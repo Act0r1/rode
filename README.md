@@ -13,14 +13,20 @@ that means direct Wayland integration, `xkbcommon` input, and GPU rendering via
 - native Wayland window and GPU-rendered three-pane interface;
 - project and provider discovery for Codex and Claude Code;
 - in-app ChatGPT sign-in through Codex's managed OAuth flow;
-- real Codex execution through the installed CLI with persisted thread IDs;
+- persistent Codex app-server sessions with streamed messages, reasoning,
+  commands, file changes, cancellation, and approval cards;
+- multiple project folders with persistent, renameable project and thread cards;
+- project-folder threads by default, with opt-in isolated
+  `rode/<thread>-<slug>` Git worktrees for new threads;
+- SQLite-backed projects, threads, UI settings, provider resume IDs, worktree
+  paths, and conversation restoration;
 - Git branch, dirty-file count, diff stats, and an in-app diff view;
 - Unicode/IME-aware prompt editor using GPUI's platform input path;
 - workspace-write sandboxing as the safe default.
 
-The worktree, terminal, approval UI, Claude/ACP adapter, persistence, and
-commit/push/PR actions are described in [the architecture](docs/architecture.md)
-and will be layered on the same provider-neutral core.
+The terminal, Claude/ACP adapter, and commit/push/PR actions are described in
+[the architecture](docs/architecture.md) and will be layered on the same
+provider-neutral core.
 
 ## Build
 
@@ -41,6 +47,11 @@ the account card when Codex confirms the login.
 Codex owns the OAuth callback, credential persistence, and token refresh. Rode
 only receives the account email and plan needed for status display; it never
 reads or stores OpenAI access or refresh tokens.
+
+Use the sidebar **+** menu to start a thread in the active project or add
+another folder. New threads share the selected folder by default. Enable
+**Settings → Isolated worktree** to create a separate Git worktree for every
+future thread.
 
 ## Why Rust
 
