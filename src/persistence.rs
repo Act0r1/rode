@@ -49,6 +49,13 @@ pub struct StoredThread {
     pub branch: Option<String>,
     pub provider_thread_id: Option<String>,
     pub ordinal: usize,
+    pub draft: String,
+    pub activity: String,
+    pub activity_updated_ms: i64,
+    pub base_branch: Option<String>,
+    pub last_error: Option<String>,
+    pub dirty_count: usize,
+    pub unread: bool,
     pub messages: Vec<StoredMessage>,
 }
 
@@ -65,7 +72,7 @@ impl StateStore {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path)
+        let mut connection = Connection::open(path)
             .with_context(|| format!("failed to open Rode state database {}", path.display()))?;
         connection
             .execute_batch(
@@ -89,6 +96,13 @@ impl StateStore {
                     provider_thread_id TEXT,
                     ordinal INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
+                    draft TEXT NOT NULL DEFAULT '',
+                    activity TEXT NOT NULL DEFAULT 'waiting',
+                    activity_updated_ms INTEGER NOT NULL DEFAULT 0,
+                    base_branch TEXT,
+                    last_error TEXT,
+                    dirty_count INTEGER NOT NULL DEFAULT 0,
+                    unread INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(project_path) REFERENCES projects(path) ON DELETE CASCADE
                  );
                  CREATE INDEX IF NOT EXISTS threads_project_ordinal
@@ -107,7 +121,7 @@ impl StateStore {
                  );",
             )
             .context("failed to initialize Rode state schema")?;
-        ensure_project_columns(&connection)?;
+        ensure_schema_columns(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -115,6 +129,11 @@ impl StateStore {
         let project_path = path_text(&thread.project_path);
         let workspace_path = path_text(&thread.workspace_path);
         let now = now_ms();
+        let activity_updated_ms = if thread.activity_updated_ms > 0 {
+            thread.activity_updated_ms
+        } else {
+            now
+        };
         let transaction = self
             .connection
             .transaction()
@@ -140,8 +159,10 @@ impl StateStore {
         transaction.execute(
             "INSERT INTO threads(
                 id, project_path, title, workspace_path, branch,
-                provider_thread_id, ordinal, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                provider_thread_id, ordinal, updated_at_ms, draft,
+                activity, activity_updated_ms, base_branch,
+                last_error, dirty_count, unread
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 project_path = excluded.project_path,
                 title = excluded.title,
@@ -149,7 +170,14 @@ impl StateStore {
                 branch = excluded.branch,
                 provider_thread_id = excluded.provider_thread_id,
                 ordinal = excluded.ordinal,
-                updated_at_ms = excluded.updated_at_ms",
+                updated_at_ms = excluded.updated_at_ms,
+                draft = excluded.draft,
+                activity = excluded.activity,
+                activity_updated_ms = excluded.activity_updated_ms,
+                base_branch = excluded.base_branch,
+                last_error = excluded.last_error,
+                dirty_count = excluded.dirty_count,
+                unread = excluded.unread",
             params![
                 thread.id,
                 project_path,
@@ -158,7 +186,14 @@ impl StateStore {
                 thread.branch,
                 thread.provider_thread_id,
                 thread.ordinal as i64,
-                now
+                now,
+                thread.draft,
+                thread.activity,
+                activity_updated_ms,
+                thread.base_branch,
+                thread.last_error,
+                usize_to_i64(thread.dirty_count),
+                thread.unread,
             ],
         )?;
         transaction.execute(
@@ -180,6 +215,50 @@ impl StateStore {
             }
         }
         transaction.commit().context("failed to save Rode state")
+    }
+
+    pub fn save_thread_draft(&mut self, id: &str, draft: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE threads SET draft = ?2 WHERE id = ?1",
+            params![id, draft],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_thread_activity(
+        &mut self,
+        id: &str,
+        activity: &str,
+        last_error: Option<&str>,
+        dirty_count: usize,
+        unread: bool,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.connection.execute(
+            "UPDATE threads
+             SET activity = ?2,
+                 activity_updated_ms = ?3,
+                 last_error = ?4,
+                 dirty_count = ?5,
+                 unread = ?6,
+                 updated_at_ms = ?3
+             WHERE id = ?1",
+            params![
+                id,
+                activity,
+                now,
+                last_error,
+                usize_to_i64(dirty_count),
+                unread,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_thread_read(&mut self, id: &str) -> Result<()> {
+        self.connection
+            .execute("UPDATE threads SET unread = 0 WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn save_project(&mut self, project: &StoredProject) -> Result<()> {
@@ -386,7 +465,9 @@ impl StateStore {
             .connection
             .query_row(
                 "SELECT id, project_path, title, workspace_path, branch,
-                        provider_thread_id, ordinal
+                        provider_thread_id, ordinal, draft, activity,
+                        activity_updated_ms, base_branch, last_error,
+                        dirty_count, unread
                  FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
@@ -398,12 +479,33 @@ impl StateStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, bool>(13)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((id, project_path, title, workspace_path, branch, provider_thread_id, ordinal)) =
-            row
+        let Some((
+            id,
+            project_path,
+            title,
+            workspace_path,
+            branch,
+            provider_thread_id,
+            ordinal,
+            draft,
+            activity,
+            activity_updated_ms,
+            base_branch,
+            last_error,
+            dirty_count,
+            unread,
+        )) = row
         else {
             return Ok(None);
         };
@@ -435,30 +537,40 @@ impl StateStore {
             branch,
             provider_thread_id,
             ordinal: ordinal.max(0) as usize,
+            draft,
+            activity,
+            activity_updated_ms,
+            base_branch,
+            last_error,
+            dirty_count: dirty_count.max(0) as usize,
+            unread,
             messages,
         }))
     }
 }
 
-fn ensure_project_columns(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(projects)")?;
+fn ensure_schema_columns(connection: &mut Connection) -> Result<()> {
+    let transaction = connection
+        .transaction()
+        .context("failed to begin Rode schema migration")?;
+    let mut statement = transaction.prepare("PRAGMA table_info(projects)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
 
     if !columns.iter().any(|column| column == "id") {
-        connection.execute("ALTER TABLE projects ADD COLUMN id TEXT", [])?;
+        transaction.execute("ALTER TABLE projects ADD COLUMN id TEXT", [])?;
     }
     if !columns.iter().any(|column| column == "git_root") {
-        connection.execute("ALTER TABLE projects ADD COLUMN git_root TEXT", [])?;
+        transaction.execute("ALTER TABLE projects ADD COLUMN git_root TEXT", [])?;
     }
     if !columns.iter().any(|column| column == "settings_json") {
-        connection.execute("ALTER TABLE projects ADD COLUMN settings_json TEXT", [])?;
+        transaction.execute("ALTER TABLE projects ADD COLUMN settings_json TEXT", [])?;
     }
 
     let projects = {
-        let mut statement = connection.prepare(
+        let mut statement = transaction.prepare(
             "SELECT rowid, path FROM projects WHERE id IS NULL OR id = '' OR git_root IS NULL",
         )?;
         statement
@@ -468,18 +580,49 @@ fn ensure_project_columns(connection: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (rowid, path) in projects {
-        connection.execute(
+        transaction.execute(
             "UPDATE projects
              SET id = COALESCE(NULLIF(id, ''), ?2), git_root = COALESCE(git_root, path)
              WHERE rowid = ?1",
             params![rowid, legacy_project_id(&path)],
         )?;
     }
-    connection.execute(
+    transaction.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS projects_stable_id ON projects(id)",
         [],
     )?;
-    Ok(())
+
+    let mut statement = transaction.prepare("PRAGMA table_info(threads)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    for (column, definition) in [
+        ("draft", "TEXT NOT NULL DEFAULT ''"),
+        ("activity", "TEXT NOT NULL DEFAULT 'waiting'"),
+        ("activity_updated_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("base_branch", "TEXT"),
+        ("last_error", "TEXT"),
+        ("dirty_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("unread", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            transaction.execute(
+                &format!("ALTER TABLE threads ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute(
+        "UPDATE threads
+         SET activity_updated_ms = updated_at_ms
+         WHERE activity_updated_ms <= 0",
+        [],
+    )?;
+    transaction
+        .commit()
+        .context("failed to commit Rode schema migration")
 }
 
 fn existing_project_id(connection: &Connection, path: &Path) -> Result<Option<String>> {
@@ -533,11 +676,15 @@ fn folder_name(path: &Path) -> String {
         .to_owned()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or_default()
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
 }
 
 #[cfg(test)]
@@ -545,6 +692,7 @@ mod tests {
     use super::{StateStore, StoredMessage, StoredThread};
     use rusqlite::Connection;
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -570,6 +718,13 @@ mod tests {
             branch: Some("rode/thread-1-native-rendering".to_owned()),
             provider_thread_id: Some("provider-thread-1".to_owned()),
             ordinal: 1,
+            draft: "Keep this draft".to_owned(),
+            activity: "running".to_owned(),
+            activity_updated_ms: 1234,
+            base_branch: Some("main".to_owned()),
+            last_error: None,
+            dirty_count: 2,
+            unread: true,
             messages: vec![
                 StoredMessage {
                     role: "user".to_owned(),
@@ -589,6 +744,26 @@ mod tests {
             .expect("active thread exists");
         assert_eq!(loaded, thread);
         assert_eq!(store.load_threads(&project).unwrap(), vec![thread]);
+        store
+            .save_thread_draft("thread-1", "Updated draft")
+            .expect("update thread draft");
+        store
+            .update_thread_activity("thread-1", "error", Some("worktree failed"), 4, true)
+            .expect("update thread activity");
+        let updated = store
+            .load_active_thread(&project)
+            .expect("load updated active thread")
+            .expect("updated active thread exists");
+        assert_eq!(updated.draft, "Updated draft");
+        assert_eq!(updated.activity, "error");
+        assert!(updated.activity_updated_ms > 1234);
+        assert_eq!(updated.last_error.as_deref(), Some("worktree failed"));
+        assert_eq!(updated.dirty_count, 4);
+        assert!(updated.unread);
+        store
+            .mark_thread_read("thread-1")
+            .expect("mark thread read");
+        assert!(!store.load_active_thread(&project).unwrap().unwrap().unread);
         let projects = store.load_projects().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].path, project);
@@ -672,6 +847,78 @@ mod tests {
         assert!(projects[0].id.starts_with("legacy-project-"));
         assert_eq!(projects[0].git_root, projects[0].path);
         assert!(projects[0].settings_override.is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("clean migration fixture");
+    }
+
+    #[test]
+    fn transactionally_upgrades_legacy_thread_activity_columns() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-thread-migration-{nonce}"));
+        fs::create_dir_all(&root).expect("create migration fixture");
+        let database = root.join("state.sqlite3");
+        let connection = Connection::open(&database).expect("open legacy database");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE projects (
+                    path TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    active_thread_id TEXT,
+                    last_opened_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE threads (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    workspace_path TEXT NOT NULL,
+                    branch TEXT,
+                    provider_thread_id TEXT,
+                    ordinal INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    FOREIGN KEY(project_path) REFERENCES projects(path) ON DELETE CASCADE
+                 );
+                 CREATE TABLE messages (
+                    thread_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    PRIMARY KEY(thread_id, sequence),
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                 );
+                 CREATE TABLE settings (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                 );
+                 INSERT INTO projects(path, name, active_thread_id, last_opened_ms)
+                 VALUES ('/tmp/legacy-thread-project', 'Legacy thread project', 'legacy-thread', 7);
+                 INSERT INTO threads(
+                    id, project_path, title, workspace_path, branch,
+                    provider_thread_id, ordinal, updated_at_ms
+                 ) VALUES (
+                    'legacy-thread', '/tmp/legacy-thread-project', 'Legacy thread',
+                    '/tmp/legacy-thread-project', 'main', NULL, 1, 4242
+                 );",
+            )
+            .expect("write legacy thread schema");
+        drop(connection);
+
+        let store = StateStore::open(&database).expect("upgrade state database");
+        let loaded = store
+            .load_active_thread(Path::new("/tmp/legacy-thread-project"))
+            .expect("load upgraded active thread")
+            .expect("upgraded active thread exists");
+        assert_eq!(loaded.draft, "");
+        assert_eq!(loaded.activity, "waiting");
+        assert_eq!(loaded.activity_updated_ms, 4242);
+        assert_eq!(loaded.base_branch, None);
+        assert_eq!(loaded.last_error, None);
+        assert_eq!(loaded.dirty_count, 0);
+        assert!(!loaded.unread);
 
         drop(store);
         fs::remove_dir_all(root).expect("clean migration fixture");

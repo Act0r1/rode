@@ -12,6 +12,13 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::actions::{Backspace, Delete, End, Home, InsertNewline, Left, Right};
 
+#[derive(Clone, Copy, Debug)]
+pub enum EditorEvent {
+    Changed,
+}
+
+impl gpui::EventEmitter<EditorEvent> for Editor {}
+
 pub struct Editor {
     pub focus_handle: FocusHandle,
     value: String,
@@ -58,6 +65,7 @@ impl Editor {
         self.value.clear();
         self.cursor = 0;
         self.reset_blink(cx);
+        cx.emit(EditorEvent::Changed);
         cx.notify();
     }
 
@@ -65,6 +73,7 @@ impl Editor {
         self.value = value.into();
         self.cursor = self.value.len();
         self.reset_blink(cx);
+        cx.emit(EditorEvent::Changed);
         cx.notify();
     }
 
@@ -132,21 +141,29 @@ impl Editor {
     }
 
     pub fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.cursor > 0;
         if self.cursor > 0 {
             let previous = previous_boundary(&self.value, self.cursor);
             self.value.drain(previous..self.cursor);
             self.cursor = previous;
         }
         self.reset_blink(cx);
+        if changed {
+            cx.emit(EditorEvent::Changed);
+        }
         cx.notify();
     }
 
     pub fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        let changed = self.cursor < self.value.len();
         if self.cursor < self.value.len() {
             let next = next_boundary(&self.value, self.cursor);
             self.value.drain(self.cursor..next);
         }
         self.reset_blink(cx);
+        if changed {
+            cx.emit(EditorEvent::Changed);
+        }
         cx.notify();
     }
 
@@ -154,6 +171,7 @@ impl Editor {
         self.value.insert(self.cursor, '\n');
         self.cursor += 1;
         self.reset_blink(cx);
+        cx.emit(EditorEvent::Changed);
         cx.notify();
     }
 }
@@ -260,6 +278,7 @@ impl EntityInputHandler for Editor {
         self.value.replace_range(range.clone(), new_text);
         self.cursor = range.start + new_text.len();
         self.reset_blink(cx);
+        cx.emit(EditorEvent::Changed);
         cx.notify();
     }
 

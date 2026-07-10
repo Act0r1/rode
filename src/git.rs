@@ -25,11 +25,13 @@ pub fn create_thread_worktree(
     repository: &Path,
     thread_id: &str,
     title: &str,
+    base_branch: &str,
 ) -> Result<ThreadWorktree> {
     create_thread_worktree_at(
         repository,
         thread_id,
         title,
+        base_branch,
         &rode_state_dir()?.join("worktrees"),
     )
 }
@@ -38,6 +40,7 @@ fn create_thread_worktree_at(
     repository: &Path,
     thread_id: &str,
     title: &str,
+    base_branch: &str,
     worktrees_root: &Path,
 ) -> Result<ThreadWorktree> {
     let repository = canonical_or_original(repository);
@@ -46,6 +49,19 @@ fn create_thread_worktree_at(
         .context("the selected project is not inside a Git repository")?;
     if !git_ok(&git_root, &["rev-parse", "--verify", "HEAD"]) {
         bail!("the repository needs an initial commit before Rode can create worktrees");
+    }
+    let base_branch = base_branch.trim();
+    if base_branch.is_empty()
+        || !git_ok(
+            &git_root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{base_branch}^{{commit}}"),
+            ],
+        )
+    {
+        bail!("the selected base branch {base_branch:?} does not exist");
     }
 
     let short_id = safe_slug(thread_id).chars().take(12).collect::<String>();
@@ -68,7 +84,7 @@ fn create_thread_worktree_at(
         .args(["worktree", "add", "-b"])
         .arg(&branch)
         .arg(&path)
-        .arg("HEAD")
+        .arg(base_branch)
         .current_dir(&git_root)
         .output()
         .context("failed to start `git worktree add`")?;
@@ -81,6 +97,24 @@ fn create_thread_worktree_at(
     }
 
     Ok(ThreadWorktree { path, branch })
+}
+
+pub fn list_local_branches(repository: &Path) -> Result<Vec<String>> {
+    let root = repository_root(repository)?;
+    let output = git_output(
+        &root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .context("failed to list local Git branches")?;
+    let mut branches = output
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    branches.sort();
+    branches.dedup();
+    Ok(branches)
 }
 
 #[allow(dead_code)] // Used by the upcoming persisted thread-deletion UI and by lifecycle tests.
@@ -362,8 +396,8 @@ fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RepoSnapshot, commit_all, create_thread_worktree_at, git_output, remove_thread_worktree,
-        safe_slug, untracked_file_diff,
+        RepoSnapshot, commit_all, create_thread_worktree_at, git_output, list_local_branches,
+        remove_thread_worktree, safe_slug, untracked_file_diff,
     };
     use crate::diff::DiffDocument;
     use std::fs;
@@ -441,15 +475,62 @@ mod tests {
                 .expect("git commit fixture")
                 .success()
         );
+        assert!(
+            Command::new("git")
+                .args(["branch", "-M", "main"])
+                .current_dir(&repository)
+                .status()
+                .expect("rename fixture branch")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["checkout", "-q", "-b", "release-base"])
+                .current_dir(&repository)
+                .status()
+                .expect("create base branch")
+                .success()
+        );
+        fs::write(repository.join("BASE.md"), "selected base\n").expect("write base fixture");
+        assert!(
+            Command::new("git")
+                .args(["add", "BASE.md"])
+                .current_dir(&repository)
+                .status()
+                .expect("add base fixture")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "--quiet", "-m", "base branch change"])
+                .current_dir(&repository)
+                .status()
+                .expect("commit base fixture")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["checkout", "-q", "main"])
+                .current_dir(&repository)
+                .status()
+                .expect("restore main branch")
+                .success()
+        );
+        assert_eq!(
+            list_local_branches(&repository).expect("list branches"),
+            vec!["main".to_owned(), "release-base".to_owned()]
+        );
 
         let worktree = create_thread_worktree_at(
             &repository,
             "thread-1234567890",
             "Add Native Terminal",
+            "release-base",
             &state,
         )
         .expect("create thread worktree");
         assert!(worktree.path.join("README.md").is_file());
+        assert!(worktree.path.join("BASE.md").is_file());
         assert_eq!(worktree.branch, "rode/thread-12345-add-native-terminal");
         let branch = Command::new("git")
             .args(["branch", "--show-current"])

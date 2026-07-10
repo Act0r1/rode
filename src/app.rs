@@ -1,9 +1,9 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use crate::actions::{
     ActivateRailItem, CancelRename, CycleTheme, DismissModal, OpenSettings, OpenSourceControl,
-    OpenTerminalRoute, OpenWorkspace, RefreshRepo, SendPrompt, SubmitRename, ToggleDiff,
-    ToggleDiffLayout, ToggleTerminal,
+    OpenTerminalRoute, OpenWorkspace, RefreshRepo, SendPrompt, SubmitNewThread, SubmitRename,
+    ToggleDiff, ToggleDiffLayout, ToggleTerminal,
 };
 use crate::agent::{ProviderKind, ProviderStatus, discover_providers};
 use crate::codex::{self, ApprovalRequest, CodexEvent, CodexSession};
@@ -14,12 +14,13 @@ use crate::codex_auth::{
 use crate::diff::{
     DiffDocument, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffViewMode, split_rows,
 };
-use crate::editor::{Editor, standard_actions};
+use crate::editor::{Editor, EditorEvent, standard_actions};
 use crate::git::{
-    RepoSnapshot, commit_all, create_pull_request, create_thread_worktree, push_current_branch,
+    RepoSnapshot, commit_all, create_pull_request, create_thread_worktree, list_local_branches,
+    push_current_branch,
 };
 use crate::notifications;
-use crate::persistence::{StateStore, StoredMessage, StoredProject, StoredThread};
+use crate::persistence::{StateStore, StoredMessage, StoredProject, StoredThread, now_ms};
 use crate::project::{ValidatedProject, validate_project};
 use crate::terminal::{TerminalCore, TerminalView};
 use crate::theme::{self, ThemeKind};
@@ -208,6 +209,56 @@ enum CodexAuthState {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ThreadActivity {
+    CreatingWorktree,
+    Running,
+    WaitingApproval,
+    Cancelling,
+    Failed,
+    Complete,
+    #[default]
+    Ready,
+}
+
+impl ThreadActivity {
+    fn storage_name(self) -> &'static str {
+        match self {
+            Self::CreatingWorktree => "creating_worktree",
+            Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Cancelling => "cancelling",
+            Self::Failed => "failed",
+            Self::Complete => "complete",
+            Self::Ready => "ready",
+        }
+    }
+
+    fn from_storage_name(value: &str) -> Self {
+        match value {
+            "creating_worktree" => Self::CreatingWorktree,
+            "running" => Self::Running,
+            "waiting_approval" => Self::WaitingApproval,
+            "cancelling" => Self::Cancelling,
+            "failed" => Self::Failed,
+            "complete" => Self::Complete,
+            _ => Self::Ready,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CreatingWorktree => "Creating worktree",
+            Self::Running => "Running",
+            Self::WaitingApproval => "Waiting approval",
+            Self::Cancelling => "Cancelling",
+            Self::Failed => "Failed",
+            Self::Complete => "Complete",
+            Self::Ready => "Ready",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectSelectionState {
     Idle,
@@ -307,13 +358,21 @@ pub(crate) struct RodeApp {
     pending_codex_login: Option<PendingCodexLoginCancellation>,
     messages: Vec<Message>,
     composer: Entity<Editor>,
+    _composer_subscription: Subscription,
+    draft_persist_generation: u64,
     commit_editor: Entity<Editor>,
     rename_editor: Entity<Editor>,
+    new_thread_editor: Entity<Editor>,
     rename_target: Option<RenameTarget>,
     _rename_blur_subscription: Subscription,
     thread_id: String,
     thread_title: String,
     thread_branch: Option<String>,
+    thread_base_branch: Option<String>,
+    thread_activity: ThreadActivity,
+    thread_activity_updated_ms: i64,
+    thread_error: Option<String>,
+    thread_unread: bool,
     codex_session: Option<CodexSession>,
     codex_thread_id: Option<String>,
     active_turn_id: Option<String>,
@@ -323,6 +382,12 @@ pub(crate) struct RodeApp {
     session_generation: u64,
     creating_worktree: bool,
     isolate_new_threads: bool,
+    new_thread_branches: Vec<String>,
+    new_thread_base_branch: Option<String>,
+    new_thread_target_project: Option<(PathBuf, String)>,
+    new_thread_form_generation: u64,
+    new_thread_loading_branches: bool,
+    worktree_failure: Option<String>,
     show_create_menu: bool,
     show_settings: bool,
     running: bool,
@@ -407,9 +472,13 @@ impl RodeApp {
                 cx,
             )
         });
+        let composer_subscription = cx.subscribe(&composer, |this, _, _: &EditorEvent, cx| {
+            this.schedule_draft_persist(cx)
+        });
         let commit_editor =
             cx.new(|cx| Editor::new("", "Commit message or pull-request title", window, cx));
         let rename_editor = cx.new(|cx| Editor::new("", "New name", window, cx));
+        let new_thread_editor = cx.new(|cx| Editor::new("", "Thread title", window, cx));
         let rename_focus = rename_editor.read(cx).focus_handle.clone();
         let rename_blur_subscription =
             cx.on_blur(&rename_focus, window, |this, _, cx| this.clear_rename(cx));
@@ -470,13 +539,21 @@ impl RodeApp {
             pending_codex_login: None,
             messages,
             composer,
+            _composer_subscription: composer_subscription,
+            draft_persist_generation: 0,
             commit_editor,
             rename_editor,
+            new_thread_editor,
             rename_target: None,
             _rename_blur_subscription: rename_blur_subscription,
             thread_id,
             thread_title,
             thread_branch,
+            thread_base_branch: None,
+            thread_activity: ThreadActivity::Ready,
+            thread_activity_updated_ms: now_ms(),
+            thread_error: None,
+            thread_unread: false,
             codex_session: None,
             codex_thread_id,
             active_turn_id: None,
@@ -486,6 +563,12 @@ impl RodeApp {
             session_generation: 0,
             creating_worktree: false,
             isolate_new_threads,
+            new_thread_branches: Vec::new(),
+            new_thread_base_branch: None,
+            new_thread_target_project: None,
+            new_thread_form_generation: 0,
+            new_thread_loading_branches: false,
+            worktree_failure: None,
             show_create_menu: false,
             show_settings: false,
             running: false,
@@ -507,8 +590,12 @@ impl RodeApp {
 
     fn persist_current_thread(&mut self) {
         if !self.project_open
-            || !self.repo.is_repository
             || self.project_root.as_os_str().is_empty()
+            || (!self.repo.is_repository
+                && !matches!(
+                    self.thread_activity,
+                    ThreadActivity::CreatingWorktree | ThreadActivity::Failed
+                ))
         {
             return;
         }
@@ -520,10 +607,25 @@ impl RodeApp {
             project_path: self.project_root.clone(),
             project_name: self.project_name.clone(),
             title: self.thread_title.clone(),
-            workspace_path: self.project_path.clone(),
+            workspace_path: if self.project_path.as_os_str().is_empty() {
+                self.project_root.clone()
+            } else {
+                self.project_path.clone()
+            },
             branch: self.thread_branch.clone(),
             provider_thread_id: self.codex_thread_id.clone(),
             ordinal: self.thread_number,
+            draft: self
+                .drafts
+                .get(&self.thread_id)
+                .cloned()
+                .unwrap_or_default(),
+            activity: self.thread_activity.storage_name().to_owned(),
+            activity_updated_ms: self.thread_activity_updated_ms,
+            base_branch: self.thread_base_branch.clone(),
+            last_error: self.thread_error.clone(),
+            dirty_count: self.repo.changed_files,
+            unread: self.thread_unread,
             messages: self
                 .messages
                 .iter()
@@ -569,6 +671,14 @@ impl RodeApp {
         if self.thread_id == thread_id {
             return;
         }
+        if self.running || self.creating_worktree {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                "Finish or cancel the active operation before switching threads. Rode will never retarget a live session.",
+            );
+            cx.notify();
+            return;
+        }
         if self.project_open {
             self.save_current_draft(cx);
             self.persist_current_thread();
@@ -593,29 +703,37 @@ impl RodeApp {
         self.publish_status = None;
         self.commit_editor
             .update(cx, |editor, cx| editor.set_text("", cx));
-        self.thread_id = thread.id;
-        self.thread_branch = thread.branch;
-        self.codex_thread_id = thread.provider_thread_id;
+        self.thread_id = thread.id.clone();
+        self.thread_branch = thread.branch.clone();
+        self.thread_base_branch = thread.base_branch.clone();
+        self.thread_activity = ThreadActivity::from_storage_name(&thread.activity);
+        self.thread_activity_updated_ms = thread.activity_updated_ms;
+        self.thread_error = thread.last_error.clone();
+        self.thread_unread = false;
+        self.codex_thread_id = thread.provider_thread_id.clone();
         self.thread_number = thread.ordinal.max(1);
-        self.thread_title = thread.title;
-        self.project_root = thread.project_path;
-        self.project_name = thread.project_name;
+        self.thread_title = thread.title.clone();
+        self.project_root = thread.project_path.clone();
+        self.project_name = thread.project_name.clone();
+        let failed_workspace =
+            self.thread_activity == ThreadActivity::Failed && self.thread_error.is_some();
+        let missing_isolated_workspace = thread.branch.is_some() && !thread.workspace_path.is_dir();
         self.project_path = if thread.workspace_path.is_dir() {
-            thread.workspace_path
-        } else {
+            if failed_workspace {
+                PathBuf::new()
+            } else {
+                thread.workspace_path.clone()
+            }
+        } else if thread.branch.is_none() {
             self.project_root.clone()
+        } else {
+            PathBuf::new()
         };
-        self.repo = RepoSnapshot::load(&self.project_path);
-        if !self.repo.is_repository {
-            let missing_path = self.project_root.clone();
-            self.close_project();
-            self.project_picker_error = Some(format!(
-                "{} is no longer a Git repository. Repair or remove it below.",
-                missing_path.display()
-            ));
-            cx.notify();
-            return;
-        }
+        self.repo = if self.project_path.as_os_str().is_empty() {
+            RepoSnapshot::default()
+        } else {
+            RepoSnapshot::load(&self.project_path)
+        };
         self.project_open = true;
         self.reconcile_project_route();
         self.messages = thread
@@ -632,21 +750,76 @@ impl RodeApp {
                 text: "Restored thread has no messages yet.".to_owned(),
             });
         }
-        let draft = self
-            .drafts
-            .get(&self.thread_id)
-            .cloned()
-            .unwrap_or_default();
+        if missing_isolated_workspace {
+            self.thread_activity = ThreadActivity::Failed;
+            self.thread_activity_updated_ms = now_ms();
+            self.thread_error = Some(format!(
+                "The isolated workspace {} is missing.",
+                thread.workspace_path.display()
+            ));
+            self.messages.push(Message {
+                role: MessageRole::System,
+                text: "This thread's isolated worktree is missing. Prompt, terminal, and Git actions are disabled; create a replacement thread or explicitly repair the workspace."
+                    .to_owned(),
+            });
+        }
+        let draft = thread.draft.clone();
+        self.drafts.insert(self.thread_id.clone(), draft.clone());
         self.composer
             .update(cx, |editor, cx| editor.set_text(draft, cx));
+        if let Some(store) = self.state_store.as_mut() {
+            let _ = store.mark_thread_read(&self.thread_id);
+            if missing_isolated_workspace {
+                let _ = store.update_thread_activity(
+                    &self.thread_id,
+                    self.thread_activity.storage_name(),
+                    self.thread_error.as_deref(),
+                    0,
+                    false,
+                );
+            }
+        }
         self.save_active_project();
         self.persist_current_thread();
         cx.notify();
     }
 
     fn save_current_draft(&mut self, cx: &mut Context<Self>) {
-        self.drafts
-            .insert(self.thread_id.clone(), self.composer.read(cx).text());
+        let draft = self.composer.read(cx).text();
+        self.drafts.insert(self.thread_id.clone(), draft.clone());
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.save_thread_draft(&self.thread_id, &draft)
+        {
+            eprintln!("failed to persist Rode thread draft: {error:#}");
+        }
+    }
+
+    fn schedule_draft_persist(&mut self, cx: &mut Context<Self>) {
+        if !self.project_open || self.thread_id.is_empty() {
+            return;
+        }
+        let thread_id = self.thread_id.clone();
+        let draft = self.composer.read(cx).text();
+        self.drafts.insert(thread_id.clone(), draft.clone());
+        self.draft_persist_generation = self.draft_persist_generation.wrapping_add(1);
+        let generation = self.draft_persist_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            this.update(cx, |this, _| {
+                if this.draft_persist_generation != generation || this.thread_id != thread_id {
+                    return;
+                }
+                if let Some(store) = this.state_store.as_mut()
+                    && let Err(error) = store.save_thread_draft(&thread_id, &draft)
+                {
+                    eprintln!("failed to persist Rode thread draft: {error:#}");
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn save_active_project(&mut self) {
@@ -1070,7 +1243,13 @@ impl RodeApp {
     }
 
     fn send_prompt(&mut self, _: &SendPrompt, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.project_open || !self.repo.is_repository {
+        if !self.project_open
+            || !self.repo.is_repository
+            || matches!(
+                self.thread_activity,
+                ThreadActivity::CreatingWorktree | ThreadActivity::Failed
+            )
+        {
             self.project_picker_error =
                 Some("Open a Git project before starting a thread.".to_owned());
             cx.notify();
@@ -1104,6 +1283,7 @@ impl RodeApp {
         }
 
         self.composer.update(cx, |editor, cx| editor.clear(cx));
+        self.drafts.insert(self.thread_id.clone(), String::new());
         self.messages.push(Message {
             role: MessageRole::User,
             text: prompt.clone(),
@@ -1111,6 +1291,7 @@ impl RodeApp {
         self.active_agent_message = None;
         self.reasoning_preview.clear();
         self.running = true;
+        self.set_thread_activity(ThreadActivity::Running, None);
         self.persist_current_thread();
         cx.notify();
 
@@ -1141,10 +1322,13 @@ impl RodeApp {
                     }
                     Err(error) => {
                         this.running = false;
+                        let detail = format!("{error:#}");
+                        this.set_thread_activity(ThreadActivity::Failed, Some(detail.clone()));
                         this.messages.push(Message {
                             role: MessageRole::System,
-                            text: format!("Could not start Codex app-server: {error:#}"),
+                            text: format!("Could not start Codex app-server: {detail}"),
                         });
+                        this.persist_current_thread();
                     }
                 }
                 cx.notify();
@@ -1163,10 +1347,13 @@ impl RodeApp {
                 this.update(cx, |this, cx| {
                     if this.session_generation == generation {
                         this.running = false;
+                        let detail = format!("{error:#}");
+                        this.set_thread_activity(ThreadActivity::Failed, Some(detail.clone()));
                         this.messages.push(Message {
                             role: MessageRole::System,
-                            text: format!("Could not start Codex turn: {error:#}"),
+                            text: format!("Could not start Codex turn: {detail}"),
                         });
+                        this.persist_current_thread();
                         cx.notify();
                     }
                 })
@@ -1286,7 +1473,11 @@ impl RodeApp {
                     text: format!("Editing files · {summary}\nitem {item_id}"),
                 });
             }
-            CodexEvent::ApprovalRequested(request) => self.approvals.push(request),
+            CodexEvent::ApprovalRequested(request) => {
+                self.approvals.push(request);
+                self.set_thread_activity(ThreadActivity::WaitingApproval, None);
+                self.persist_current_thread();
+            }
             CodexEvent::TurnCompleted { status, error } => {
                 self.running = false;
                 self.active_turn_id = None;
@@ -1294,6 +1485,14 @@ impl RodeApp {
                 self.reasoning_preview.clear();
                 self.repo = RepoSnapshot::load(&self.project_path);
                 let failed = error.is_some() || !matches!(status.as_str(), "completed" | "success");
+                self.set_thread_activity(
+                    if failed {
+                        ThreadActivity::Failed
+                    } else {
+                        ThreadActivity::Complete
+                    },
+                    error.clone(),
+                );
                 notifications::turn_finished(&self.thread_title, &status, failed);
                 if let Some(error) = error {
                     self.messages.push(Message {
@@ -1303,14 +1502,22 @@ impl RodeApp {
                 }
                 self.persist_current_thread();
             }
-            CodexEvent::Error(error) => self.messages.push(Message {
-                role: MessageRole::System,
-                text: format!("Codex app-server: {error}"),
-            }),
+            CodexEvent::Error(error) => {
+                self.set_thread_activity(ThreadActivity::Failed, Some(error.clone()));
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    text: format!("Codex app-server: {error}"),
+                });
+                self.persist_current_thread();
+            }
             CodexEvent::Exited => {
                 self.codex_session = None;
                 if self.running {
                     self.running = false;
+                    self.set_thread_activity(
+                        ThreadActivity::Failed,
+                        Some("Codex app-server exited before completion".to_owned()),
+                    );
                     self.messages.push(Message {
                         role: MessageRole::System,
                         text: "Codex app-server exited before the turn completed.".to_owned(),
@@ -1356,6 +1563,9 @@ impl RodeApp {
             role: MessageRole::System,
             text: outcome,
         });
+        if self.running && self.approvals.is_empty() {
+            self.set_thread_activity(ThreadActivity::Running, None);
+        }
         self.persist_current_thread();
         cx.notify();
     }
@@ -1364,12 +1574,15 @@ impl RodeApp {
         let Some(session) = self.codex_session.clone() else {
             return;
         };
+        self.set_thread_activity(ThreadActivity::Cancelling, None);
+        self.persist_current_thread();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { session.interrupt() })
                 .await;
             if let Err(error) = result {
                 this.update(cx, |this, cx| {
+                    this.set_thread_activity(ThreadActivity::Running, None);
                     this.messages.push(Message {
                         role: MessageRole::System,
                         text: format!("Could not cancel Codex turn: {error:#}"),
@@ -1380,6 +1593,21 @@ impl RodeApp {
             }
         })
         .detach();
+    }
+
+    fn set_thread_activity(&mut self, activity: ThreadActivity, error: Option<String>) {
+        self.thread_activity = activity;
+        self.thread_activity_updated_ms = now_ms();
+        self.thread_error = error;
+        if let Some(store) = self.state_store.as_mut() {
+            let _ = store.update_thread_activity(
+                &self.thread_id,
+                activity.storage_name(),
+                self.thread_error.as_deref(),
+                self.repo.changed_files,
+                self.thread_unread,
+            );
+        }
     }
 
     fn toggle_create_menu(&mut self, cx: &mut Context<Self>) {
@@ -1495,6 +1723,14 @@ impl RodeApp {
         repair_target: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        if self.running || self.creating_worktree {
+            self.project_picker_error = Some(
+                "Finish or cancel the active thread operation before switching projects."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         if self.project_open {
             self.save_current_draft(cx);
             self.persist_current_thread();
@@ -1671,53 +1907,202 @@ impl RodeApp {
 
     fn dismiss_modal(&mut self, _: &DismissModal, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal.take().is_some() {
+            self.new_thread_target_project = None;
+            self.new_thread_form_generation = self.new_thread_form_generation.wrapping_add(1);
             let focus = self.composer.read(cx).focus_handle.clone();
             window.focus(&focus, cx);
             cx.notify();
         }
     }
 
-    fn new_thread(&mut self, cx: &mut Context<Self>) {
+    fn new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.project_open || !self.repo.is_repository {
             return;
         }
         self.show_create_menu = false;
-        self.start_new_thread(true, cx);
+        self.open_new_thread_modal_for(None, window, cx);
     }
 
     fn new_thread_in_project(
         &mut self,
         project_path: PathBuf,
         project_name: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.running || self.creating_worktree {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                "Finish or cancel the active operation before changing projects.",
+            );
+            cx.notify();
+            return;
+        }
         if !project_path.is_dir() {
             self.close_project();
             self.project_picker_error = Some("That saved project folder is missing.".to_owned());
             cx.notify();
             return;
         }
-        self.persist_current_thread();
-        self.project_root = project_path.clone();
-        self.project_path = project_path;
-        self.project_name = project_name;
-        self.repo = RepoSnapshot::load(&self.project_path);
-        self.project_open = self.repo.is_repository;
-        if !self.project_open {
-            self.close_project();
-            self.project_picker_error =
-                Some("That saved folder is no longer a Git repository.".to_owned());
-            cx.notify();
-            return;
-        }
-        self.reconcile_project_route();
-        self.start_new_thread(false, cx);
+        self.open_new_thread_modal_for(Some((project_path, project_name)), window, cx);
     }
 
     fn start_new_thread(&mut self, persist_previous: bool, cx: &mut Context<Self>) {
+        let next = self.next_thread_number();
+        let base_branch = self.repo.branch.clone();
+        self.initialize_thread(
+            persist_previous,
+            format!("Thread {next}"),
+            base_branch,
+            false,
+            cx,
+        );
+    }
+
+    fn open_new_thread_modal_for(
+        &mut self,
+        target_project: Option<(PathBuf, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.project_open || !self.repo.is_repository {
             return;
         }
+        let repository = target_project
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .unwrap_or_else(|| self.project_root.clone());
+        self.modal = Some(ModalState::NewThread);
+        self.new_thread_form_generation = self.new_thread_form_generation.wrapping_add(1);
+        let form_generation = self.new_thread_form_generation;
+        self.new_thread_target_project = target_project;
+        self.worktree_failure = None;
+        self.new_thread_branches.clear();
+        self.new_thread_base_branch = (repository == self.project_root
+            && !self.repo.branch.is_empty())
+        .then(|| self.repo.branch.clone());
+        self.new_thread_loading_branches = true;
+        self.new_thread_editor
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        let focus = self.new_thread_editor.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { list_local_branches(&repository) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.new_thread_form_generation != form_generation
+                    || this.modal != Some(ModalState::NewThread)
+                {
+                    return;
+                }
+                this.new_thread_loading_branches = false;
+                match result {
+                    Ok(branches) => {
+                        if this
+                            .new_thread_base_branch
+                            .as_ref()
+                            .is_none_or(|selected| !branches.contains(selected))
+                        {
+                            this.new_thread_base_branch = branches.first().cloned();
+                        }
+                        this.new_thread_branches = branches;
+                    }
+                    Err(error) => {
+                        this.worktree_failure =
+                            Some(format!("Could not list local branches: {error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn select_new_thread_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        self.new_thread_base_branch = Some(branch);
+        cx.notify();
+    }
+
+    fn confirm_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.new_thread_editor.read(cx).text().trim().to_owned();
+        if title.is_empty() {
+            self.worktree_failure = Some("Enter a thread title.".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(base_branch) = self.new_thread_base_branch.clone() else {
+            self.worktree_failure = Some("Choose a local base branch.".to_owned());
+            cx.notify();
+            return;
+        };
+        let changing_project = self.new_thread_target_project.take();
+        if let Some((project_path, project_name)) = changing_project.as_ref() {
+            self.save_current_draft(cx);
+            self.persist_current_thread();
+            self.project_root = project_path.clone();
+            self.project_path = project_path.clone();
+            self.project_name = project_name.clone();
+            self.repo = RepoSnapshot::load(&self.project_path);
+            if !self.repo.is_repository {
+                self.close_project();
+                self.project_picker_error =
+                    Some("That saved folder is no longer a Git repository.".to_owned());
+                cx.notify();
+                return;
+            }
+            self.project_open = true;
+            self.refresh_known_state();
+            self.save_active_project();
+        }
+        self.modal = None;
+        self.worktree_failure = None;
+        self.initialize_thread(
+            changing_project.is_none(),
+            title,
+            base_branch,
+            self.isolate_new_threads,
+            cx,
+        );
+        if self.isolate_new_threads {
+            self.spawn_worktree_creation(window, cx);
+        } else {
+            let focus = self.composer.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        }
+    }
+
+    fn submit_new_thread_action(
+        &mut self,
+        _: &SubmitNewThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal == Some(ModalState::NewThread) && self.worktree_failure.is_none() {
+            self.confirm_new_thread(window, cx);
+        }
+    }
+
+    fn next_thread_number(&self) -> usize {
+        self.known_threads
+            .iter()
+            .filter(|thread| thread.project_path == self.project_root)
+            .map(|thread| thread.ordinal)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    fn initialize_thread(
+        &mut self,
+        persist_previous: bool,
+        title: String,
+        base_branch: String,
+        isolated: bool,
+        cx: &mut Context<Self>,
+    ) {
         if persist_previous {
             self.save_current_draft(cx);
             self.persist_current_thread();
@@ -1736,46 +2121,56 @@ impl RodeApp {
         self.composer
             .update(cx, |editor, cx| editor.set_text("", cx));
         self.running = false;
-        self.thread_number = self
-            .known_threads
-            .iter()
-            .filter(|thread| thread.project_path == self.project_root)
-            .map(|thread| thread.ordinal)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        self.thread_number = self.next_thread_number();
         self.thread_id = new_local_thread_id();
-        self.thread_title = format!("Thread {}", self.thread_number);
-        self.thread_branch = None;
+        self.thread_title = title;
+        self.thread_base_branch = Some(base_branch);
+        self.thread_error = None;
+        self.thread_unread = false;
         self.project_path = self.project_root.clone();
         self.repo = RepoSnapshot::load(&self.project_path);
+        self.thread_branch = if isolated {
+            None
+        } else {
+            (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone())
+        };
+        self.thread_activity = if isolated {
+            ThreadActivity::CreatingWorktree
+        } else {
+            ThreadActivity::Ready
+        };
+        self.thread_activity_updated_ms = now_ms();
         self.messages = vec![Message {
             role: MessageRole::System,
-            text: if self.isolate_new_threads {
+            text: if isolated {
                 "Creating an isolated Git worktree for the new thread…".to_owned()
             } else {
-                "New local thread in the project folder. The first prompt will open a new Codex app-server session.".to_owned()
+                "This thread uses the current project checkout by explicit choice. The first prompt will open a new Codex app-server session.".to_owned()
             },
         }];
-        self.creating_worktree = self.isolate_new_threads;
+        self.creating_worktree = isolated;
         self.persist_current_thread();
         cx.notify();
+    }
 
-        if !self.isolate_new_threads {
+    fn spawn_worktree_creation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.creating_worktree {
             return;
         }
-
         let generation = self.session_generation;
         let repository = self.project_root.clone();
         let thread_id = self.thread_id.clone();
         let title = self.thread_title.clone();
-        cx.spawn(async move |this, cx| {
+        let Some(base_branch) = self.thread_base_branch.clone() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    create_thread_worktree(&repository, &thread_id, &title)
+                    create_thread_worktree(&repository, &thread_id, &title, &base_branch)
                 })
                 .await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 if this.session_generation != generation {
                     return;
                 }
@@ -1784,6 +2179,9 @@ impl RodeApp {
                         this.project_path = worktree.path;
                         this.thread_branch = Some(worktree.branch.clone());
                         this.repo = RepoSnapshot::load(&this.project_path);
+                        this.thread_activity = ThreadActivity::Ready;
+                        this.thread_error = None;
+                        this.worktree_failure = None;
                         this.messages = vec![Message {
                             role: MessageRole::System,
                             text: format!(
@@ -1791,26 +2189,68 @@ impl RodeApp {
                                 worktree.branch
                             ),
                         }];
+                        let focus = this.composer.read(cx).focus_handle.clone();
+                        window.focus(&focus, cx);
                     }
                     Err(error) => {
-                        this.project_path = this.project_root.clone();
+                        let detail = format!("{error:#}");
+                        this.project_path.clear();
                         this.thread_branch = None;
-                        this.repo = RepoSnapshot::load(&this.project_path);
+                        this.repo = RepoSnapshot::default();
+                        this.thread_activity = ThreadActivity::Failed;
+                        this.thread_error = Some(detail.clone());
+                        this.worktree_failure = Some(detail.clone());
+                        this.modal = Some(ModalState::NewThread);
                         this.messages = vec![Message {
                             role: MessageRole::System,
                             text: format!(
-                                "Could not create an isolated worktree: {error:#}. This thread is using the main checkout."
+                                "Could not create the isolated worktree: {detail}. Retry or explicitly use the current checkout."
                             ),
                         }];
                     }
                 }
                 this.creating_worktree = false;
+                this.thread_activity_updated_ms = now_ms();
                 this.persist_current_thread();
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn retry_worktree_creation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal = None;
+        self.worktree_failure = None;
+        self.creating_worktree = true;
+        self.thread_activity = ThreadActivity::CreatingWorktree;
+        self.thread_activity_updated_ms = now_ms();
+        self.persist_current_thread();
+        self.spawn_worktree_creation(window, cx);
+    }
+
+    fn use_current_checkout_after_worktree_failure(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal = None;
+        self.worktree_failure = None;
+        self.project_path = self.project_root.clone();
+        self.repo = RepoSnapshot::load(&self.project_path);
+        self.thread_branch = (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone());
+        self.thread_activity = ThreadActivity::Ready;
+        self.thread_activity_updated_ms = now_ms();
+        self.thread_error = None;
+        self.messages.push(Message {
+            role: MessageRole::System,
+            text: "Warning: this thread is using the current project checkout after the isolated worktree failed."
+                .to_owned(),
+        });
+        self.persist_current_thread();
+        let focus = self.composer.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -1827,7 +2267,14 @@ impl RodeApp {
     }
 
     fn ensure_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.creating_worktree || self.terminal_sessions.contains_key(&self.thread_id) {
+        if !self.project_open
+            || !self.repo.is_repository
+            || matches!(
+                self.thread_activity,
+                ThreadActivity::CreatingWorktree | ThreadActivity::Failed
+            )
+            || self.terminal_sessions.contains_key(&self.thread_id)
+        {
             return;
         }
         match TerminalCore::start(&self.project_path) {
@@ -1953,6 +2400,277 @@ impl RodeApp {
             )
     }
 
+    fn render_active_modal(
+        &self,
+        modal_state: ModalState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if modal_state != ModalState::NewThread {
+            return modal::modal_frame(
+                modal_state.title(),
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                    .child("This dialog is ready for its feature-specific content."),
+                self.theme,
+            )
+            .into_any_element();
+        }
+
+        let colors = theme::tokens(self.theme).colors;
+        if self.thread_activity == ThreadActivity::Failed && self.worktree_failure.is_some() {
+            let detail = self.worktree_failure.clone().unwrap_or_default();
+            return modal::modal_frame(
+                "Worktree creation failed",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(colors.deletion))
+                            .bg(rgb(colors.deletion_soft))
+                            .p_3()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .text_color(rgb(colors.error))
+                            .child(detail),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(colors.muted_text))
+                            .child("Rode did not fall back to the main checkout. Retry, or explicitly accept sharing the current checkout."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_3()
+                            .child(button::button(
+                                "use-current-checkout",
+                                "Use current checkout",
+                                button::ButtonStyle::Destructive,
+                                false,
+                                self.theme,
+                                cx.listener(|this, _, window, cx| {
+                                    this.use_current_checkout_after_worktree_failure(window, cx)
+                                }),
+                            ))
+                            .child(button::button(
+                                "retry-worktree",
+                                "Retry",
+                                button::ButtonStyle::Primary,
+                                false,
+                                self.theme,
+                                cx.listener(|this, _, window, cx| {
+                                    this.retry_worktree_creation(window, cx)
+                                }),
+                            )),
+                    ),
+                self.theme,
+            )
+            .into_any_element();
+        }
+
+        let focus = self.new_thread_editor.read(cx).focus_handle.clone();
+        let branches = self
+            .new_thread_branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                let selected = self.new_thread_base_branch.as_deref() == Some(branch.as_str());
+                let branch_click = branch.clone();
+                let branch_key = branch.clone();
+                div()
+                    .id(("new-thread-branch", index))
+                    .role(Role::Button)
+                    .aria_label(format!("Use {branch} as the base branch"))
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        colors.focus_ring
+                    } else {
+                        colors.border
+                    }))
+                    .bg(rgb(if selected {
+                        colors.accent_soft
+                    } else {
+                        colors.panel
+                    }))
+                    .text_sm()
+                    .text_color(rgb(colors.text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_new_thread_branch(branch_click.clone(), cx)
+                    }))
+                    .on_key_down(cx.listener(move |this, event, _, cx| {
+                        if is_activation_key(event) {
+                            this.select_new_thread_branch(branch_key.clone(), cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(branch.clone())
+                    .into_any_element()
+            });
+        let body = div()
+            .key_context("NewThread")
+            .track_focus(&focus)
+            .map(standard_actions(self.new_thread_editor.clone()))
+            .on_action(cx.listener(Self::submit_new_thread_action))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.muted_text))
+                            .child("TITLE"),
+                    )
+                    .child(
+                        div()
+                            .h(px(40.))
+                            .px_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(colors.strong_border))
+                            .bg(rgb(colors.panel))
+                            .text_sm()
+                            .child(
+                                self.new_thread_editor
+                                    .clone()
+                                    .cached(StyleRefinement::default().w_full()),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.muted_text))
+                            .child("BASE BRANCH"),
+                    )
+                    .when(self.new_thread_loading_branches, |list| {
+                        list.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(colors.faint_text))
+                                .child("Loading local branches…"),
+                        )
+                    })
+                    .when(!self.new_thread_loading_branches, |list| {
+                        list.child(div().flex().flex_col().gap_2().children(branches))
+                    }),
+            )
+            .when_some(self.worktree_failure.clone(), |body, error| {
+                body.child(
+                    div()
+                        .rounded_md()
+                        .bg(rgb(colors.deletion_soft))
+                        .p_3()
+                        .text_sm()
+                        .text_color(rgb(colors.error))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .id("new-thread-isolation")
+                    .role(Role::Button)
+                    .aria_label("Toggle isolated worktree creation")
+                    .tab_index(0)
+                    .tab_stop(true)
+                    .cursor_pointer()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.panel))
+                    .p_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_thread_isolation(cx)))
+                    .on_key_down(cx.listener(|this, event, _, cx| {
+                        if is_activation_key(event) {
+                            this.toggle_thread_isolation(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(colors.text))
+                                    .child("Isolated worktree"),
+                            )
+                            .child(
+                                div().text_xs().text_color(rgb(colors.faint_text)).child(
+                                    "Create a dedicated branch and workspace for this thread.",
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(if self.isolate_new_threads {
+                                colors.success
+                            } else {
+                                colors.warning
+                            }))
+                            .child(if self.isolate_new_threads {
+                                "On"
+                            } else {
+                                "Off"
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_3()
+                    .child(button::button(
+                        "cancel-new-thread",
+                        "Cancel",
+                        button::ButtonStyle::Secondary,
+                        false,
+                        self.theme,
+                        cx.listener(|this, _, window, cx| {
+                            this.dismiss_modal(&DismissModal, window, cx)
+                        }),
+                    ))
+                    .child(button::button(
+                        "confirm-new-thread",
+                        "Create thread",
+                        button::ButtonStyle::Primary,
+                        self.new_thread_loading_branches || self.new_thread_base_branch.is_none(),
+                        self.theme,
+                        cx.listener(|this, _, window, cx| this.confirm_new_thread(window, cx)),
+                    )),
+            );
+        modal::modal_frame("New thread", body, self.theme).into_any_element()
+    }
+
     fn render_project_group(
         &self,
         project_index: usize,
@@ -2047,10 +2765,11 @@ impl RodeApp {
                                     .hover(|style| {
                                         style.bg(rgb(theme::tokens(self.theme).colors.overlay))
                                     })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         this.new_thread_in_project(
                                             project_path_for_thread.clone(),
                                             project_name_for_thread.clone(),
+                                            window,
                                             cx,
                                         )
                                     }))
@@ -2094,11 +2813,31 @@ impl RodeApp {
                         let thread_id_for_rename = thread.id.clone();
                         let renaming_thread =
                             self.rename_target == Some(RenameTarget::Thread(thread.id.clone()));
-                        let session = thread
-                            .provider_thread_id
-                            .as_deref()
-                            .map(|id| id.chars().take(8).collect::<String>())
-                            .unwrap_or_else(|| "not started".to_owned());
+                        let activity = if active {
+                            self.thread_activity
+                        } else {
+                            ThreadActivity::from_storage_name(&thread.activity)
+                        };
+                        let activity_color = match activity {
+                            ThreadActivity::Failed => theme::tokens(self.theme).colors.error,
+                            ThreadActivity::Running | ThreadActivity::CreatingWorktree => {
+                                theme::tokens(self.theme).colors.info
+                            }
+                            ThreadActivity::WaitingApproval | ThreadActivity::Cancelling => {
+                                theme::tokens(self.theme).colors.warning
+                            }
+                            ThreadActivity::Complete => theme::tokens(self.theme).colors.success,
+                            ThreadActivity::Ready => theme::tokens(self.theme).colors.muted_text,
+                        };
+                        let branch = thread
+                            .branch
+                            .clone()
+                            .unwrap_or_else(|| "current checkout".to_owned());
+                        let workspace_kind = if thread.branch.is_some() {
+                            "isolated"
+                        } else {
+                            "shared"
+                        };
                         div()
                             .id(format!("thread-{}", thread.id))
                             .rounded_lg()
@@ -2138,13 +2877,28 @@ impl RodeApp {
                                     .when(!renaming_thread, |content| {
                                         content.child(
                                             div()
-                                                .text_sm()
-                                                .text_color(rgb(theme::tokens(self.theme)
-                                                    .colors
-                                                    .text))
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .child(thread.title.clone()),
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .text_sm()
+                                                        .text_color(rgb(theme::tokens(self.theme)
+                                                            .colors
+                                                            .text))
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
+                                                        .child(thread.title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_xs()
+                                                        .text_color(rgb(activity_color))
+                                                        .child(activity.label()),
+                                                ),
                                         )
                                     })
                                     .child(
@@ -2153,7 +2907,33 @@ impl RodeApp {
                                             .text_color(rgb(theme::tokens(self.theme)
                                                 .colors
                                                 .muted_text))
-                                            .child(format!("session {session}")),
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(format!("{branch} · {workspace_kind}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_xs()
+                                            .text_color(rgb(theme::tokens(self.theme)
+                                                .colors
+                                                .faint_text))
+                                            .child(relative_activity_time(
+                                                thread.activity_updated_ms,
+                                            ))
+                                            .when(thread.dirty_count > 0, |meta| {
+                                                meta.child(format!(
+                                                    "● {} dirty",
+                                                    thread.dirty_count
+                                                ))
+                                            })
+                                            .when(thread.unread && !active, |meta| {
+                                                meta.child(div().size(px(7.)).rounded_full().bg(
+                                                    rgb(theme::tokens(self.theme).colors.accent),
+                                                ))
+                                            }),
                                     ),
                             )
                             .child(
@@ -3014,7 +3794,7 @@ impl RodeApp {
                             false,
                             false,
                             self.theme,
-                            cx.listener(|this, _, _, cx| this.new_thread(cx)),
+                            cx.listener(|this, _, window, cx| this.new_thread(window, cx)),
                         ))
                         .child(selectable_row::selectable_row(
                             "add-project-folder",
@@ -4535,14 +5315,7 @@ impl Render for RodeApp {
             .child(self.render_app_rail(cx))
             .child(route)
             .when_some(self.modal, |root, active_modal| {
-                root.child(modal::modal_frame(
-                    active_modal.title(),
-                    div()
-                        .text_sm()
-                        .text_color(rgb(colors.muted_text))
-                        .child("This dialog is ready for its feature-specific content."),
-                    self.theme,
-                ))
+                root.child(self.render_active_modal(active_modal, cx))
             })
             .child(
                 div()
@@ -4581,6 +5354,16 @@ fn onboarding_status(label: &'static str, theme_kind: ThemeKind) -> gpui::AnyEle
 
 fn is_activation_key(event: &KeyDownEvent) -> bool {
     matches!(event.keystroke.key.as_str(), "enter" | "space")
+}
+
+fn relative_activity_time(timestamp_ms: i64) -> String {
+    let elapsed_seconds = now_ms().saturating_sub(timestamp_ms).max(0) / 1_000;
+    match elapsed_seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m ago", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_seconds / 3_600),
+        _ => format!("{}d ago", elapsed_seconds / 86_400),
+    }
 }
 
 fn new_local_thread_id() -> String {
@@ -4640,8 +5423,8 @@ fn route_after_auth(
 mod tests {
     use super::{
         AppRoute, CodexAccount, CodexAuthState, INSPECTOR_WIDTH_SETTING, ROUTE_SETTING,
-        SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, UiPreferences, route_after_auth,
-        select_startup_project,
+        SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, ThreadActivity, UiPreferences,
+        relative_activity_time, route_after_auth, select_startup_project,
     };
     use crate::persistence::{StateStore, StoredProject};
     use crate::theme::ThemeKind;
@@ -4669,6 +5452,29 @@ mod tests {
             })
             .requires_onboarding()
         );
+    }
+
+    #[test]
+    fn thread_activity_round_trips_and_relative_time_has_stable_boundaries() {
+        for activity in [
+            ThreadActivity::CreatingWorktree,
+            ThreadActivity::Running,
+            ThreadActivity::WaitingApproval,
+            ThreadActivity::Cancelling,
+            ThreadActivity::Failed,
+            ThreadActivity::Complete,
+            ThreadActivity::Ready,
+        ] {
+            assert_eq!(
+                ThreadActivity::from_storage_name(activity.storage_name()),
+                activity
+            );
+        }
+        let now = crate::persistence::now_ms();
+        assert_eq!(relative_activity_time(now), "now");
+        assert_eq!(relative_activity_time(now - 60_000), "1m ago");
+        assert_eq!(relative_activity_time(now - 3_600_000), "1h ago");
+        assert_eq!(relative_activity_time(now - 86_400_000), "1d ago");
     }
 
     #[test]
