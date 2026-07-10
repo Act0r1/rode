@@ -13,14 +13,18 @@ that means direct Wayland integration, `xkbcommon` input, and GPU rendering via
 - native Wayland window and GPU-rendered three-pane interface;
 - project and provider discovery for Codex and Claude Code;
 - in-app ChatGPT sign-in through Codex's managed OAuth flow;
-- real Codex execution through the installed CLI with persisted thread IDs;
+- persistent Codex app-server sessions with streamed messages, reasoning,
+  commands, file changes, cancellation, and approval cards;
+- isolated `rode/<thread>-<slug>` Git worktrees for new threads;
+- SQLite-backed projects, threads, provider resume IDs, worktree paths, and
+  conversation restoration;
 - Git branch, dirty-file count, diff stats, and an in-app diff view;
 - Unicode/IME-aware prompt editor using GPUI's platform input path;
 - workspace-write sandboxing as the safe default.
 
-The worktree, terminal, approval UI, Claude/ACP adapter, persistence, and
-commit/push/PR actions are described in [the architecture](docs/architecture.md)
-and will be layered on the same provider-neutral core.
+The terminal, Claude/ACP adapter, and commit/push/PR actions are described in
+[the architecture](docs/architecture.md) and will be layered on the same
+provider-neutral core.
 
 ## Build
 
