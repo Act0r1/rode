@@ -28,6 +28,8 @@ GPUI elements / layout / text / accessibility
         +-- gpui_linux: Wayland protocols, clipboard, xkbcommon, portals
         +-- gpui_wgpu: scene batching, glyph atlas, WGSL pipelines
         +-- calloop: compositor and async event-loop integration
+        +-- libghostty-vt: VT state, reflow, modes, input encoding, render state
+        +-- portable-pty: host shell process and resize/signalling boundary
         |
         v
 Wayland compositor + Vulkan/other wgpu backend
@@ -52,21 +54,39 @@ Zed's Linux code informed several deliberate choices:
 - `app`: GPUI views, focus, actions, and the top-level application state.
 - `editor`: IME-aware multiline input and its low-level shaped-text element.
 - `agent`: provider-neutral turn result plus the first Codex CLI adapter.
+- `codex`: persistent app-server JSON-RPC transport, streamed events,
+  cancellation, and approval responses.
 - `codex_auth`: the Codex app-server account client and managed ChatGPT login.
-- `git`: read-only repository snapshots and diffs; worktree and publishing
-  operations belong here as the prototype grows.
+- `git`: repository snapshots, diffs, and isolated thread worktree lifecycle.
+- `persistence`: WAL-mode SQLite projections for projects, threads, provider
+  resume IDs, workspaces, branches, and messages.
+- `terminal`: one worker-owned Ghostty VT and host PTY per Rode thread, plus a
+  thin GPUI adapter that paints Ghostty render snapshots and forwards input.
 
-The target provider interface is event-oriented:
+## Host terminal boundary
 
-```rust,ignore
-trait AgentProvider {
-    fn discover(&self) -> ProviderStatus;
-    async fn start_thread(&self, request: StartThread) -> EventStream;
-    async fn resume_thread(&self, request: ResumeThread) -> EventStream;
-    async fn respond_to_approval(&self, response: ApprovalResponse);
-    async fn cancel(&self, turn_id: TurnId);
-}
-```
+Rode does not implement a terminal emulator or shell. Each thread lazily owns
+a `libghostty-vt` instance and a real host PTY. `libghostty-vt` is the MIT
+terminal engine extracted from Ghostty; it owns escape-sequence parsing, grid
+and scrollback state, reflow, terminal modes, cursor state, paste safety, and
+key/focus encoding. WezTerm's `portable-pty` owns the process boundary. Rode's
+code only translates Ghostty's render snapshot into GPUI text and quads.
+
+The child command is the user's existing `$SHELL` (falling back to `/bin/sh`),
+started interactively in the active thread worktree. Rode does not force a
+login wrapper or replace the user's startup command, so normal `.zshrc` or
+`.bashrc` behavior, prompts, aliases, and CLI tools are preserved. The terminal
+inherits the host environment with `TERM=xterm-256color`, true-color support,
+and `TERM_PROGRAM=Rode`.
+
+Ghostty's complete `ghostty_surface_*` host API currently accepts macOS/iOS
+native views, not a Linux GPUI/Wayland surface. Embedding Ghostty's GTK window
+inside GPUI is also not possible through Wayland's surface model. The portable
+`libghostty-vt` API is therefore the supported reuse boundary: Ghostty owns
+terminal semantics while GPUI remains the sole window and renderer. Pointer
+press, multi-click, drag, and release events are passed to Ghostty's selection
+gesture state machine, and selected text is formatted by Ghostty before GPUI
+writes it to the Wayland clipboard.
 
 Codex authentication already uses the
 [`codex app-server`](https://developers.openai.com/codex/app-server) JSON-RPC
@@ -75,14 +95,15 @@ account surface. Rode calls `account/read`, starts managed browser OAuth with
 `account/login/completed`. Codex owns the callback listener, token storage, and
 refresh lifecycle; Rode does not handle tokens.
 
-Agent turns should ultimately move to the same app-server transport because it
-also exposes thread/turn lifecycle, streaming items, permission requests,
-cancellation, and process interaction. The first executable slice still uses
-`codex exec --json` and retains the emitted thread ID; approval prompts and live
-token deltas require the app-server transport.
+Agent turns use a persistent app-server transport. Rode initializes the child,
+opens or resumes a provider thread, starts turns, and consumes message,
+reasoning, command, file-change, and completion notifications as they arrive.
+Command and file-change server requests become native approval cards; the user
+can approve or decline without falling back to a terminal. Running turns can be
+interrupted with `turn/interrupt`.
 
-Claude and OpenCode should use ACP where available. A PTY compatibility adapter
-is the fallback for harnesses without a structured protocol.
+Rode deliberately targets Codex only. Claude and OpenCode adapters are outside
+the product scope.
 
 ## Safety model
 
@@ -96,17 +117,20 @@ Per-thread runtime modes map to provider-native policies:
 - `Full access`: explicit opt-in, visibly marked, never inferred from a previous
   thread.
 
-Until the app-server approval flow is implemented, the Codex adapter runs with
-`approval_policy = "never"` and the workspace-write sandbox. A denied operation
-is shown as an agent error; Rode does not auto-upgrade it to full access.
+The Codex transport uses `approvalPolicy = "on-request"` with the
+`workspace-write` sandbox. Requests for commands or writes outside that policy
+are surfaced in the conversation and Rode never auto-upgrades them to full
+access.
 
-## Persistence and isolation plan
+## Persistence and isolation
 
-SQLite will store projects, thread metadata, provider session IDs, message
-projections, panel layout, and drafts. Raw provider events will be appended
-before projection so interrupted streams can be replayed.
+SQLite stores projects, thread metadata, provider session IDs, message
+projections, active-thread selection, worktree paths, and branches. Rode
+restores the active conversation and all project thread cards on launch. Raw
+provider-event journaling, panel layout, and draft restoration remain to be
+added.
 
-For an isolated thread, Rode creates:
+For each new isolated thread, Rode now creates:
 
 ```text
 $XDG_STATE_HOME/rode/worktrees/<repo-id>/<thread-id>/
@@ -122,10 +146,14 @@ created and records the failure.
 1. Native shell, input, provider discovery, managed Codex login, Codex turns,
    and Git diff.
 2. Codex app-server transport with streaming events, cancellation, and approval
-   cards.
-3. SQLite event store and restoration of projects/threads/drafts.
-4. Per-thread Git worktrees and lifecycle management.
-5. PTY terminal with terminal-grid rendering and clipboard support.
+   cards. (implemented)
+3. SQLite state store and restoration of projects, threads, workspaces, provider
+   resume IDs, and messages. (implemented; raw event journal and drafts remain)
+4. Per-thread Git worktree creation and lifecycle management. (creation and
+   removal core implemented; persisted restoration remains)
+5. Per-thread Ghostty VT + host PTY terminal with native grid rendering.
+   (implemented, including mouse selection and host clipboard copy/paste; OSC
+   clipboard requests remain)
 6. Commit/push/PR workflow using the user's `git` and `gh` authentication.
-7. Claude/OpenCode ACP adapters, notifications, desktop-file packaging, and
-   Wayland compositor compatibility tests.
+7. Notifications, desktop-file packaging, and Wayland compositor compatibility
+   tests.

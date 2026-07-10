@@ -143,12 +143,7 @@ impl Editor {
         cx.notify();
     }
 
-    pub fn insert_newline(
-        &mut self,
-        _: &InsertNewline,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
         self.value.insert(self.cursor, '\n');
         self.cursor += 1;
         self.reset_blink(cx);
@@ -373,9 +368,11 @@ impl Element for EditorText {
                 underline: None,
                 strikethrough: None,
             };
-            vec![window
-                .text_system()
-                .shape_line(placeholder, font_size, &[run], None)]
+            vec![
+                window
+                    .text_system()
+                    .shape_line(placeholder, font_size, &[run], None),
+            ]
         } else {
             content
                 .split('\n')
@@ -389,7 +386,9 @@ impl Element for EditorText {
                         underline: None,
                         strikethrough: None,
                     };
-                    window.text_system().shape_line(text, font_size, &[run], None)
+                    window
+                        .text_system()
+                        .shape_line(text, font_size, &[run], None)
                 })
                 .collect()
         };
@@ -403,7 +402,10 @@ impl Element for EditorText {
             };
             Some(fill(
                 Bounds::new(
-                    point(bounds.left() + x, bounds.top() + line_height * cursor_line as f32),
+                    point(
+                        bounds.left() + x,
+                        bounds.top() + line_height * cursor_line as f32,
+                    ),
                     size(px(1.5), line_height),
                 ),
                 text_color,
