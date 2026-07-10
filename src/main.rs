@@ -3,6 +3,7 @@
 mod agent;
 mod codex;
 mod codex_auth;
+mod diff;
 mod editor;
 mod git;
 mod persistence;
@@ -16,6 +17,7 @@ use std::{
 use agent::{ProviderKind, ProviderStatus, discover_providers};
 use codex::{ApprovalRequest, CodexEvent, CodexSession};
 use codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
+use diff::{DiffDocument, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffViewMode, split_rows};
 use editor::{Editor, standard_actions};
 use git::{RepoSnapshot, create_thread_worktree};
 use gpui::{
@@ -44,6 +46,7 @@ actions!(
         CancelRename,
         ToggleTerminal,
         ToggleDiff,
+        ToggleDiffLayout,
         RefreshRepo,
         Quit
     ]
@@ -136,6 +139,7 @@ struct RodeApp {
     show_settings: bool,
     running: bool,
     show_diff: bool,
+    diff_view: DiffViewMode,
     show_terminal: bool,
     terminal_sessions: HashMap<String, Entity<TerminalView>>,
     thread_number: usize,
@@ -278,6 +282,7 @@ impl RodeApp {
             show_settings: false,
             running: false,
             show_diff: true,
+            diff_view: DiffViewMode::Split,
             show_terminal: false,
             terminal_sessions: HashMap::new(),
             thread_number,
@@ -1103,6 +1108,14 @@ impl RodeApp {
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
         self.show_diff = !self.show_diff;
+        cx.notify();
+    }
+
+    fn toggle_diff_layout(&mut self, _: &ToggleDiffLayout, _: &mut Window, cx: &mut Context<Self>) {
+        self.diff_view = match self.diff_view {
+            DiffViewMode::Stack => DiffViewMode::Split,
+            DiffViewMode::Split => DiffViewMode::Stack,
+        };
         cx.notify();
     }
 
@@ -2336,70 +2349,434 @@ impl RodeApp {
             )
     }
 
-    fn render_diff(&self) -> Div {
-        let preview = self
-            .repo
-            .diff
-            .lines()
-            .take(180)
-            .collect::<Vec<_>>()
-            .join("\n");
+    fn render_diff(&self, cx: &mut Context<Self>) -> Div {
+        let document = DiffDocument::parse(&self.repo.diff);
+        let mut files = div()
+            .id("diff-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .overflow_x_scroll()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_3();
+
+        if document.files.is_empty() {
+            files = files.child(
+                div()
+                    .w_full()
+                    .p_5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x292f38))
+                    .bg(rgb(0x141820))
+                    .text_sm()
+                    .text_color(rgb(0x88919f))
+                    .child("No uncommitted diff"),
+            );
+        } else {
+            for (file_index, file) in document.files.iter().enumerate() {
+                files = files.child(self.render_diff_file(file_index, file));
+            }
+        }
+
         div()
-            .w(px(380.))
+            .w(px(720.))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(0x121419))
+            .bg(rgb(0x0d1117))
             .border_l_1()
-            .border_color(rgb(0x292c33))
+            .border_color(rgb(0x292f38))
             .child(
                 div()
                     .h(px(58.))
                     .px_4()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x292c33))
+                    .border_color(rgb(0x292f38))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xe5e7eb))
-                            .child("Working tree"),
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xe6edf3))
+                                    .child("Working tree"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(0x202630))
+                                    .text_xs()
+                                    .text_color(rgb(0x9da7b5))
+                                    .child(format!("{} files", self.repo.changed_files)),
+                            ),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(0x8b93a3))
-                            .child(format!("{} files", self.repo.changed_files)),
+                            .p_1()
+                            .rounded_md()
+                            .bg(rgb(0x171c24))
+                            .border_1()
+                            .border_color(rgb(0x303742))
+                            .flex()
+                            .items_center()
+                            .child(self.render_diff_mode_button(
+                                "diff-mode-stack",
+                                "Stack",
+                                DiffViewMode::Stack,
+                                cx,
+                            ))
+                            .child(self.render_diff_mode_button(
+                                "diff-mode-split",
+                                "Split",
+                                DiffViewMode::Split,
+                                cx,
+                            )),
                     ),
             )
             .child(
                 div()
-                    .p_3()
+                    .px_4()
+                    .py_2()
+                    .flex_none()
                     .border_b_1()
-                    .border_color(rgb(0x292c33))
+                    .border_color(rgb(0x292f38))
                     .text_xs()
                     .whitespace_normal()
-                    .text_color(rgb(0x9aa1af))
+                    .text_color(rgb(0x8b949e))
                     .child(self.repo.diff_stat.clone()),
             )
+            .child(files)
+    }
+
+    fn render_diff_mode_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        mode: DiffViewMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.diff_view == mode;
+        div()
+            .id(id)
+            .role(Role::Button)
+            .aria_label(format!("Show {label} diff view"))
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(if selected {
+                gpui::FontWeight::SEMIBOLD
+            } else {
+                gpui::FontWeight::NORMAL
+            })
+            .bg(if selected {
+                rgb(0x303844)
+            } else {
+                rgb(0x171c24)
+            })
+            .text_color(if selected {
+                rgb(0xf0f6fc)
+            } else {
+                rgb(0x8b949e)
+            })
+            .hover(|style| style.bg(rgb(0x303844)).text_color(rgb(0xf0f6fc)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.diff_view = mode;
+                cx.notify();
+            }))
+            .child(label)
+    }
+
+    fn render_diff_file(&self, file_index: usize, file: &DiffFile) -> impl IntoElement {
+        let mut body = div().w_full().flex().flex_col();
+        let mut previous_old_end = 1;
+
+        if self.diff_view == DiffViewMode::Split && !file.hunks.is_empty() {
+            body = body.child(
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(0x151a21))
+                    .border_b_1()
+                    .border_color(rgb(0x2a3039))
+                    .text_xs()
+                    .text_color(rgb(0x7d8794))
+                    .child(
+                        div()
+                            .w_1_2()
+                            .px_3()
+                            .child(format!("Original · {}", file.old_path)),
+                    )
+                    .child(
+                        div()
+                            .w_1_2()
+                            .px_3()
+                            .border_l_1()
+                            .border_color(rgb(0x343b46))
+                            .child(format!("Modified · {}", file.new_path)),
+                    ),
+            );
+        }
+
+        for hunk in &file.hunks {
+            let hidden = hunk.old_start.saturating_sub(previous_old_end);
+            if hidden > 0 {
+                body = body.child(render_unchanged_band(hidden));
+            }
+            body = body.child(match self.diff_view {
+                DiffViewMode::Stack => render_stack_hunk(hunk),
+                DiffViewMode::Split => render_split_hunk(hunk),
+            });
+            previous_old_end = hunk.old_start.saturating_add(hunk.old_count);
+        }
+
+        if file.hunks.is_empty() {
+            body = body.child(
+                div()
+                    .p_4()
+                    .bg(rgb(0x11161d))
+                    .text_xs()
+                    .text_color(rgb(0x8b949e))
+                    .child(if file.binary {
+                        "Binary file changed"
+                    } else {
+                        "No textual hunks"
+                    }),
+            );
+        }
+
+        div()
+            .id(("diff-file", file_index))
+            .min_w(px(680.))
+            .rounded_lg()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(0x303742))
+            .bg(rgb(0x0f141b))
             .child(
                 div()
-                    .id("diff-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_3()
-                    .font_family("monospace")
-                    .text_xs()
-                    .line_height(px(18.))
-                    .whitespace_normal()
-                    .text_color(rgb(0xbac0cb))
-                    .child(preview),
+                    .h(px(42.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(rgb(0x1a2029))
+                    .border_b_1()
+                    .border_color(rgb(0x303742))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_color(rgb(0x6e7681)).text_xs().child("▾"))
+                            .child(
+                                div()
+                                    .font_family("monospace")
+                                    .text_sm()
+                                    .text_color(rgb(0xd6dde5))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(file.display_path().to_owned()),
+                            )
+                            .when_some(file.status.clone(), |header, status| {
+                                header.child(
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x272e38))
+                                        .text_xs()
+                                        .text_color(rgb(0xaab4c0))
+                                        .child(status),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .font_family("monospace")
+                            .text_xs()
+                            .child(
+                                div()
+                                    .text_color(rgb(0x3fb950))
+                                    .child(format!("+{}", file.additions)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0xf85149))
+                                    .child(format!("−{}", file.deletions)),
+                            ),
+                    ),
             )
+            .child(body)
+    }
+}
+
+fn render_unchanged_band(count: u32) -> Div {
+    div()
+        .h(px(25.))
+        .px_2()
+        .flex()
+        .items_center()
+        .bg(rgb(0x242a33))
+        .border_b_1()
+        .border_color(rgb(0x303742))
+        .font_family("monospace")
+        .text_xs()
+        .text_color(rgb(0x8b949e))
+        .child(format!("▾ {count} unchanged lines"))
+}
+
+fn render_hunk_header(header: &str) -> Div {
+    div()
+        .h(px(25.))
+        .px_2()
+        .flex()
+        .items_center()
+        .bg(rgb(0x242a33))
+        .border_b_1()
+        .border_color(rgb(0x303742))
+        .font_family("monospace")
+        .text_xs()
+        .text_color(rgb(0x9aa4b2))
+        .child(header.to_owned())
+}
+
+fn render_stack_hunk(hunk: &DiffHunk) -> Div {
+    let mut element = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(render_hunk_header(&hunk.header));
+    for line in &hunk.lines {
+        element = element.child(render_stack_line(line));
+    }
+    element
+}
+
+fn render_stack_line(line: &DiffLine) -> Div {
+    let (background, foreground, marker) = diff_line_style(line.kind);
+    div()
+        .min_w(px(680.))
+        .h(px(21.))
+        .flex()
+        .items_center()
+        .bg(rgb(background))
+        .font_family("monospace")
+        .text_xs()
+        .line_height(px(21.))
+        .text_color(rgb(foreground))
+        .child(render_line_number(line.old_line))
+        .child(render_line_number(line.new_line))
+        .child(
+            div()
+                .w(px(20.))
+                .flex_none()
+                .text_center()
+                .text_color(rgb(foreground))
+                .child(marker),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pr_3()
+                .whitespace_nowrap()
+                .child(line.text.clone()),
+        )
+}
+
+fn render_split_hunk(hunk: &DiffHunk) -> Div {
+    let mut element = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(render_hunk_header(&hunk.header));
+    for row in split_rows(hunk) {
+        element = element.child(
+            div()
+                .min_w(px(680.))
+                .h(px(21.))
+                .flex()
+                .child(render_split_cell(row.left.as_ref(), true))
+                .child(render_split_cell(row.right.as_ref(), false)),
+        );
+    }
+    element
+}
+
+fn render_split_cell(line: Option<&DiffLine>, left: bool) -> Div {
+    let (background, foreground, marker) = line
+        .map(|line| diff_line_style(line.kind))
+        .unwrap_or((0x11161d, 0x6e7681, ""));
+    let number = line.and_then(|line| if left { line.old_line } else { line.new_line });
+    let text = line.map(|line| line.text.clone()).unwrap_or_default();
+
+    div()
+        .w_1_2()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .items_center()
+        .bg(rgb(background))
+        .when(!left, |cell| cell.border_l_1().border_color(rgb(0x343b46)))
+        .font_family("monospace")
+        .text_xs()
+        .line_height(px(21.))
+        .text_color(rgb(foreground))
+        .child(render_line_number(number))
+        .child(div().w(px(20.)).flex_none().text_center().child(marker))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pr_2()
+                .whitespace_nowrap()
+                .child(text),
+        )
+}
+
+fn render_line_number(number: Option<u32>) -> Div {
+    div()
+        .w(px(42.))
+        .h_full()
+        .flex_none()
+        .pr_2()
+        .flex()
+        .items_center()
+        .justify_end()
+        .bg(rgb(0x161b22))
+        .border_r_1()
+        .border_color(rgb(0x2b313a))
+        .text_color(rgb(0x6e7681))
+        .child(number.map(|number| number.to_string()).unwrap_or_default())
+}
+
+fn diff_line_style(kind: DiffLineKind) -> (u32, u32, &'static str) {
+    match kind {
+        DiffLineKind::Context => (0x0f141b, 0xc9d1d9, " "),
+        DiffLineKind::Addition => (0x123523, 0xc8e6d0, "+"),
+        DiffLineKind::Deletion => (0x431d22, 0xf0c5ca, "−"),
+        DiffLineKind::Meta => (0x1a2029, 0x8b949e, ""),
     }
 }
 
@@ -2418,6 +2795,7 @@ impl Render for RodeApp {
             .on_action(cx.listener(Self::cancel_rename))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_diff))
+            .on_action(cx.listener(Self::toggle_diff_layout))
             .on_action(cx.listener(Self::refresh_repo))
             .size_full()
             .min_w(px(900.))
@@ -2439,7 +2817,7 @@ impl Render for RodeApp {
                     })
                     .child(self.render_composer(cx)),
             )
-            .when(self.show_diff, |root| root.child(self.render_diff()))
+            .when(self.show_diff, |root| root.child(self.render_diff(cx)))
             .into_any_element()
     }
 }
@@ -2505,6 +2883,7 @@ fn main() {
             KeyBinding::new("escape", CancelRename, Some("Rename")),
             KeyBinding::new("ctrl-j", ToggleTerminal, None),
             KeyBinding::new("ctrl-d", ToggleDiff, None),
+            KeyBinding::new("ctrl-shift-d", ToggleDiffLayout, None),
             KeyBinding::new("ctrl-r", RefreshRepo, None),
             KeyBinding::new("ctrl-q", Quit, None),
         ]);

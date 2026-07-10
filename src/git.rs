@@ -118,26 +118,22 @@ impl RepoSnapshot {
             .unwrap_or_else(|| "detached HEAD".to_owned());
         let status = git_output(&root, &["status", "--porcelain=v1"]).unwrap_or_default();
         let changed_files = status.lines().count();
+        let untracked = untracked_paths(&root);
         let mut diff_stat = git_output(&root, &["diff", "--stat", "HEAD"]).unwrap_or_default();
         let mut diff =
             git_output(&root, &["diff", "--no-ext-diff", "--no-color", "HEAD"]).unwrap_or_default();
-        let untracked = status
-            .lines()
-            .filter_map(|line| line.strip_prefix("?? "))
-            .collect::<Vec<_>>();
+
         if !untracked.is_empty() {
             if !diff_stat.is_empty() {
                 diff_stat.push('\n');
             }
             diff_stat.push_str(&format!("{} untracked file(s)", untracked.len()));
-            if !diff.is_empty() {
-                diff.push_str("\n\n");
-            }
-            diff.push_str("Untracked files:\n");
-            for path in untracked {
-                diff.push_str("  + ");
-                diff.push_str(path);
-                diff.push('\n');
+            for path in &untracked {
+                if !diff.is_empty() {
+                    diff.push_str("\n\n");
+                }
+                let bytes = std::fs::read(root.join(path)).unwrap_or_default();
+                diff.push_str(&untracked_file_diff(path, &bytes));
             }
         }
         if diff_stat.is_empty() {
@@ -220,9 +216,59 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn untracked_paths(cwd: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(cwd)
+        .output()
+        .ok();
+    let Some(output) = output.filter(|output| output.status.success()) else {
+        return Vec::new();
+    };
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {
+    let mut diff = format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+    );
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        diff.push_str(&format!("Binary files /dev/null and b/{path} differ"));
+        return diff;
+    };
+    let line_count = text.lines().count();
+    if bytes.contains(&0) || bytes.len() > 256 * 1024 || line_count > 5_000 {
+        diff.push_str(&format!("Binary files /dev/null and b/{path} differ"));
+        return diff;
+    }
+    if line_count == 0 {
+        return diff;
+    }
+
+    diff.push_str(&format!("@@ -0,0 +1,{line_count} @@\n"));
+    for line in text.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    if !text.ends_with('\n') {
+        diff.push_str("\\ No newline at end of file\n");
+    }
+    diff
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RepoSnapshot, create_thread_worktree_at, remove_thread_worktree, safe_slug};
+    use super::{
+        RepoSnapshot, create_thread_worktree_at, remove_thread_worktree, safe_slug,
+        untracked_file_diff,
+    };
+    use crate::diff::DiffDocument;
     use std::fs;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,7 +297,8 @@ mod tests {
         let snapshot = RepoSnapshot::load(&root);
         assert_eq!(snapshot.changed_files, 1);
         assert!(snapshot.diff_stat.contains("1 untracked file"));
-        assert!(snapshot.diff.contains("+ new.txt"));
+        assert!(snapshot.diff.contains("+++ b/new.txt"));
+        assert!(snapshot.diff.contains("+hello"));
 
         fs::remove_dir_all(root).expect("clean temp repository");
     }
@@ -325,5 +372,23 @@ mod tests {
     fn slug_is_safe_for_branches_and_paths() {
         assert_eq!(safe_slug("  Fix: Wayland / HiDPI  "), "fix-wayland-hidpi");
         assert_eq!(safe_slug("../../"), "");
+    }
+
+    #[test]
+    fn untracked_text_files_are_rendered_as_added_hunks() {
+        let diff = untracked_file_diff("notes/new file.txt", b"first\nsecond\n");
+        let document = DiffDocument::parse(&diff);
+        assert_eq!(document.files.len(), 1);
+        assert_eq!(document.files[0].display_path(), "notes/new file.txt");
+        assert_eq!(document.files[0].status.as_deref(), Some("Added"));
+        assert_eq!(document.files[0].additions, 2);
+    }
+
+    #[test]
+    fn untracked_binary_files_are_not_decoded_as_text() {
+        let diff = untracked_file_diff("image.png", b"\x89PNG\0data");
+        let document = DiffDocument::parse(&diff);
+        assert!(document.files[0].binary);
+        assert_eq!(document.files[0].status.as_deref(), Some("Added"));
     }
 }
