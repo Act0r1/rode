@@ -1,19 +1,22 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 mod agent;
+mod codex;
 mod codex_auth;
 mod editor;
 mod git;
 
 use std::path::PathBuf;
 
-use agent::{ProviderKind, ProviderStatus, discover_providers, run_codex};
+use agent::{ProviderKind, ProviderStatus, discover_providers};
+use codex::{ApprovalRequest, CodexEvent, CodexSession};
 use codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
 use editor::{Editor, standard_actions};
 use git::RepoSnapshot;
 use gpui::{
     App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, Render, Role,
-    StyleRefinement, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    StyleRefinement, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 
@@ -38,6 +41,7 @@ actions!(
 enum MessageRole {
     User,
     Agent,
+    Tool,
     System,
 }
 
@@ -65,7 +69,13 @@ struct RodeApp {
     codex_auth: CodexAuthState,
     messages: Vec<Message>,
     composer: Entity<Editor>,
+    codex_session: Option<CodexSession>,
     codex_thread_id: Option<String>,
+    active_turn_id: Option<String>,
+    active_agent_message: Option<usize>,
+    reasoning_preview: String,
+    approvals: Vec<ApprovalRequest>,
+    session_generation: u64,
     running: bool,
     show_diff: bool,
     thread_number: usize,
@@ -112,7 +122,13 @@ impl RodeApp {
                 text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
             }],
             composer,
+            codex_session: None,
             codex_thread_id: None,
+            active_turn_id: None,
+            active_agent_message: None,
+            reasoning_preview: String::new(),
+            approvals: Vec::new(),
+            session_generation: 0,
             running: false,
             show_diff: true,
             thread_number: 1,
@@ -269,36 +285,288 @@ impl RodeApp {
             role: MessageRole::User,
             text: prompt.clone(),
         });
+        self.active_agent_message = None;
+        self.reasoning_preview.clear();
         self.running = true;
         cx.notify();
 
+        let generation = self.session_generation;
+        if let Some(session) = self.codex_session.clone() {
+            Self::spawn_turn(session, prompt, generation, cx);
+            return;
+        }
+
         let cwd = self.project_path.clone();
-        let thread_id = self.codex_thread_id.clone();
+        let resume_thread_id = self.codex_thread_id.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { run_codex(&cwd, &prompt, thread_id.as_deref()) })
+                .background_spawn(async move {
+                    let (session, events) = CodexSession::start(&cwd, resume_thread_id.as_deref())?;
+                    session.start_turn(&prompt)?;
+                    anyhow::Ok((session, events))
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.running = false;
+                if this.session_generation != generation {
+                    return;
+                }
                 match result {
-                    Ok(run) => {
-                        this.codex_thread_id = run.thread_id;
+                    Ok((session, events)) => {
+                        this.codex_session = Some(session);
+                        this.start_codex_event_pump(events, generation, cx);
+                    }
+                    Err(error) => {
+                        this.running = false;
                         this.messages.push(Message {
-                            role: MessageRole::Agent,
-                            text: run.message,
+                            role: MessageRole::System,
+                            text: format!("Could not start Codex app-server: {error:#}"),
                         });
                     }
-                    Err(error) => this.messages.push(Message {
-                        role: MessageRole::System,
-                        text: format!("Agent turn failed: {error:#}"),
-                    }),
                 }
-                this.repo = RepoSnapshot::load(&this.project_path);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn spawn_turn(session: CodexSession, prompt: String, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { session.start_turn(&prompt) })
+                .await;
+            if let Err(error) = result {
+                this.update(cx, |this, cx| {
+                    if this.session_generation == generation {
+                        this.running = false;
+                        this.messages.push(Message {
+                            role: MessageRole::System,
+                            text: format!("Could not start Codex turn: {error:#}"),
+                        });
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn start_codex_event_pump(
+        &mut self,
+        events: async_channel::Receiver<CodexEvent>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        if this.session_generation == generation {
+                            this.handle_codex_event(event, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn handle_codex_event(&mut self, event: CodexEvent, cx: &mut Context<Self>) {
+        match event {
+            CodexEvent::SessionReady { thread_id, model } => {
+                self.codex_thread_id = Some(thread_id);
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    text: format!("Codex app-server session ready · {model}"),
+                });
+            }
+            CodexEvent::TurnStarted { turn_id } => {
+                self.active_turn_id = Some(turn_id);
+            }
+            CodexEvent::AgentMessageDelta { delta } => {
+                let index = match self.active_agent_message {
+                    Some(index) if index < self.messages.len() => index,
+                    _ => {
+                        self.messages.push(Message {
+                            role: MessageRole::Agent,
+                            text: String::new(),
+                        });
+                        let index = self.messages.len() - 1;
+                        self.active_agent_message = Some(index);
+                        index
+                    }
+                };
+                self.messages[index].text.push_str(&delta);
+            }
+            CodexEvent::AgentMessageCompleted { text } => {
+                if let Some(index) = self.active_agent_message
+                    && index < self.messages.len()
+                {
+                    self.messages[index].text = text;
+                } else if !text.trim().is_empty() {
+                    self.messages.push(Message {
+                        role: MessageRole::Agent,
+                        text,
+                    });
+                }
+                self.active_agent_message = None;
+            }
+            CodexEvent::ReasoningDelta { delta } => {
+                self.reasoning_preview.push_str(&delta);
+                const MAX_REASONING_PREVIEW: usize = 240;
+                if self.reasoning_preview.len() > MAX_REASONING_PREVIEW {
+                    let keep_from = self.reasoning_preview.len() - MAX_REASONING_PREVIEW;
+                    let keep_from = self.reasoning_preview.floor_char_boundary(keep_from);
+                    self.reasoning_preview.drain(..keep_from);
+                }
+            }
+            CodexEvent::CommandStarted {
+                item_id,
+                command,
+                cwd,
+            } => self.messages.push(Message {
+                role: MessageRole::Tool,
+                text: format!("$ {command}\n{cwd}\nitem {item_id}"),
+            }),
+            CodexEvent::CommandCompleted {
+                item_id,
+                command,
+                exit_code,
+                output,
+            } => {
+                let output = output.lines().take(20).collect::<Vec<_>>().join("\n");
+                self.messages.push(Message {
+                    role: MessageRole::Tool,
+                    text: format!(
+                        "$ {command}\nexit {} · item {item_id}{}",
+                        exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "?".to_owned()),
+                        if output.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n\n{output}")
+                        }
+                    ),
+                });
+            }
+            CodexEvent::FileChangeStarted { item_id, summary } => {
+                self.messages.push(Message {
+                    role: MessageRole::Tool,
+                    text: format!("Editing files · {summary}\nitem {item_id}"),
+                });
+            }
+            CodexEvent::ApprovalRequested(request) => self.approvals.push(request),
+            CodexEvent::TurnCompleted { status, error } => {
+                self.running = false;
+                self.active_turn_id = None;
+                self.active_agent_message = None;
+                self.reasoning_preview.clear();
+                self.repo = RepoSnapshot::load(&self.project_path);
+                if let Some(error) = error {
+                    self.messages.push(Message {
+                        role: MessageRole::System,
+                        text: format!("Codex turn {status}: {error}"),
+                    });
+                }
+            }
+            CodexEvent::Error(error) => self.messages.push(Message {
+                role: MessageRole::System,
+                text: format!("Codex app-server: {error}"),
+            }),
+            CodexEvent::Exited => {
+                self.codex_session = None;
+                if self.running {
+                    self.running = false;
+                    self.messages.push(Message {
+                        role: MessageRole::System,
+                        text: "Codex app-server exited before the turn completed.".to_owned(),
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn respond_to_approval(
+        &mut self,
+        index: usize,
+        decision: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.approvals.len() {
+            return;
+        }
+        let request = self.approvals.remove(index);
+        let result = self.codex_session.as_ref().map_or_else(
+            || Err(anyhow::anyhow!("Codex session is no longer running")),
+            |session| session.respond_to_approval(&request.rpc_id, decision),
+        );
+        let outcome = if let Err(error) = result {
+            format!("Could not answer approval request: {error:#}")
+        } else {
+            format!(
+                "{} request {}.",
+                match request.kind {
+                    codex::ApprovalKind::Command => "Command",
+                    codex::ApprovalKind::FileChange => "File-change",
+                },
+                if decision == "accept" {
+                    "approved"
+                } else {
+                    "declined"
+                }
+            )
+        };
+        self.messages.push(Message {
+            role: MessageRole::System,
+            text: outcome,
+        });
+        cx.notify();
+    }
+
+    fn cancel_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.codex_session.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { session.interrupt() })
+                .await;
+            if let Err(error) = result {
+                this.update(cx, |this, cx| {
+                    this.messages.push(Message {
+                        role: MessageRole::System,
+                        text: format!("Could not cancel Codex turn: {error:#}"),
+                    });
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn new_thread(&mut self, cx: &mut Context<Self>) {
+        self.session_generation += 1;
+        self.codex_session = None;
+        self.codex_thread_id = None;
+        self.active_turn_id = None;
+        self.active_agent_message = None;
+        self.reasoning_preview.clear();
+        self.approvals.clear();
+        self.running = false;
+        self.thread_number += 1;
+        self.messages = vec![Message {
+            role: MessageRole::System,
+            text: "New local thread. The first prompt will open a new Codex app-server session."
+                .to_owned(),
+        }];
+        cx.notify();
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -453,15 +721,7 @@ impl RodeApp {
                             .cursor_pointer()
                             .bg(rgb(0x242831))
                             .hover(|style| style.bg(rgb(0x343946)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.thread_number += 1;
-                                this.codex_thread_id = None;
-                                this.messages = vec![Message {
-                                    role: MessageRole::System,
-                                    text: "New local thread. The first prompt will start a new Codex session.".to_owned(),
-                                }];
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.new_thread(cx)))
                             .child("+"),
                     ),
             )
@@ -471,12 +731,7 @@ impl RodeApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x777d8b))
-                            .child("PROJECT"),
-                    )
+                    .child(div().text_xs().text_color(rgb(0x777d8b)).child("PROJECT"))
                     .child(
                         div()
                             .rounded_lg()
@@ -559,13 +814,13 @@ impl RodeApp {
                                             rgb(0x6b7280)
                                         },
                                     ))
-                                    .child(
-                                        div().text_xs().text_color(rgb(0xb9bec9)).child(format!(
+                                    .child(div().text_xs().text_color(rgb(0xb9bec9)).child(
+                                        format!(
                                             "{} · {}",
                                             ProviderKind::Claude.label(),
                                             if claude_available { "ready" } else { "missing" }
-                                        )),
-                                    ),
+                                        ),
+                                    )),
                             )
                             .when_some(claude_path, |status, path| {
                                 status.child(
@@ -664,11 +919,29 @@ impl RodeApp {
                                 this.toggle_diff(&ToggleDiff, window, cx)
                             }))
                             .child(format!("Diff · {}", self.repo.changed_files)),
-                    ),
+                    )
+                    .when(self.running, |actions| {
+                        actions.child(
+                            div()
+                                .id("cancel-turn")
+                                .role(Role::Button)
+                                .aria_label("Cancel the running Codex turn")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_xs()
+                                .bg(rgb(0x7f1d1d))
+                                .text_color(rgb(0xfecaca))
+                                .hover(|style| style.bg(rgb(0x991b1b)))
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_turn(cx)))
+                                .child("Cancel"),
+                        )
+                    }),
             )
     }
 
-    fn render_messages(&self) -> impl IntoElement {
+    fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut messages = div()
             .id("messages")
             .flex_1()
@@ -683,6 +956,7 @@ impl RodeApp {
             let (label, background, border, text) = match message.role {
                 MessageRole::User => ("YOU", 0x17233a, 0x284b7a, 0xe8eef9),
                 MessageRole::Agent => ("CODEX", 0x1a1d24, 0x323641, 0xd8dbe2),
+                MessageRole::Tool => ("TOOL", 0x181b20, 0x3b3f48, 0xc4c9d3),
                 MessageRole::System => ("RODE", 0x171b20, 0x294137, 0xa7c7b8),
             };
             messages = messages.child(
@@ -715,7 +989,104 @@ impl RodeApp {
                     ),
             );
         }
+
+        for (index, request) in self.approvals.iter().enumerate() {
+            let kind = match request.kind {
+                codex::ApprovalKind::Command => "COMMAND APPROVAL",
+                codex::ApprovalKind::FileChange => "FILE-CHANGE APPROVAL",
+            };
+            messages = messages.child(
+                div()
+                    .id(("approval", index))
+                    .w_full()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x92400e))
+                    .bg(rgb(0x261d13))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xfbbf24))
+                            .child(kind),
+                    )
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_sm()
+                            .whitespace_normal()
+                            .text_color(rgb(0xfef3c7))
+                            .child(request.title.clone()),
+                    )
+                    .when(!request.detail.is_empty(), |card| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .whitespace_normal()
+                                .text_color(rgb(0xd6b98b))
+                                .child(request.detail.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(0x8b7355))
+                            .child(format!("item {}", request.item_id)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("approval-accept", index))
+                                    .role(Role::Button)
+                                    .aria_label("Approve request")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(0x166534))
+                                    .text_xs()
+                                    .text_color(rgb(0xdcfce7))
+                                    .hover(|style| style.bg(rgb(0x15803d)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.respond_to_approval(index, "accept", cx)
+                                    }))
+                                    .child("Approve once"),
+                            )
+                            .child(
+                                div()
+                                    .id(("approval-decline", index))
+                                    .role(Role::Button)
+                                    .aria_label("Decline request")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(0x3f2424))
+                                    .text_xs()
+                                    .text_color(rgb(0xfecaca))
+                                    .hover(|style| style.bg(rgb(0x5f2d2d)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.respond_to_approval(index, "decline", cx)
+                                    }))
+                                    .child("Decline"),
+                            ),
+                    ),
+            );
+        }
         if self.running {
+            let activity = if self.reasoning_preview.trim().is_empty() {
+                "Codex is working…".to_owned()
+            } else {
+                format!("Reasoning… {}", self.reasoning_preview.trim())
+            };
             messages = messages.child(
                 div()
                     .w_full()
@@ -726,7 +1097,8 @@ impl RodeApp {
                     .p_4()
                     .text_sm()
                     .text_color(rgb(0x9ca3af))
-                    .child("Codex is working…"),
+                    .line_clamp(3)
+                    .child(activity),
             );
         }
         messages
@@ -870,7 +1242,7 @@ impl Render for RodeApp {
                     .flex()
                     .flex_col()
                     .child(self.render_header(cx))
-                    .child(self.render_messages())
+                    .child(self.render_messages(cx))
                     .child(self.render_composer(cx)),
             )
             .when(self.show_diff, |root| root.child(self.render_diff()))
@@ -903,6 +1275,11 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                app_id: Some("dev.rode.Rode".to_owned()),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Rode".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             move |window, cx| {
