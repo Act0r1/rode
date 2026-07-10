@@ -4,21 +4,12 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderKind {
     Codex,
-    Claude,
 }
 
 impl ProviderKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex",
-            Self::Claude => "Claude",
-        }
-    }
-
     fn executable(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Claude => "claude",
         }
     }
 }
@@ -27,18 +18,16 @@ impl ProviderKind {
 pub struct ProviderStatus {
     pub kind: ProviderKind,
     pub available: bool,
-    pub path: Option<PathBuf>,
 }
 
 pub fn discover_providers() -> Vec<ProviderStatus> {
-    [ProviderKind::Codex, ProviderKind::Claude]
+    [ProviderKind::Codex]
         .into_iter()
         .map(|kind| {
             let path = find_executable(kind.executable());
             ProviderStatus {
                 kind,
                 available: path.is_some(),
-                path,
             }
         })
         .collect()
@@ -58,8 +47,7 @@ mod tests {
     #[test]
     fn discovery_always_returns_supported_providers() {
         let providers = discover_providers();
-        assert_eq!(providers.len(), 2);
+        assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].kind, ProviderKind::Codex);
-        assert_eq!(providers[1].kind, ProviderKind::Claude);
     }
 }

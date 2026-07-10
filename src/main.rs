@@ -6,8 +6,12 @@ mod codex_auth;
 mod editor;
 mod git;
 mod persistence;
+mod terminal;
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use agent::{ProviderKind, ProviderStatus, discover_providers};
 use codex::{ApprovalRequest, CodexEvent, CodexSession};
@@ -21,6 +25,7 @@ use gpui::{
 };
 use gpui_platform::application;
 use persistence::{StateStore, StoredMessage, StoredProject, StoredThread};
+use terminal::{TerminalCore, TerminalView};
 
 const ISOLATE_NEW_THREADS_SETTING: &str = "isolate_new_threads";
 
@@ -37,6 +42,7 @@ actions!(
         SendPrompt,
         SubmitRename,
         CancelRename,
+        ToggleTerminal,
         ToggleDiff,
         RefreshRepo,
         Quit
@@ -124,6 +130,8 @@ struct RodeApp {
     show_settings: bool,
     running: bool,
     show_diff: bool,
+    show_terminal: bool,
+    terminal_sessions: HashMap<String, Entity<TerminalView>>,
     thread_number: usize,
 }
 
@@ -264,6 +272,8 @@ impl RodeApp {
             show_settings: false,
             running: false,
             show_diff: true,
+            show_terminal: false,
+            terminal_sessions: HashMap::new(),
             thread_number,
         };
         app.persist_current_thread();
@@ -982,6 +992,20 @@ impl RodeApp {
         self.start_new_thread(true, cx);
     }
 
+    fn new_thread_in_project(
+        &mut self,
+        project_path: PathBuf,
+        project_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.persist_current_thread();
+        self.project_root = project_path.clone();
+        self.project_path = project_path;
+        self.project_name = project_name;
+        self.repo = RepoSnapshot::load(&self.project_path);
+        self.start_new_thread(false, cx);
+    }
+
     fn start_new_thread(&mut self, persist_previous: bool, cx: &mut Context<Self>) {
         if persist_previous {
             self.persist_current_thread();
@@ -1076,6 +1100,45 @@ impl RodeApp {
         cx.notify();
     }
 
+    fn ensure_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating_worktree || self.terminal_sessions.contains_key(&self.thread_id) {
+            return;
+        }
+        match TerminalCore::start(&self.project_path) {
+            Ok(core) => {
+                let terminal = cx.new(|cx| TerminalView::new(core, window, cx));
+                let focus = terminal.read(cx).focus_handle.clone();
+                self.terminal_sessions
+                    .insert(self.thread_id.clone(), terminal);
+                window.focus(&focus, cx);
+            }
+            Err(error) => {
+                self.show_terminal = false;
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    text: format!("Could not start the native terminal: {error:#}"),
+                });
+                self.persist_current_thread();
+            }
+        }
+    }
+
+    fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_terminal = !self.show_terminal;
+        if self.show_terminal {
+            self.ensure_terminal(window, cx);
+            if let Some(terminal) = self.terminal_sessions.get(&self.thread_id) {
+                let focus = terminal.read(cx).focus_handle.clone();
+                terminal.update(cx, |_, cx| cx.notify());
+                window.focus(&focus, cx);
+            }
+        } else {
+            let focus = self.composer.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
     fn refresh_repo(&mut self, _: &RefreshRepo, _: &mut Window, cx: &mut Context<Self>) {
         self.repo = RepoSnapshot::load(&self.project_path);
         cx.notify();
@@ -1115,6 +1178,8 @@ impl RodeApp {
     ) -> Div {
         let project_path = project.path.clone();
         let project_path_for_rename = project.path.clone();
+        let project_path_for_thread = project.path.clone();
+        let project_name_for_thread = project.name.clone();
         let project_is_active = project.path == self.project_root;
         let renaming_project =
             self.rename_target == Some(RenameTarget::Project(project.path.clone()));
@@ -1179,27 +1244,56 @@ impl RodeApp {
                     )
                     .child(
                         div()
-                            .id(format!("rename-project-{project_index}"))
-                            .role(Role::Button)
-                            .aria_label(format!("Rename project {}", project.name))
                             .flex_none()
-                            .size(px(24.))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x8b93a3))
-                            .hover(|style| style.bg(rgb(0x2b303a)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.begin_rename(
-                                    RenameTarget::Project(project_path_for_rename.clone()),
-                                    window,
-                                    cx,
-                                )
-                            }))
-                            .child("✎"),
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(format!("new-thread-project-{project_index}"))
+                                    .role(Role::Button)
+                                    .aria_label(format!("New thread in {}", project.name))
+                                    .size(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(0x8b93a3))
+                                    .hover(|style| style.bg(rgb(0x2b303a)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.new_thread_in_project(
+                                            project_path_for_thread.clone(),
+                                            project_name_for_thread.clone(),
+                                            cx,
+                                        )
+                                    }))
+                                    .child("+"),
+                            )
+                            .child(
+                                div()
+                                    .id(format!("rename-project-{project_index}"))
+                                    .role(Role::Button)
+                                    .aria_label(format!("Rename project {}", project.name))
+                                    .size(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgb(0x8b93a3))
+                                    .hover(|style| style.bg(rgb(0x2b303a)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_rename(
+                                            RenameTarget::Project(project_path_for_rename.clone()),
+                                            window,
+                                            cx,
+                                        )
+                                    }))
+                                    .child("✎"),
+                            ),
                     ),
             )
             .child(
@@ -1306,14 +1400,6 @@ impl RodeApp {
             CodexAuthState::Error(error) => Some(error.clone()),
             _ => None,
         };
-        let claude_provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.kind == ProviderKind::Claude);
-        let claude_available = claude_provider.is_some_and(|provider| provider.available);
-        let claude_path = claude_provider
-            .and_then(|provider| provider.path.as_ref())
-            .map(|path| path.display().to_string());
         let codex_status = div()
             .rounded_md()
             .p_2()
@@ -1580,44 +1666,7 @@ impl RodeApp {
                                 ),
                         )
                     })
-                    .child(codex_status)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(div().size(px(7.)).rounded_full().bg(
-                                        if claude_available {
-                                            rgb(0x34d399)
-                                        } else {
-                                            rgb(0x6b7280)
-                                        },
-                                    ))
-                                    .child(div().text_xs().text_color(rgb(0xb9bec9)).child(
-                                        format!(
-                                            "{} · {}",
-                                            ProviderKind::Claude.label(),
-                                            if claude_available { "ready" } else { "missing" }
-                                        ),
-                                    )),
-                            )
-                            .when_some(claude_path, |status, path| {
-                                status.child(
-                                    div()
-                                        .pl_4()
-                                        .text_xs()
-                                        .text_color(rgb(0x6b7280))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(path),
-                                )
-                            }),
-                    ),
+                    .child(codex_status),
             )
     }
 
@@ -1665,6 +1714,28 @@ impl RodeApp {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(
+                        div()
+                            .id("toggle-terminal")
+                            .role(Role::Button)
+                            .aria_label("Toggle native terminal")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_xs()
+                            .bg(if self.show_terminal {
+                                rgb(0x2563eb)
+                            } else {
+                                rgb(0x292d36)
+                            })
+                            .text_color(rgb(0xf3f4f6))
+                            .hover(|style| style.bg(rgb(0x3b82f6)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_terminal(&ToggleTerminal, window, cx)
+                            }))
+                            .child("Terminal"),
+                    )
                     .child(
                         div()
                             .id("refresh-repo")
@@ -1940,6 +2011,77 @@ impl RodeApp {
             )
     }
 
+    fn render_terminal(&self, cx: &mut Context<Self>) -> Div {
+        let terminal = self.terminal_sessions.get(&self.thread_id).cloned();
+        let (title, exited) = terminal.as_ref().map_or_else(
+            || ("Preparing terminal…".to_owned(), false),
+            |terminal| {
+                let terminal = terminal.read(cx);
+                (terminal.title().to_owned(), terminal.exited())
+            },
+        );
+        div()
+            .h(px(300.))
+            .min_h(px(180.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(rgb(0x292c33))
+            .bg(rgb(0x0f1115))
+            .child(
+                div()
+                    .h(px(34.))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(rgb(0x17191f))
+                    .border_b_1()
+                    .border_color(rgb(0x292c33))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(if exited { rgb(0xf87171) } else { rgb(0xb9bec9) })
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(if exited {
+                                format!("{title} · exited")
+                            } else {
+                                title
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("close-terminal")
+                            .role(Role::Button)
+                            .aria_label("Close terminal panel")
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(rgb(0x8b93a3))
+                            .hover(|style| style.bg(rgb(0x292d36)).text_color(rgb(0xf3f4f6)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_terminal(&ToggleTerminal, window, cx)
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_2()
+                    .when_some(terminal, |panel, terminal| {
+                        panel
+                            .child(terminal.cached(StyleRefinement::default().w_full().h(px(250.))))
+                    }),
+            )
+    }
+
     fn render_diff(&self) -> Div {
         let preview = self
             .repo
@@ -2008,12 +2150,16 @@ impl RodeApp {
 }
 
 impl Render for RodeApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.show_terminal {
+            self.ensure_terminal(window, cx);
+        }
         div()
             .id("rode-root")
             .on_action(cx.listener(Self::send_prompt))
             .on_action(cx.listener(Self::submit_rename))
             .on_action(cx.listener(Self::cancel_rename))
+            .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::toggle_diff))
             .on_action(cx.listener(Self::refresh_repo))
             .size_full()
@@ -2031,6 +2177,9 @@ impl Render for RodeApp {
                     .flex_col()
                     .child(self.render_header(cx))
                     .child(self.render_messages(cx))
+                    .when(self.show_terminal, |column| {
+                        column.child(self.render_terminal(cx))
+                    })
                     .child(self.render_composer(cx)),
             )
             .when(self.show_diff, |root| root.child(self.render_diff()))
@@ -2081,6 +2230,7 @@ fn main() {
             KeyBinding::new("end", End, Some("Rename")),
             KeyBinding::new("enter", SubmitRename, Some("Rename")),
             KeyBinding::new("escape", CancelRename, Some("Rename")),
+            KeyBinding::new("ctrl-j", ToggleTerminal, None),
             KeyBinding::new("ctrl-d", ToggleDiff, None),
             KeyBinding::new("ctrl-r", RefreshRepo, None),
             KeyBinding::new("ctrl-q", Quit, None),
