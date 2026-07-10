@@ -14,6 +14,7 @@ that means direct Wayland integration, `xkbcommon` input, and GPU rendering via
 - project and provider discovery for Codex and Claude Code;
 - in-app ChatGPT sign-in through Codex's managed OAuth flow;
 - real Codex execution through the installed CLI with persisted thread IDs;
+- folder-based chat groups, with native directory picking and multiple chats per folder;
 - Git branch, dirty-file count, diff stats, and an in-app diff view;
 - Unicode/IME-aware prompt editor using GPUI's platform input path;
 - workspace-write sandboxing as the safe default.

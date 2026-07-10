@@ -6,7 +6,7 @@ mod codex_auth;
 mod editor;
 mod git;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent::{ProviderKind, ProviderStatus, discover_providers};
 use codex::{ApprovalRequest, CodexEvent, CodexSession};
@@ -14,9 +14,9 @@ use codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
 use editor::{Editor, standard_actions};
 use git::RepoSnapshot;
 use gpui::{
-    App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, Render, Role,
-    StyleRefinement, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::*, px, rgb, size,
+    App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, PathPromptOptions,
+    Render, Role, StyleRefinement, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
+    div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 
@@ -52,6 +52,52 @@ struct Message {
 }
 
 #[derive(Clone, Debug)]
+struct Chat {
+    number: usize,
+    thread_id: Option<String>,
+    messages: Vec<Message>,
+}
+
+impl Chat {
+    fn new(number: usize) -> Self {
+        Self {
+            number,
+            thread_id: None,
+            messages: vec![Message {
+                role: MessageRole::System,
+                text: "New local chat. The first prompt will open a new Codex app-server session."
+                    .to_owned(),
+            }],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChatFolder {
+    name: String,
+    path: PathBuf,
+    chats: Vec<Chat>,
+}
+
+impl ChatFolder {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            name: folder_name(&path),
+            path,
+            chats: vec![Chat::new(1)],
+        }
+    }
+}
+
+fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Folder")
+        .to_owned()
+}
+
+#[derive(Clone, Debug)]
 enum CodexAuthState {
     Unavailable,
     Checking,
@@ -78,7 +124,10 @@ struct RodeApp {
     session_generation: u64,
     running: bool,
     show_diff: bool,
-    thread_number: usize,
+    chat_number: usize,
+    chat_folders: Vec<ChatFolder>,
+    active_folder: usize,
+    active_chat: usize,
 }
 
 impl RodeApp {
@@ -111,16 +160,20 @@ impl RodeApp {
             CodexAuthState::Unavailable
         };
 
+        let initial_messages = vec![Message {
+            role: MessageRole::System,
+            text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
+        }];
+        let mut initial_folder = ChatFolder::new(repo.root.clone());
+        initial_folder.chats[0].messages = initial_messages.clone();
+
         Self {
             project_path: repo.root.clone(),
             project_name,
             repo,
             providers,
             codex_auth,
-            messages: vec![Message {
-                role: MessageRole::System,
-                text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
-            }],
+            messages: initial_messages,
             composer,
             codex_session: None,
             codex_thread_id: None,
@@ -131,7 +184,10 @@ impl RodeApp {
             session_generation: 0,
             running: false,
             show_diff: true,
-            thread_number: 1,
+            chat_number: 1,
+            chat_folders: vec![initial_folder],
+            active_folder: 0,
+            active_chat: 0,
         }
     }
 
@@ -551,22 +607,125 @@ impl RodeApp {
         .detach();
     }
 
-    fn new_thread(&mut self, cx: &mut Context<Self>) {
+    fn save_active_chat(&mut self) {
+        let Some(folder) = self.chat_folders.get_mut(self.active_folder) else {
+            return;
+        };
+        let Some(chat) = folder.chats.get_mut(self.active_chat) else {
+            return;
+        };
+        chat.thread_id = self.codex_thread_id.clone();
+        chat.messages = self.messages.clone();
+    }
+
+    fn reset_chat_runtime(&mut self) {
         self.session_generation += 1;
         self.codex_session = None;
-        self.codex_thread_id = None;
         self.active_turn_id = None;
         self.active_agent_message = None;
         self.reasoning_preview.clear();
         self.approvals.clear();
         self.running = false;
-        self.thread_number += 1;
-        self.messages = vec![Message {
-            role: MessageRole::System,
-            text: "New local thread. The first prompt will open a new Codex app-server session."
-                .to_owned(),
-        }];
+    }
+
+    fn switch_chat(&mut self, folder_index: usize, chat_index: usize, cx: &mut Context<Self>) {
+        if folder_index == self.active_folder && chat_index == self.active_chat {
+            return;
+        }
+        let Some(folder) = self.chat_folders.get(folder_index) else {
+            return;
+        };
+        let Some(chat) = folder.chats.get(chat_index) else {
+            return;
+        };
+        let project_path = folder.path.clone();
+        let project_name = folder.name.clone();
+        let chat_number = chat.number;
+        let thread_id = chat.thread_id.clone();
+        let messages = chat.messages.clone();
+
+        self.save_active_chat();
+        self.reset_chat_runtime();
+        self.active_folder = folder_index;
+        self.active_chat = chat_index;
+        self.project_path = project_path;
+        self.project_name = project_name;
+        self.repo = RepoSnapshot::load(&self.project_path);
+        self.chat_number = chat_number;
+        self.codex_thread_id = thread_id;
+        self.messages = messages;
+        self.composer.update(cx, |editor, cx| editor.clear(cx));
         cx.notify();
+    }
+
+    fn new_chat(&mut self, folder_index: usize, cx: &mut Context<Self>) {
+        if folder_index >= self.chat_folders.len() {
+            return;
+        }
+        self.save_active_chat();
+        let chat_index = self.chat_folders[folder_index].chats.len();
+        let chat_number = chat_index + 1;
+        self.chat_folders[folder_index]
+            .chats
+            .push(Chat::new(chat_number));
+
+        if folder_index == self.active_folder && chat_index == self.active_chat {
+            return;
+        }
+        self.switch_chat(folder_index, chat_index, cx);
+    }
+
+    fn add_chat_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let path = path.canonicalize().unwrap_or(path);
+        if let Some(folder_index) = self
+            .chat_folders
+            .iter()
+            .position(|folder| folder.path == path)
+        {
+            let chat_index = self.chat_folders[folder_index]
+                .chats
+                .len()
+                .saturating_sub(1);
+            self.switch_chat(folder_index, chat_index, cx);
+            return;
+        }
+
+        self.save_active_chat();
+        self.chat_folders.push(ChatFolder::new(path));
+        let folder_index = self.chat_folders.len() - 1;
+        self.switch_chat(folder_index, 0, cx);
+    }
+
+    fn open_folder_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add folder".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match selection.await {
+                Ok(result) => result,
+                Err(_) => return,
+            };
+            this.update_in(cx, |this, _window, cx| match result {
+                Ok(Some(paths)) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.add_chat_folder(path, cx);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    this.messages.push(Message {
+                        role: MessageRole::System,
+                        text: format!("Could not open the folder picker: {error:#}"),
+                    });
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -580,12 +739,6 @@ impl RodeApp {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
-        let root_label = self.project_path.display().to_string();
-        let thread_id = self
-            .codex_thread_id
-            .as_deref()
-            .map(|id| id.chars().take(8).collect::<String>())
-            .unwrap_or_else(|| "not started".to_owned());
         let (codex_color, codex_label) = match &self.codex_auth {
             CodexAuthState::Unavailable => (0x6b7280, "Codex · missing".to_owned()),
             CodexAuthState::Checking => (0xf59e0b, "Codex · checking account".to_owned()),
@@ -682,6 +835,121 @@ impl RodeApp {
                     )
                 },
             );
+        let folder_list = self.chat_folders.iter().enumerate().fold(
+            div().flex().flex_col().gap_2(),
+            |folder_list, (folder_index, folder)| {
+                let chats = folder.chats.iter().enumerate().fold(
+                    div().pl_3().flex().flex_col().gap_1(),
+                    |chats, (chat_index, chat)| {
+                        let is_active =
+                            folder_index == self.active_folder && chat_index == self.active_chat;
+                        let session_label = if is_active {
+                            self.codex_thread_id.as_deref()
+                        } else {
+                            chat.thread_id.as_deref()
+                        }
+                        .map(|id| id.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "not started".to_owned());
+                        chats.child(
+                            div()
+                                .id(format!("folder-{folder_index}-chat-{chat_index}"))
+                                .role(Role::Button)
+                                .aria_label(format!("Open Chat {} in {}", chat.number, folder.name))
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(if is_active {
+                                    rgb(0x272b35)
+                                } else {
+                                    rgb(0x17191f)
+                                })
+                                .border_1()
+                                .border_color(if is_active {
+                                    rgb(0x3b82f6)
+                                } else {
+                                    rgb(0x242831)
+                                })
+                                .hover(|style| style.bg(rgb(0x242831)))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.switch_chat(folder_index, chat_index, cx)
+                                }))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xf3f4f6))
+                                        .child(format!("Chat {}", chat.number)),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x777d8b))
+                                        .child(format!("session {session_label}")),
+                                ),
+                        )
+                    },
+                );
+
+                folder_list.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .px_1()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(rgb(0xe5e7eb))
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .child(folder.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x666d7a))
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .child(folder.path.display().to_string()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(format!("new-chat-{folder_index}"))
+                                        .role(Role::Button)
+                                        .aria_label(format!("New chat in {}", folder.name))
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(rgb(0x9ca3af))
+                                        .hover(|style| style.bg(rgb(0x2b303a)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.new_chat(folder_index, cx)
+                                        }))
+                                        .child("New chat"),
+                                ),
+                        )
+                        .child(chats),
+                )
+            },
+        );
 
         div()
             .w(px(252.))
@@ -710,9 +978,9 @@ impl RodeApp {
                     )
                     .child(
                         div()
-                            .id("new-thread")
+                            .id("new-folder")
                             .role(Role::Button)
-                            .aria_label("New agent thread")
+                            .aria_label("Add a chat folder")
                             .size(px(28.))
                             .rounded_md()
                             .flex()
@@ -721,73 +989,25 @@ impl RodeApp {
                             .cursor_pointer()
                             .bg(rgb(0x242831))
                             .hover(|style| style.bg(rgb(0x343946)))
-                            .on_click(cx.listener(|this, _, _, cx| this.new_thread(cx)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_folder_picker(window, cx)
+                            }))
                             .child("+"),
                     ),
             )
             .child(
                 div()
+                    .id("folder-list-scroll")
                     .p_3()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(div().text_xs().text_color(rgb(0x777d8b)).child("PROJECT"))
-                    .child(
-                        div()
-                            .rounded_lg()
-                            .p_3()
-                            .bg(rgb(0x1c1f26))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xe5e7eb))
-                                    .child(self.project_name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x777d8b))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(root_label),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .text_xs()
-                            .text_color(rgb(0x777d8b))
-                            .child("THREADS"),
-                    )
-                    .child(
-                        div()
-                            .rounded_lg()
-                            .p_3()
-                            .bg(rgb(0x272b35))
-                            .border_1()
-                            .border_color(rgb(0x3b82f6))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xf3f4f6))
-                                    .child(format!("Thread {}", self.thread_number)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8b93a3))
-                                    .child(format!("session {thread_id}")),
-                            ),
-                    ),
+                    .child(div().text_xs().text_color(rgb(0x777d8b)).child("FOLDERS"))
+                    .child(folder_list),
             )
-            .child(div().flex_1())
             .child(
                 div()
                     .p_3()
@@ -863,7 +1083,7 @@ impl RodeApp {
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(0xe5e7eb))
-                            .child(format!("Thread {}", self.thread_number)),
+                            .child(format!("{} · Chat {}", self.project_name, self.chat_number)),
                     )
                     .child(
                         div()
@@ -1298,4 +1518,26 @@ fn main() {
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("Rode currently targets Linux/Wayland only.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatFolder, MessageRole, folder_name};
+    use std::path::Path;
+
+    #[test]
+    fn folder_label_comes_from_selected_directory() {
+        assert_eq!(folder_name(Path::new("/work/client-app")), "client-app");
+    }
+
+    #[test]
+    fn a_selected_folder_starts_with_chat_one() {
+        let folder = ChatFolder::new("/work/client-app".into());
+
+        assert_eq!(folder.name, "client-app");
+        assert_eq!(folder.chats.len(), 1);
+        assert_eq!(folder.chats[0].number, 1);
+        assert_eq!(folder.chats[0].messages.len(), 1);
+        assert_eq!(folder.chats[0].messages[0].role, MessageRole::System);
+    }
 }
