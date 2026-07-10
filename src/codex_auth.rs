@@ -42,33 +42,43 @@ impl PendingCodexLogin {
     pub fn wait(mut self) -> Result<CodexAccountStatus> {
         loop {
             let message = self.session.read_message()?;
-            if message.get("method").and_then(Value::as_str) != Some("account/login/completed") {
-                continue;
+            if let Some(completion) = parse_login_completion(&message, &self.login_id) {
+                completion?;
+                return self.session.read_account();
             }
-
-            let params = message
-                .get("params")
-                .context("login completion notification is missing params")?;
-            let completed_login_id = params.get("loginId").and_then(Value::as_str);
-            if completed_login_id != Some(self.login_id.as_str()) {
-                continue;
-            }
-
-            if !params
-                .get("success")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                let detail = params
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the browser login did not complete");
-                bail!("Codex login failed: {detail}");
-            }
-
-            return self.session.read_account();
         }
     }
+}
+
+fn parse_login_completion(message: &Value, expected_login_id: &str) -> Option<Result<()>> {
+    if message.get("method").and_then(Value::as_str) != Some("account/login/completed") {
+        return None;
+    }
+
+    let Some(params) = message.get("params") else {
+        return Some(Err(anyhow!(
+            "login completion notification is missing params"
+        )));
+    };
+    if let Some(completed_login_id) = params.get("loginId").and_then(Value::as_str)
+        && completed_login_id != expected_login_id
+    {
+        return None;
+    }
+
+    if params
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(Ok(()));
+    }
+
+    let detail = params
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("the browser login did not complete");
+    Some(Err(anyhow!("Codex login failed: {detail}")))
 }
 
 pub fn read_codex_account() -> Result<CodexAccountStatus> {
@@ -80,23 +90,34 @@ pub fn begin_codex_login() -> Result<PendingCodexLogin> {
     let result = session.request(
         LOGIN_REQUEST_ID,
         "account/login/start",
-        json!({
-            "type": "chatgpt",
-            "useHostedLoginSuccessPage": true,
-            "appBrand": "codex"
-        }),
+        chatgpt_login_params(),
     )?;
-    let login_id = required_string(&result, "loginId")?;
-    let auth_url = required_string(&result, "authUrl")?;
-    if !auth_url.starts_with("https://") {
-        bail!("Codex returned a non-HTTPS authentication URL");
-    }
+    let (login_id, auth_url) = parse_login_start(&result)?;
 
     Ok(PendingCodexLogin {
         session,
         login_id,
         auth_url,
     })
+}
+
+fn chatgpt_login_params() -> Value {
+    json!({
+        "type": "chatgpt",
+        // The Codex-branded hosted page redirects to `codex://threads/new/`.
+        // Rode receives completion over app-server, so keep success in the
+        // browser instead of claiming another client's URI scheme.
+        "useHostedLoginSuccessPage": false
+    })
+}
+
+fn parse_login_start(result: &Value) -> Result<(String, String)> {
+    let login_id = required_string(result, "loginId")?;
+    let auth_url = required_string(result, "authUrl")?;
+    if !auth_url.starts_with("https://") {
+        bail!("Codex returned a non-HTTPS authentication URL");
+    }
+    Ok((login_id, auth_url))
 }
 
 struct AppServerSession {
@@ -243,7 +264,10 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexAccount, CodexAccountStatus, parse_account_status, read_codex_account};
+    use super::{
+        CodexAccount, CodexAccountStatus, begin_codex_login, chatgpt_login_params,
+        parse_account_status, parse_login_completion, parse_login_start, read_codex_account,
+    };
     use serde_json::json;
 
     #[test]
@@ -283,9 +307,73 @@ mod tests {
     }
 
     #[test]
+    fn starts_the_managed_codex_browser_flow_with_a_local_success_page() {
+        assert_eq!(
+            chatgpt_login_params(),
+            json!({
+                "type": "chatgpt",
+                "useHostedLoginSuccessPage": false
+            })
+        );
+        assert_eq!(
+            parse_login_start(&json!({
+                "loginId": "login-123",
+                "authUrl": "https://chatgpt.com/auth"
+            }))
+            .unwrap(),
+            (
+                "login-123".to_owned(),
+                "https://chatgpt.com/auth".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn refuses_to_open_an_insecure_login_url() {
+        let error = parse_login_start(&json!({
+            "loginId": "login-123",
+            "authUrl": "http://example.com/auth"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("non-HTTPS"));
+    }
+
+    #[test]
+    fn accepts_login_completion_with_a_nullable_login_id() {
+        let completion = parse_login_completion(
+            &json!({
+                "method": "account/login/completed",
+                "params": { "loginId": null, "success": true, "error": null }
+            }),
+            "login-123",
+        )
+        .expect("completion notification");
+        completion.unwrap();
+    }
+
+    #[test]
+    fn ignores_completion_for_a_different_non_null_login_id() {
+        let completion = parse_login_completion(
+            &json!({
+                "method": "account/login/completed",
+                "params": { "loginId": "other-login", "success": true, "error": null }
+            }),
+            "login-123",
+        );
+        assert!(completion.is_none());
+    }
+
+    #[test]
     #[ignore = "requires an installed Codex CLI"]
     fn installed_codex_app_server_reports_account_state() {
         let status = read_codex_account().unwrap();
         assert!(status.account.is_some() || status.requires_openai_auth);
+    }
+
+    #[test]
+    #[ignore = "requires an installed Codex CLI"]
+    fn installed_codex_app_server_starts_browser_login() {
+        let login = begin_codex_login().unwrap();
+        assert!(login.auth_url.starts_with("https://"));
     }
 }
