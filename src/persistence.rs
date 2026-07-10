@@ -203,24 +203,43 @@ impl StateStore {
     }
 
     pub fn load_bool_setting(&self, key: &str, default: bool) -> Result<bool> {
-        let value = self
-            .connection
+        let value = self.load_string_setting(key)?;
+        Ok(value.map_or(default, |value| value == "true"))
+    }
+
+    pub fn save_bool_setting(&mut self, key: &str, value: bool) -> Result<()> {
+        self.save_string_setting(key, if value { "true" } else { "false" })
+    }
+
+    pub fn load_string_setting(&self, key: &str) -> Result<Option<String>> {
+        self.connection
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
                 params![key],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?;
-        Ok(value.map_or(default, |value| value == "true"))
+            .optional()
+            .context("failed to load Rode setting")
     }
 
-    pub fn save_bool_setting(&mut self, key: &str, value: bool) -> Result<()> {
+    pub fn save_string_setting(&mut self, key: &str, value: &str) -> Result<()> {
         self.connection.execute(
             "INSERT INTO settings(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, if value { "true" } else { "false" }],
+            params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn load_f32_setting(&self, key: &str, default: f32) -> Result<f32> {
+        Ok(self
+            .load_string_setting(key)?
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(default))
+    }
+
+    pub fn save_f32_setting(&mut self, key: &str, value: f32) -> Result<()> {
+        self.save_string_setting(key, &value.to_string())
     }
 
     pub fn load_active_thread(&self, project_path: &Path) -> Result<Option<StoredThread>> {
@@ -404,6 +423,16 @@ mod tests {
         assert!(!store.load_bool_setting("isolate", false).unwrap());
         store.save_bool_setting("isolate", true).unwrap();
         assert!(store.load_bool_setting("isolate", false).unwrap());
+        store.save_string_setting("theme", "daylight").unwrap();
+        assert_eq!(
+            store.load_string_setting("theme").unwrap().as_deref(),
+            Some("daylight")
+        );
+        store.save_f32_setting("sidebar_width", 284.5).unwrap();
+        assert_eq!(
+            store.load_f32_setting("sidebar_width", 252.0).unwrap(),
+            284.5
+        );
 
         drop(store);
         fs::remove_dir_all(root).expect("clean state fixture");

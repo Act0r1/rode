@@ -14,6 +14,12 @@ actions!(
         SubmitRename,
         CancelRename,
         DismissModal,
+        OpenWorkspace,
+        OpenSourceControl,
+        OpenTerminalRoute,
+        OpenSettings,
+        CycleTheme,
+        ActivateRailItem,
         ToggleTerminal,
         ToggleDiff,
         ToggleDiffLayout,
@@ -41,6 +47,13 @@ pub(crate) enum ActionId {
     RenameSubmit,
     RenameCancel,
     DismissModal,
+    OpenWorkspace,
+    OpenSourceControl,
+    OpenTerminalRoute,
+    OpenSettings,
+    CycleTheme,
+    ActivateRailItem,
+    ActivateRailItemSpace,
     ToggleTerminal,
     ToggleDiff,
     ToggleDiffLayout,
@@ -149,6 +162,28 @@ pub(crate) const ACTION_REGISTRY: &[ActionDescriptor] = &[
         "escape",
         Some("Modal"),
     ),
+    action(ActionId::OpenWorkspace, "Open workspace", "ctrl-1", None),
+    action(
+        ActionId::OpenSourceControl,
+        "Open source control",
+        "ctrl-2",
+        None,
+    ),
+    action(ActionId::OpenTerminalRoute, "Open terminal", "ctrl-3", None),
+    action(ActionId::OpenSettings, "Open settings", "ctrl-4", None),
+    action(ActionId::CycleTheme, "Cycle theme", "ctrl-shift-t", None),
+    action(
+        ActionId::ActivateRailItem,
+        "Activate navigation item",
+        "enter",
+        Some("Rail"),
+    ),
+    action(
+        ActionId::ActivateRailItemSpace,
+        "Activate navigation item",
+        "space",
+        Some("Rail"),
+    ),
     action(ActionId::ToggleTerminal, "Toggle terminal", "ctrl-j", None),
     action(ActionId::ToggleDiff, "Toggle diff", "ctrl-d", None),
     action(
@@ -205,6 +240,21 @@ fn binding(action: &ActionDescriptor) -> KeyBinding {
         ActionId::RenameSubmit => KeyBinding::new(action.shortcut, SubmitRename, action.context),
         ActionId::RenameCancel => KeyBinding::new(action.shortcut, CancelRename, action.context),
         ActionId::DismissModal => KeyBinding::new(action.shortcut, DismissModal, action.context),
+        ActionId::OpenWorkspace => KeyBinding::new(action.shortcut, OpenWorkspace, action.context),
+        ActionId::OpenSourceControl => {
+            KeyBinding::new(action.shortcut, OpenSourceControl, action.context)
+        }
+        ActionId::OpenTerminalRoute => {
+            KeyBinding::new(action.shortcut, OpenTerminalRoute, action.context)
+        }
+        ActionId::OpenSettings => KeyBinding::new(action.shortcut, OpenSettings, action.context),
+        ActionId::CycleTheme => KeyBinding::new(action.shortcut, CycleTheme, action.context),
+        ActionId::ActivateRailItem => {
+            KeyBinding::new(action.shortcut, ActivateRailItem, action.context)
+        }
+        ActionId::ActivateRailItemSpace => {
+            KeyBinding::new(action.shortcut, ActivateRailItem, action.context)
+        }
         ActionId::ToggleTerminal => {
             KeyBinding::new(action.shortcut, ToggleTerminal, action.context)
         }

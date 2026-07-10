@@ -58,7 +58,7 @@ Zed's Linux code informed several deliberate choices:
   metadata registry used by future menus and the command palette.
 - `theme`: semantic color, status, diff, shadow, and corner-radius tokens.
 - `ui`: reusable native buttons, modal frame, tabs, toast queue, and selectable
-  rows.
+  rows, plus viewport-aware resizable split panes.
 - `editor`: IME-aware multiline input and its low-level shaped-text element.
 - `agent`: installed Codex discovery.
 - `codex`: persistent app-server JSON-RPC transport, streamed events,
@@ -141,6 +141,12 @@ created and records the failure.
 
 ## Implemented delivery
 
+- Architecture milestone 0: application state/rendering extracted from startup,
+  with explicit route and modal state, a shared action registry, theme tokens,
+  and reusable native UI primitives. (implemented)
+- Shell milestone 1: authenticated application rail and Workspace/Source
+  Control/Terminal/Settings routing, Ember/Graphite/Daylight themes, responsive
+  split panes, and persisted route/theme/panel widths. (implemented)
 1. Native shell, input, provider discovery, managed Codex login, Codex turns,
    and structured Git diff. (implemented)
 2. Codex app-server transport with streaming events, cancellation, and approval

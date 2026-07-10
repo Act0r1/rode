@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+use crate::theme::{self, ThemeKind};
+
 use anyhow::{Context as _, Result};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, ElementInputHandler, Entity,
@@ -746,11 +748,17 @@ pub struct TerminalView {
     cursor_bounds: Option<Bounds<Pixels>>,
     grid_bounds: Option<Bounds<Pixels>>,
     cell_size: Option<gpui::Size<Pixels>>,
+    theme: ThemeKind,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TerminalView {
-    pub fn new(core: Arc<TerminalCore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        core: Arc<TerminalCore>,
+        theme: ThemeKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let focus_in = cx.on_focus(&focus_handle, window, |this, _, cx| {
             this.core.focus(true);
@@ -771,10 +779,18 @@ impl TerminalView {
             cursor_bounds: None,
             grid_bounds: None,
             cell_size: None,
+            theme,
             _subscriptions: vec![focus_in, focus_out],
         };
         view.start_event_pump(cx);
         view
+    }
+
+    pub fn set_theme(&mut self, theme: ThemeKind, cx: &mut Context<Self>) {
+        if self.theme != theme {
+            self.theme = theme;
+            cx.notify();
+        }
     }
 
     pub fn title(&self) -> &str {
@@ -1152,6 +1168,7 @@ impl EntityInputHandler for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = theme::tokens(self.theme).colors;
         div()
             .id("native-terminal")
             .key_context("Terminal")
@@ -1159,7 +1176,7 @@ impl Render for TerminalView {
             .w_full()
             .h(px(250.))
             .overflow_hidden()
-            .bg(rgb(0x0f1115))
+            .bg(rgb(colors.root))
             .font_family("monospace")
             .text_size(px(13.))
             .line_height(px(18.))
@@ -1184,6 +1201,7 @@ impl Render for TerminalView {
                 view: cx.entity(),
                 snapshot: self.snapshot.clone(),
                 marked_text: self.marked_text.clone(),
+                theme: self.theme,
             })
     }
 }
@@ -1192,6 +1210,7 @@ struct TerminalGrid {
     view: Entity<TerminalView>,
     snapshot: TerminalSnapshot,
     marked_text: Option<String>,
+    theme: ThemeKind,
 }
 
 struct TerminalGridPrepaint {
@@ -1245,6 +1264,7 @@ impl Element for TerminalGrid {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let colors = theme::tokens(self.theme).colors;
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
@@ -1382,18 +1402,20 @@ impl Element for TerminalGrid {
                         point(cursor_origin.x, cursor_origin.y + line_height - px(2.)),
                         size(cell_width, px(2.)),
                     ),
-                    rgb(0xd8dbe2),
+                    rgb(colors.text),
                 )),
                 TerminalCursorShape::Bar => Some(fill(
                     Bounds::new(cursor_origin, size(px(2.), line_height)),
-                    rgb(0xd8dbe2),
+                    rgb(colors.text),
                 )),
                 TerminalCursorShape::HollowBlock => Some(outline(
                     cursor_bounds,
-                    rgb(0xd8dbe2),
+                    rgb(colors.text),
                     gpui::BorderStyle::default(),
                 )),
-                TerminalCursorShape::Block => Some(fill(cursor_bounds, gpui::rgba(0xd8dbe259))),
+                TerminalCursorShape::Block => {
+                    Some(fill(cursor_bounds, rgb(colors.text).alpha(0.35)))
+                }
             }
         };
         let marked_text = self
@@ -1405,10 +1427,10 @@ impl Element for TerminalGrid {
                 let run = TextRun {
                     len: text.len(),
                     font: style.font(),
-                    color: rgb(0xf8f9fb).into(),
-                    background_color: Some(rgb(0x242831).into()),
+                    color: rgb(colors.text).into(),
+                    background_color: Some(rgb(colors.overlay).into()),
                     underline: Some(UnderlineStyle {
-                        color: Some(rgb(0x75b2ff).into()),
+                        color: Some(rgb(colors.focus_ring).into()),
                         thickness: px(1.),
                         wavy: false,
                     }),

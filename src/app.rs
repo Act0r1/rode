@@ -4,7 +4,8 @@ use std::{
 };
 
 use crate::actions::{
-    CancelRename, DismissModal, RefreshRepo, SendPrompt, SubmitRename, ToggleDiff,
+    ActivateRailItem, CancelRename, CycleTheme, DismissModal, OpenSettings, OpenSourceControl,
+    OpenTerminalRoute, OpenWorkspace, RefreshRepo, SendPrompt, SubmitRename, ToggleDiff,
     ToggleDiffLayout, ToggleTerminal,
 };
 use crate::agent::{ProviderKind, ProviderStatus, discover_providers};
@@ -20,16 +21,20 @@ use crate::git::{
 use crate::notifications;
 use crate::persistence::{StateStore, StoredMessage, StoredProject, StoredThread};
 use crate::terminal::{TerminalCore, TerminalView};
-use crate::theme;
-use crate::ui::{button, modal, selectable_row, tabs, toast};
+use crate::theme::{self, ThemeKind};
+use crate::ui::{button, modal, selectable_row, split_pane, tabs, toast};
 use gpui::{
-    App, Context, CursorStyle, Div, Entity, IntoElement, PathPromptOptions, Render, Role,
-    StyleRefinement, Subscription, Window, div, prelude::*, px, rgb,
+    App, Context, CursorStyle, Div, Entity, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Render, Role, StyleRefinement, Subscription, Window, div, prelude::*, px,
+    rgb,
 };
 
 const ISOLATE_NEW_THREADS_SETTING: &str = "isolate_new_threads";
+const ROUTE_SETTING: &str = "ui.route";
+const THEME_SETTING: &str = "ui.theme";
+const SIDEBAR_WIDTH_SETTING: &str = "ui.workspace.sidebar_width";
+const INSPECTOR_WIDTH_SETTING: &str = "ui.workspace.inspector_width";
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum SettingsSection {
     #[default]
@@ -41,7 +46,6 @@ pub(crate) enum SettingsSection {
     Account,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum AppRoute {
     Login,
@@ -60,6 +64,71 @@ impl AppRoute {
             Self::SourceControl => "SourceControl",
             Self::Terminal => "TerminalRoute",
             Self::Settings(_) => "Settings",
+        }
+    }
+
+    fn storage_name(self) -> &'static str {
+        match self {
+            Self::Login | Self::Workspace => "workspace",
+            Self::SourceControl => "source_control",
+            Self::Terminal => "terminal",
+            Self::Settings(_) => "settings",
+        }
+    }
+
+    fn from_storage_name(value: &str) -> Self {
+        match value {
+            "source_control" => Self::SourceControl,
+            "terminal" => Self::Terminal,
+            "settings" => Self::Settings(SettingsSection::Appearance),
+            _ => Self::Workspace,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Login => "Sign in",
+            Self::Workspace => "Workspace",
+            Self::SourceControl => "Source control",
+            Self::Terminal => "Terminal",
+            Self::Settings(_) => "Settings",
+        }
+    }
+
+    fn same_surface(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Login, Self::Login)
+                | (Self::Workspace, Self::Workspace)
+                | (Self::SourceControl, Self::SourceControl)
+                | (Self::Terminal, Self::Terminal)
+                | (Self::Settings(_), Self::Settings(_))
+        )
+    }
+
+    fn requires_project(self) -> bool {
+        matches!(self, Self::SourceControl | Self::Terminal)
+    }
+}
+
+impl SettingsSection {
+    const ALL: [Self; 6] = [
+        Self::Appearance,
+        Self::AgentsAndModels,
+        Self::Terminal,
+        Self::GitAndWorktrees,
+        Self::Keybindings,
+        Self::Account,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::AgentsAndModels => "Agents & models",
+            Self::Terminal => "Terminal",
+            Self::GitAndWorktrees => "Git & worktrees",
+            Self::Keybindings => "Keybindings",
+            Self::Account => "Account",
         }
     }
 }
@@ -154,8 +223,60 @@ enum PublishOperation {
     PullRequest(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UiPreferences {
+    route: AppRoute,
+    theme: ThemeKind,
+    panels: split_pane::PanelLayout,
+}
+
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            route: AppRoute::Workspace,
+            theme: ThemeKind::Ember,
+            panels: split_pane::PanelLayout::default(),
+        }
+    }
+}
+
+impl UiPreferences {
+    fn load(store: &StateStore) -> Self {
+        let defaults = Self::default();
+        Self {
+            route: store
+                .load_string_setting(ROUTE_SETTING)
+                .ok()
+                .flatten()
+                .as_deref()
+                .map(AppRoute::from_storage_name)
+                .unwrap_or(defaults.route),
+            theme: store
+                .load_string_setting(THEME_SETTING)
+                .ok()
+                .flatten()
+                .as_deref()
+                .map(ThemeKind::from_storage_name)
+                .unwrap_or(defaults.theme),
+            panels: split_pane::PanelLayout {
+                sidebar_width: store
+                    .load_f32_setting(SIDEBAR_WIDTH_SETTING, defaults.panels.sidebar_width)
+                    .unwrap_or(defaults.panels.sidebar_width),
+                inspector_width: store
+                    .load_f32_setting(INSPECTOR_WIDTH_SETTING, defaults.panels.inspector_width)
+                    .unwrap_or(defaults.panels.inspector_width),
+            }
+            .sanitized(),
+        }
+    }
+}
+
 pub(crate) struct RodeApp {
     route: AppRoute,
+    last_authenticated_route: AppRoute,
+    theme: ThemeKind,
+    panel_layout: split_pane::PanelLayout,
+    active_split: Option<split_pane::SplitTarget>,
     modal: Option<ModalState>,
     toasts: toast::ToastQueue,
     state_store: Option<StateStore>,
@@ -201,18 +322,26 @@ impl RodeApp {
     pub(crate) fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let initial_repo = RepoSnapshot::load(&project_path);
         let project_root = initial_repo.root.clone();
-        let (state_store, restored_thread, isolate_new_threads, persistence_error) =
+        let (state_store, restored_thread, isolate_new_threads, ui_preferences, persistence_error) =
             match StateStore::open_default() {
                 Ok(store) => {
+                    let ui_preferences = UiPreferences::load(&store);
                     let isolate_new_threads = store
                         .load_bool_setting(ISOLATE_NEW_THREADS_SETTING, false)
                         .unwrap_or(false);
                     match store.load_active_thread(&project_root) {
-                        Ok(thread) => (Some(store), thread, isolate_new_threads, None),
+                        Ok(thread) => (
+                            Some(store),
+                            thread,
+                            isolate_new_threads,
+                            ui_preferences,
+                            None,
+                        ),
                         Err(error) => (
                             Some(store),
                             None,
                             isolate_new_threads,
+                            ui_preferences,
                             Some(format!("Could not restore Rode state: {error:#}")),
                         ),
                     }
@@ -221,6 +350,7 @@ impl RodeApp {
                     None,
                     None,
                     false,
+                    UiPreferences::default(),
                     Some(format!("Could not open Rode state database: {error:#}")),
                 ),
             };
@@ -230,6 +360,11 @@ impl RodeApp {
             .filter(|path| path.is_dir());
         let project_path = restored_workspace.unwrap_or_else(|| project_root.clone());
         let repo = RepoSnapshot::load(&project_path);
+        let restored_route = if ui_preferences.route.requires_project() && !repo.is_repository {
+            AppRoute::Workspace
+        } else {
+            ui_preferences.route
+        };
         let project_name = restored_thread
             .as_ref()
             .map(|thread| thread.project_name.clone())
@@ -309,8 +444,12 @@ impl RodeApp {
             route: if codex_auth.requires_onboarding() {
                 AppRoute::Login
             } else {
-                AppRoute::Workspace
+                restored_route
             },
+            last_authenticated_route: restored_route,
+            theme: ui_preferences.theme,
+            panel_layout: ui_preferences.panels,
+            active_split: None,
             modal: None,
             toasts: toast::ToastQueue::default(),
             state_store,
@@ -447,6 +586,7 @@ impl RodeApp {
             self.project_root.clone()
         };
         self.repo = RepoSnapshot::load(&self.project_path);
+        self.reconcile_project_route();
         self.messages = thread
             .messages
             .into_iter()
@@ -476,7 +616,172 @@ impl RodeApp {
     }
 
     fn sync_route_with_auth(&mut self) {
-        self.route = route_after_auth(self.route, self.codex_auth.requires_onboarding());
+        self.route = route_after_auth(
+            self.route,
+            self.last_authenticated_route,
+            self.codex_auth.requires_onboarding(),
+        );
+    }
+
+    fn reconcile_project_route(&mut self) {
+        if !self.repo.is_repository
+            && (self.route.requires_project() || self.last_authenticated_route.requires_project())
+        {
+            self.route = AppRoute::Workspace;
+            self.last_authenticated_route = AppRoute::Workspace;
+        }
+    }
+
+    fn navigate_to(&mut self, route: AppRoute, window: &mut Window, cx: &mut Context<Self>) {
+        if self.codex_auth.requires_onboarding() {
+            self.route = AppRoute::Login;
+            cx.notify();
+            return;
+        }
+        if route.requires_project() && !self.repo.is_repository {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                format!("{} requires an open Git project.", route.label()),
+            );
+            cx.notify();
+            return;
+        }
+
+        self.route = route;
+        self.last_authenticated_route = route;
+        self.show_create_menu = false;
+        self.show_settings = false;
+        self.modal = None;
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.save_string_setting(ROUTE_SETTING, route.storage_name())
+        {
+            self.toasts.push(
+                toast::ToastKind::Error,
+                format!("Could not save the selected route: {error:#}"),
+            );
+        }
+
+        match route {
+            AppRoute::Workspace => {
+                let focus = self.composer.read(cx).focus_handle.clone();
+                window.focus(&focus, cx);
+            }
+            AppRoute::Terminal => {
+                self.ensure_terminal(window, cx);
+                if let Some(terminal) = self.terminal_sessions.get(&self.thread_id) {
+                    let focus = terminal.read(cx).focus_handle.clone();
+                    window.focus(&focus, cx);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn open_workspace(&mut self, _: &OpenWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_to(AppRoute::Workspace, window, cx);
+    }
+
+    fn open_source_control(
+        &mut self,
+        _: &OpenSourceControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_to(AppRoute::SourceControl, window, cx);
+    }
+
+    fn open_terminal_route(
+        &mut self,
+        _: &OpenTerminalRoute,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_to(AppRoute::Terminal, window, cx);
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_to(AppRoute::Settings(SettingsSection::Appearance), window, cx);
+    }
+
+    fn set_theme(&mut self, selected: ThemeKind, cx: &mut Context<Self>) {
+        if self.theme == selected {
+            return;
+        }
+        self.theme = selected;
+        for terminal in self.terminal_sessions.values() {
+            terminal.update(cx, |terminal, cx| terminal.set_theme(selected, cx));
+        }
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.save_string_setting(THEME_SETTING, selected.storage_name())
+        {
+            self.toasts.push(
+                toast::ToastKind::Error,
+                format!("Could not save the selected theme: {error:#}"),
+            );
+        }
+        cx.notify();
+    }
+
+    fn set_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        let route = AppRoute::Settings(section);
+        self.route = route;
+        self.last_authenticated_route = route;
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.save_string_setting(ROUTE_SETTING, route.storage_name())
+        {
+            self.toasts.push(
+                toast::ToastKind::Error,
+                format!("Could not save the settings section: {error:#}"),
+            );
+        }
+        cx.notify();
+    }
+
+    fn cycle_theme(&mut self, _: &CycleTheme, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_theme(self.theme.next(), cx);
+    }
+
+    fn resize_panels(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.active_split else {
+            return;
+        };
+        match active {
+            split_pane::SplitTarget::Sidebar => {
+                self.panel_layout.sidebar_width =
+                    f32::from(event.position.x) - split_pane::RAIL_WIDTH;
+            }
+            split_pane::SplitTarget::Inspector => {
+                self.panel_layout.inspector_width =
+                    f32::from(window.viewport_size().width) - f32::from(event.position.x);
+            }
+        }
+        self.panel_layout = self.panel_layout.sanitized();
+        cx.notify();
+    }
+
+    fn finish_panel_resize(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_split.take().is_none() {
+            return;
+        }
+        if let Some(store) = self.state_store.as_mut() {
+            let sidebar =
+                store.save_f32_setting(SIDEBAR_WIDTH_SETTING, self.panel_layout.sidebar_width);
+            let inspector =
+                store.save_f32_setting(INSPECTOR_WIDTH_SETTING, self.panel_layout.inspector_width);
+            if let Err(error) = sidebar.and(inspector) {
+                self.toasts.push(
+                    toast::ToastKind::Error,
+                    format!("Could not save panel widths: {error:#}"),
+                );
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn refresh_codex_account(&mut self, cx: &mut Context<Self>) {
@@ -1006,6 +1311,7 @@ impl RodeApp {
             .map(|project| project.name)
             .unwrap_or_else(|| folder_name(&path));
         self.repo = RepoSnapshot::load(&path);
+        self.reconcile_project_route();
         if let Some(store) = self.state_store.as_mut()
             && let Err(error) = store.save_project(&StoredProject {
                 path,
@@ -1119,6 +1425,7 @@ impl RodeApp {
         self.project_path = project_path;
         self.project_name = project_name;
         self.repo = RepoSnapshot::load(&self.project_path);
+        self.reconcile_project_route();
         self.start_new_thread(false, cx);
     }
 
@@ -1234,7 +1541,8 @@ impl RodeApp {
         }
         match TerminalCore::start(&self.project_path) {
             Ok(core) => {
-                let terminal = cx.new(|cx| TerminalView::new(core, window, cx));
+                let theme = self.theme;
+                let terminal = cx.new(|cx| TerminalView::new(core, theme, window, cx));
                 let focus = terminal.read(cx).focus_handle.clone();
                 self.terminal_sessions
                     .insert(self.thread_id.clone(), terminal);
@@ -1343,10 +1651,10 @@ impl RodeApp {
             .py_1()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x3b82f6))
-            .bg(rgb(0x20232a))
+            .border_color(rgb(theme::tokens(self.theme).colors.accent_hover))
+            .bg(rgb(theme::tokens(self.theme).colors.raised))
             .text_sm()
-            .text_color(rgb(0xf3f4f6))
+            .text_color(rgb(theme::tokens(self.theme).colors.text))
             .child(
                 self.rename_editor
                     .clone()
@@ -1377,15 +1685,15 @@ impl RodeApp {
             .rounded_lg()
             .p_2()
             .bg(if project_is_active {
-                rgb(0x1c2028)
+                rgb(theme::tokens(self.theme).colors.raised)
             } else {
-                rgb(0x171a20)
+                rgb(theme::tokens(self.theme).colors.chrome)
             })
             .border_1()
             .border_color(if project_is_active {
-                rgb(0x374151)
+                rgb(theme::tokens(self.theme).colors.strong_border)
             } else {
-                rgb(0x292c33)
+                rgb(theme::tokens(self.theme).colors.border)
             })
             .flex()
             .flex_col()
@@ -1411,7 +1719,7 @@ impl RodeApp {
                                     div()
                                         .text_sm()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xe5e7eb))
+                                        .text_color(rgb(theme::tokens(self.theme).colors.text))
                                         .overflow_hidden()
                                         .text_ellipsis()
                                         .child(project.name.clone()),
@@ -1420,7 +1728,7 @@ impl RodeApp {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x666d7a))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .child(project_path.display().to_string()),
@@ -1444,8 +1752,10 @@ impl RodeApp {
                                     .rounded_md()
                                     .cursor_pointer()
                                     .text_sm()
-                                    .text_color(rgb(0x8b93a3))
-                                    .hover(|style| style.bg(rgb(0x2b303a)))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                                    .hover(|style| {
+                                        style.bg(rgb(theme::tokens(self.theme).colors.overlay))
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.new_thread_in_project(
                                             project_path_for_thread.clone(),
@@ -1467,8 +1777,10 @@ impl RodeApp {
                                     .rounded_md()
                                     .cursor_pointer()
                                     .text_xs()
-                                    .text_color(rgb(0x8b93a3))
-                                    .hover(|style| style.bg(rgb(0x2b303a)))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                                    .hover(|style| {
+                                        style.bg(rgb(theme::tokens(self.theme).colors.overlay))
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.begin_rename(
                                             RenameTarget::Project(project_path_for_rename.clone()),
@@ -1500,9 +1812,17 @@ impl RodeApp {
                             .id(format!("thread-{}", thread.id))
                             .rounded_lg()
                             .p_2()
-                            .bg(if active { rgb(0x272b35) } else { rgb(0x1a1d23) })
+                            .bg(if active {
+                                rgb(theme::tokens(self.theme).colors.overlay)
+                            } else {
+                                rgb(theme::tokens(self.theme).colors.panel)
+                            })
                             .border_1()
-                            .border_color(if active { rgb(0x3b82f6) } else { rgb(0x292c33) })
+                            .border_color(if active {
+                                rgb(theme::tokens(self.theme).colors.accent_hover)
+                            } else {
+                                rgb(theme::tokens(self.theme).colors.border)
+                            })
                             .flex()
                             .items_start()
                             .gap_1()
@@ -1528,7 +1848,9 @@ impl RodeApp {
                                         content.child(
                                             div()
                                                 .text_sm()
-                                                .text_color(rgb(0xf3f4f6))
+                                                .text_color(rgb(theme::tokens(self.theme)
+                                                    .colors
+                                                    .text))
                                                 .overflow_hidden()
                                                 .text_ellipsis()
                                                 .child(thread.title.clone()),
@@ -1537,7 +1859,9 @@ impl RodeApp {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(0x8b93a3))
+                                            .text_color(rgb(theme::tokens(self.theme)
+                                                .colors
+                                                .muted_text))
                                             .child(format!("session {session}")),
                                     ),
                             )
@@ -1554,8 +1878,11 @@ impl RodeApp {
                                     .rounded_md()
                                     .cursor_pointer()
                                     .text_xs()
-                                    .text_color(rgb(0x8b93a3))
-                                    .hover(|style| style.bg(rgb(0x343946)))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                                    .hover(|style| {
+                                        style
+                                            .bg(rgb(theme::tokens(self.theme).colors.strong_border))
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.begin_rename(
                                             RenameTarget::Thread(thread_id_for_rename.clone()),
@@ -1570,13 +1897,14 @@ impl RodeApp {
     }
 
     fn render_auth_onboarding(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = theme::tokens(self.theme).colors;
         let (status_color, status_label) = match &self.codex_auth {
-            CodexAuthState::Unavailable => (0xf87171, "CLI not found"),
-            CodexAuthState::Checking => (0xfbbf24, "Checking account"),
-            CodexAuthState::SignedOut => (0x60a5fa, "Ready to connect"),
-            CodexAuthState::SigningIn => (0x60a5fa, "Waiting for browser"),
-            CodexAuthState::Error(_) => (0xf87171, "Connection error"),
-            CodexAuthState::SignedIn(_) => (0x34d399, "Connected"),
+            CodexAuthState::Unavailable => (colors.error, "CLI not found"),
+            CodexAuthState::Checking => (colors.warning, "Checking account"),
+            CodexAuthState::SignedOut => (colors.info, "Ready to connect"),
+            CodexAuthState::SigningIn => (colors.info, "Waiting for browser"),
+            CodexAuthState::Error(_) => (colors.error, "Connection error"),
+            CodexAuthState::SignedIn(_) => (colors.success, "Connected"),
         };
         let error = match &self.codex_auth {
             CodexAuthState::Error(error) => Some(error.clone()),
@@ -1589,8 +1917,8 @@ impl RodeApp {
             .min_w(px(720.))
             .flex()
             .flex_col()
-            .bg(rgb(0x0f1115))
-            .text_color(rgb(0xd1d5db))
+            .bg(rgb(theme::tokens(self.theme).colors.root))
+            .text_color(rgb(theme::tokens(self.theme).colors.text))
             .child(
                 div()
                     .h(px(64.))
@@ -1599,18 +1927,18 @@ impl RodeApp {
                     .flex()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(0x252932))
+                    .border_color(rgb(theme::tokens(self.theme).colors.overlay))
                     .child(
                         div()
                             .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xf3f4f6))
+                            .text_color(rgb(theme::tokens(self.theme).colors.text))
                             .child("RODE"),
                     ),
             )
-            .child(
-                div()
-                    .flex_1()
+                    .child(
+                        div()
+                            .flex_1()
                     .min_h_0()
                     .flex()
                     .items_center()
@@ -1621,8 +1949,8 @@ impl RodeApp {
                             .w(px(560.))
                             .rounded_xl()
                             .border_1()
-                            .border_color(rgb(0x343946))
-                            .bg(rgb(0x191d25))
+                            .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
+                            .bg(rgb(theme::tokens(self.theme).colors.panel))
                             .p_6()
                             .flex()
                             .flex_col()
@@ -1636,14 +1964,14 @@ impl RodeApp {
                                         div()
                                             .text_size(px(28.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xf3f4f6))
+                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
                                             .child("Connect Codex"),
                                     )
                                     .child(
                                         div()
                                             .text_sm()
                                             .line_height(px(21.))
-                                            .text_color(rgb(0x9299a8))
+                                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                                             .child(
                                                 "Rode uses your installed Codex CLI and OpenAI account. Authentication stays managed by Codex.",
                                             ),
@@ -1653,8 +1981,8 @@ impl RodeApp {
                                 div()
                                     .rounded_lg()
                                     .border_1()
-                                    .border_color(rgb(0x3b82f6))
-                                    .bg(rgb(0x161a22))
+                                    .border_color(rgb(theme::tokens(self.theme).colors.accent_hover))
+                                    .bg(rgb(theme::tokens(self.theme).colors.panel))
                                     .p_4()
                                     .flex()
                                     .items_center()
@@ -1671,10 +1999,10 @@ impl RodeApp {
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
-                                                    .bg(rgb(0xf3f4f6))
+                                                    .bg(rgb(theme::tokens(self.theme).colors.text))
                                                     .font_family("monospace")
                                                     .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(rgb(0x111318))
+                                                    .text_color(rgb(theme::tokens(self.theme).colors.root))
                                                     .child(">_"),
                                             )
                                             .child(
@@ -1688,13 +2016,13 @@ impl RodeApp {
                                                             .font_weight(
                                                                 gpui::FontWeight::SEMIBOLD,
                                                             )
-                                                            .text_color(rgb(0xf3f4f6))
+                                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
                                                             .child("Codex"),
                                                     )
                                                     .child(
                                                         div()
                                                             .text_xs()
-                                                            .text_color(rgb(0x8f96a5))
+                                                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                                                             .child("OpenAI coding agent"),
                                                     ),
                                             ),
@@ -1704,7 +2032,7 @@ impl RodeApp {
                                             .px_3()
                                             .py_1()
                                             .rounded_full()
-                                            .bg(rgb(0x202a3d))
+                                            .bg(rgb(theme::tokens(self.theme).colors.accent_soft))
                                             .flex()
                                             .items_center()
                                             .gap_2()
@@ -1717,7 +2045,7 @@ impl RodeApp {
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(rgb(0xc5cada))
+                                                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                                                     .child(status_label),
                                             ),
                                     ),
@@ -1727,12 +2055,12 @@ impl RodeApp {
                                     div()
                                         .rounded_lg()
                                         .border_1()
-                                        .border_color(rgb(0x513238))
-                                        .bg(rgb(0x24191c))
+                                        .border_color(rgb(theme::tokens(self.theme).colors.deletion_soft))
+                                        .bg(rgb(theme::tokens(self.theme).colors.deletion_soft))
                                         .p_4()
                                         .text_sm()
                                         .line_height(px(20.))
-                                        .text_color(rgb(0xfca5a5))
+                                        .text_color(rgb(theme::tokens(self.theme).colors.error))
                                         .child(
                                             "Install the Codex CLI and make sure `codex` is available on PATH, then restart Rode.",
                                         ),
@@ -1743,11 +2071,11 @@ impl RodeApp {
                                     div()
                                         .rounded_lg()
                                         .border_1()
-                                        .border_color(rgb(0x513238))
-                                        .bg(rgb(0x24191c))
+                                        .border_color(rgb(theme::tokens(self.theme).colors.deletion_soft))
+                                        .bg(rgb(theme::tokens(self.theme).colors.deletion_soft))
                                         .p_4()
                                         .text_sm()
-                                        .text_color(rgb(0xfca5a5))
+                                        .text_color(rgb(theme::tokens(self.theme).colors.error))
                                         .child(error),
                                 )
                             })
@@ -1763,11 +2091,11 @@ impl RodeApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .bg(rgb(0x2563eb))
-                                    .hover(|style| style.bg(rgb(0x3b82f6)))
+                                    .bg(rgb(theme::tokens(self.theme).colors.accent))
+                                    .hover(|style| style.bg(rgb(theme::tokens(self.theme).colors.accent_hover)))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_sm()
-                                    .text_color(rgb(0xffffff))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.on_accent))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sign_in_codex(cx)
                                     }))
@@ -1784,21 +2112,26 @@ impl RodeApp {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .bg(rgb(0x343946))
-                                    .hover(|style| style.bg(rgb(0x444b5a)))
+                                    .bg(rgb(theme::tokens(self.theme).colors.strong_border))
+                                    .hover(|style| style.bg(rgb(theme::tokens(self.theme).colors.strong_border)))
                                     .text_sm()
-                                    .text_color(rgb(0xf3f4f6))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.text))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.refresh_codex_account(cx)
                                     }))
                                     .child("Try again")
                                     .into_any_element(),
-                                CodexAuthState::Checking => onboarding_status("Checking account…"),
+                                CodexAuthState::Checking => {
+                                    onboarding_status("Checking account…", self.theme)
+                                }
                                 CodexAuthState::SigningIn => {
-                                    onboarding_status("Finish signing in in your browser…")
+                                    onboarding_status(
+                                        "Finish signing in in your browser…",
+                                        self.theme,
+                                    )
                                 }
                                 CodexAuthState::Unavailable => {
-                                    onboarding_status("Codex CLI required")
+                                    onboarding_status("Codex CLI required", self.theme)
                                 }
                                 CodexAuthState::SignedIn(_) => div().into_any_element(),
                             })
@@ -1807,7 +2140,7 @@ impl RodeApp {
                                     .text_center()
                                     .text_xs()
                                     .line_height(px(18.))
-                                    .text_color(rgb(0x6f7685))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
                                     .child(
                                         "Sign-in opens in your browser. Codex stores and refreshes the session.",
                                     ),
@@ -1817,16 +2150,17 @@ impl RodeApp {
             .into_any_element()
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> Div {
+        let colors = theme::tokens(self.theme).colors;
         let (codex_color, codex_label) = match &self.codex_auth {
-            CodexAuthState::Unavailable => (0x6b7280, "Codex · missing".to_owned()),
-            CodexAuthState::Checking => (0xf59e0b, "Codex · checking account".to_owned()),
-            CodexAuthState::SignedOut => (0xf59e0b, "Codex · sign in required".to_owned()),
+            CodexAuthState::Unavailable => (colors.faint_text, "Codex · missing".to_owned()),
+            CodexAuthState::Checking => (colors.warning, "Codex · checking account".to_owned()),
+            CodexAuthState::SignedOut => (colors.warning, "Codex · sign in required".to_owned()),
             CodexAuthState::SignedIn(account) => {
-                (0x34d399, format!("Codex · {}", account.summary()))
+                (colors.success, format!("Codex · {}", account.summary()))
             }
-            CodexAuthState::SigningIn => (0x60a5fa, "Codex · waiting for browser".to_owned()),
-            CodexAuthState::Error(_) => (0xf87171, "Codex · authentication error".to_owned()),
+            CodexAuthState::SigningIn => (colors.info, "Codex · waiting for browser".to_owned()),
+            CodexAuthState::Error(_) => (colors.error, "Codex · authentication error".to_owned()),
         };
         let codex_error = match &self.codex_auth {
             CodexAuthState::Error(error) => Some(error.clone()),
@@ -1835,7 +2169,7 @@ impl RodeApp {
         let codex_status = div()
             .rounded_md()
             .p_2()
-            .bg(rgb(0x191c22))
+            .bg(rgb(theme::tokens(self.theme).colors.panel))
             .flex()
             .flex_col()
             .gap_2()
@@ -1849,7 +2183,7 @@ impl RodeApp {
                         div()
                             .min_w_0()
                             .text_xs()
-                            .text_color(rgb(0xb9bec9))
+                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(codex_label),
@@ -1859,7 +2193,7 @@ impl RodeApp {
                 status.child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xfca5a5))
+                        .text_color(rgb(theme::tokens(self.theme).colors.error))
                         .line_height(px(16.))
                         .child(error),
                 )
@@ -1876,10 +2210,12 @@ impl RodeApp {
                             .py_1()
                             .rounded_md()
                             .cursor_pointer()
-                            .bg(rgb(0x2563eb))
-                            .hover(|style| style.bg(rgb(0x3b82f6)))
+                            .bg(rgb(theme::tokens(self.theme).colors.accent))
+                            .hover(|style| {
+                                style.bg(rgb(theme::tokens(self.theme).colors.accent_hover))
+                            })
                             .text_xs()
-                            .text_color(rgb(0xffffff))
+                            .text_color(rgb(theme::tokens(self.theme).colors.on_accent))
                             .on_click(cx.listener(|this, _, _, cx| this.sign_in_codex(cx)))
                             .child("Sign in with ChatGPT"),
                     )
@@ -1897,10 +2233,12 @@ impl RodeApp {
                             .py_1()
                             .rounded_md()
                             .cursor_pointer()
-                            .bg(rgb(0x343946))
-                            .hover(|style| style.bg(rgb(0x444b5a)))
+                            .bg(rgb(theme::tokens(self.theme).colors.strong_border))
+                            .hover(|style| {
+                                style.bg(rgb(theme::tokens(self.theme).colors.strong_border))
+                            })
                             .text_xs()
-                            .text_color(rgb(0xf3f4f6))
+                            .text_color(rgb(theme::tokens(self.theme).colors.text))
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_codex_account(cx)))
                             .child("Retry account check"),
                     )
@@ -1908,14 +2246,14 @@ impl RodeApp {
             );
 
         div()
-            .w(px(252.))
+            .w(px(width))
             .h_full()
             .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(0x111318))
+            .bg(rgb(theme::tokens(self.theme).colors.root))
             .border_r_1()
-            .border_color(rgb(0x292c33))
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
             .child(
                 div()
                     .h(px(58.))
@@ -1924,12 +2262,12 @@ impl RodeApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x292c33))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
                     .child(
                         div()
                             .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xf3f4f6))
+                            .text_color(rgb(theme::tokens(self.theme).colors.text))
                             .child("RODE"),
                     )
                     .child(
@@ -1943,8 +2281,10 @@ impl RodeApp {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .bg(rgb(0x242831))
-                            .hover(|style| style.bg(rgb(0x343946)))
+                            .bg(rgb(theme::tokens(self.theme).colors.overlay))
+                            .hover(|style| {
+                                style.bg(rgb(theme::tokens(self.theme).colors.strong_border))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_create_menu(cx)))
                             .child("+"),
                     ),
@@ -1957,8 +2297,8 @@ impl RodeApp {
                         .p_1()
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(0x343946))
-                        .bg(rgb(0x20232a))
+                        .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
+                        .bg(rgb(theme::tokens(self.theme).colors.raised))
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -1967,6 +2307,7 @@ impl RodeApp {
                             "New thread",
                             false,
                             false,
+                            self.theme,
                             cx.listener(|this, _, _, cx| this.new_thread(cx)),
                         ))
                         .child(selectable_row::selectable_row(
@@ -1974,6 +2315,7 @@ impl RodeApp {
                             "Add project folder…",
                             false,
                             false,
+                            self.theme,
                             cx.listener(|this, _, window, cx| this.open_folder_picker(window, cx)),
                         )),
                 )
@@ -1988,7 +2330,12 @@ impl RodeApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(div().text_xs().text_color(rgb(0x777d8b)).child("PROJECTS"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
+                            .child("PROJECTS"),
+                    )
                     .children(
                         self.known_projects
                             .iter()
@@ -2000,7 +2347,7 @@ impl RodeApp {
                 div()
                     .p_3()
                     .border_t_1()
-                    .border_color(rgb(0x292c33))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -2014,8 +2361,8 @@ impl RodeApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_sm()
-                            .text_color(rgb(0xb9bec9))
-                            .hover(|style| style.bg(rgb(0x292d36)))
+                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                            .hover(|style| style.bg(rgb(theme::tokens(self.theme).colors.overlay)))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx)))
                             .child(if self.show_settings {
                                 "Settings ▴"
@@ -2029,8 +2376,8 @@ impl RodeApp {
                                 .p_2()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(0x343946))
-                                .bg(rgb(0x191c22))
+                                .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
+                                .bg(rgb(theme::tokens(self.theme).colors.panel))
                                 .flex()
                                 .flex_col()
                                 .gap_2()
@@ -2038,14 +2385,16 @@ impl RodeApp {
                                     div()
                                         .text_xs()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0xd1d5db))
+                                        .text_color(rgb(theme::tokens(self.theme).colors.text))
                                         .child("New thread workspace"),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .line_height(px(16.))
-                                        .text_color(rgb(0x7f8796))
+                                        .text_color(rgb(theme::tokens(self.theme)
+                                            .colors
+                                            .faint_text))
                                         .child(if self.isolate_new_threads {
                                             "Each new thread gets an isolated Git worktree."
                                         } else {
@@ -2062,13 +2411,17 @@ impl RodeApp {
                                         .rounded_md()
                                         .cursor_pointer()
                                         .bg(if self.isolate_new_threads {
-                                            rgb(0x2563eb)
+                                            rgb(theme::tokens(self.theme).colors.accent)
                                         } else {
-                                            rgb(0x303540)
+                                            rgb(theme::tokens(self.theme).colors.overlay)
                                         })
                                         .text_xs()
-                                        .text_color(rgb(0xf3f4f6))
-                                        .hover(|style| style.bg(rgb(0x3b82f6)))
+                                        .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                        .hover(|style| {
+                                            style.bg(rgb(theme::tokens(self.theme)
+                                                .colors
+                                                .accent_hover))
+                                        })
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.toggle_thread_isolation(cx)
                                         }))
@@ -2097,9 +2450,9 @@ impl RodeApp {
             .flex()
             .items_center()
             .justify_between()
-            .bg(rgb(0x17191f))
+            .bg(rgb(theme::tokens(self.theme).colors.chrome))
             .border_b_1()
-            .border_color(rgb(0x292c33))
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
             .child(
                 div()
                     .flex()
@@ -2109,7 +2462,7 @@ impl RodeApp {
                         div()
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xe5e7eb))
+                            .text_color(rgb(theme::tokens(self.theme).colors.text))
                             .child(self.thread_title.clone()),
                     )
                     .child(
@@ -2117,9 +2470,9 @@ impl RodeApp {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(0x22252d))
+                            .bg(rgb(theme::tokens(self.theme).colors.raised))
                             .text_xs()
-                            .text_color(rgb(0x9ca3af))
+                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                             .child(format!("⎇ {branch}")),
                     ),
             )
@@ -2137,6 +2490,7 @@ impl RodeApp {
                             button::ButtonStyle::Secondary
                         },
                         false,
+                        self.theme,
                         cx.listener(|this, _, window, cx| {
                             this.toggle_terminal(&ToggleTerminal, window, cx)
                         }),
@@ -2151,8 +2505,8 @@ impl RodeApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_xs()
-                            .text_color(rgb(0xb9bec9))
-                            .hover(|style| style.bg(rgb(0x292d36)))
+                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                            .hover(|style| style.bg(rgb(theme::tokens(self.theme).colors.overlay)))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.refresh_repo(&RefreshRepo, window, cx)
                             }))
@@ -2167,6 +2521,7 @@ impl RodeApp {
                             button::ButtonStyle::Secondary
                         },
                         false,
+                        self.theme,
                         cx.listener(|this, _, window, cx| {
                             this.toggle_diff(&ToggleDiff, window, cx)
                         }),
@@ -2177,6 +2532,7 @@ impl RodeApp {
                             "Cancel",
                             button::ButtonStyle::Destructive,
                             false,
+                            self.theme,
                             cx.listener(|this, _, _, cx| this.cancel_turn(cx)),
                         ))
                     }),
@@ -2184,6 +2540,7 @@ impl RodeApp {
     }
 
     fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = theme::tokens(self.theme).colors;
         let mut messages = div()
             .id("messages")
             .flex_1()
@@ -2196,10 +2553,10 @@ impl RodeApp {
 
         for (index, message) in self.messages.iter().enumerate() {
             let (label, background, border, text) = match message.role {
-                MessageRole::User => ("YOU", 0x17233a, 0x284b7a, 0xe8eef9),
-                MessageRole::Agent => ("CODEX", 0x1a1d24, 0x323641, 0xd8dbe2),
-                MessageRole::Tool => ("TOOL", 0x181b20, 0x3b3f48, 0xc4c9d3),
-                MessageRole::System => ("RODE", 0x171b20, 0x294137, 0xa7c7b8),
+                MessageRole::User => ("YOU", colors.accent_soft, colors.focus_ring, colors.text),
+                MessageRole::Agent => ("CODEX", colors.panel, colors.border, colors.text),
+                MessageRole::Tool => ("TOOL", colors.raised, colors.strong_border, colors.text),
+                MessageRole::System => ("RODE", colors.addition_soft, colors.success, colors.text),
             };
             messages = messages.child(
                 div()
@@ -2217,7 +2574,7 @@ impl RodeApp {
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x7f8796))
+                            .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
                             .child(label),
                     )
                     .child(
@@ -2243,8 +2600,8 @@ impl RodeApp {
                     .w_full()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x92400e))
-                    .bg(rgb(0x261d13))
+                    .border_color(rgb(theme::tokens(self.theme).colors.warning))
+                    .bg(rgb(colors.warning_soft))
                     .p_4()
                     .flex()
                     .flex_col()
@@ -2253,7 +2610,7 @@ impl RodeApp {
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xfbbf24))
+                            .text_color(rgb(theme::tokens(self.theme).colors.warning))
                             .child(kind),
                     )
                     .child(
@@ -2261,7 +2618,7 @@ impl RodeApp {
                             .font_family("monospace")
                             .text_sm()
                             .whitespace_normal()
-                            .text_color(rgb(0xfef3c7))
+                            .text_color(rgb(theme::tokens(self.theme).colors.warning))
                             .child(request.title.clone()),
                     )
                     .when(!request.detail.is_empty(), |card| {
@@ -2269,14 +2626,14 @@ impl RodeApp {
                             div()
                                 .text_xs()
                                 .whitespace_normal()
-                                .text_color(rgb(0xd6b98b))
+                                .text_color(rgb(theme::tokens(self.theme).colors.warning))
                                 .child(request.detail.clone()),
                         )
                     })
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(0x8b7355))
+                            .text_color(rgb(theme::tokens(self.theme).colors.warning))
                             .child(format!("item {}", request.item_id)),
                     )
                     .child(
@@ -2293,10 +2650,12 @@ impl RodeApp {
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .bg(rgb(0x166534))
+                                    .bg(rgb(theme::tokens(self.theme).colors.addition_soft))
                                     .text_xs()
-                                    .text_color(rgb(0xdcfce7))
-                                    .hover(|style| style.bg(rgb(0x15803d)))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.success))
+                                    .hover(|style| {
+                                        style.bg(rgb(theme::tokens(self.theme).colors.success))
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.respond_to_approval(index, "accept", cx)
                                     }))
@@ -2311,10 +2670,13 @@ impl RodeApp {
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .bg(rgb(0x3f2424))
+                                    .bg(rgb(theme::tokens(self.theme).colors.deletion_soft))
                                     .text_xs()
-                                    .text_color(rgb(0xfecaca))
-                                    .hover(|style| style.bg(rgb(0x5f2d2d)))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.error))
+                                    .hover(|style| {
+                                        style
+                                            .bg(rgb(theme::tokens(self.theme).colors.deletion_soft))
+                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.respond_to_approval(index, "decline", cx)
                                     }))
@@ -2334,11 +2696,11 @@ impl RodeApp {
                     .w_full()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x323641))
-                    .bg(rgb(0x1a1d24))
+                    .border_color(rgb(theme::tokens(self.theme).colors.overlay))
+                    .bg(rgb(theme::tokens(self.theme).colors.panel))
                     .p_4()
                     .text_sm()
-                    .text_color(rgb(0x9ca3af))
+                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                     .line_clamp(3)
                     .child(activity),
             );
@@ -2351,9 +2713,11 @@ impl RodeApp {
         div()
             .p_4()
             .flex_none()
+            .min_w_0()
+            .overflow_hidden()
             .border_t_1()
-            .border_color(rgb(0x292c33))
-            .bg(rgb(0x17191f))
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
+            .bg(rgb(theme::tokens(self.theme).colors.chrome))
             .child(
                 div()
                     .id("composer")
@@ -2362,22 +2726,26 @@ impl RodeApp {
                     .map(standard_actions(self.composer.clone()))
                     .cursor(CursorStyle::IBeam)
                     .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
                     .h(px(112.))
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x3a3f4b))
-                    .bg(rgb(0x20232a))
+                    .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
+                    .bg(rgb(theme::tokens(self.theme).colors.raised))
                     .p_3()
                     .flex()
                     .flex_col()
                     .gap_2()
                     .line_height(px(20.))
                     .text_size(px(14.))
-                    .text_color(rgb(0xe5e7eb))
+                    .text_color(rgb(theme::tokens(self.theme).colors.text))
                     .child(
-                        self.composer
-                            .clone()
-                            .cached(StyleRefinement::default().w_full().h(px(72.))),
+                        div().w_full().min_w_0().h(px(72.)).overflow_hidden().child(
+                            self.composer
+                                .clone()
+                                .cached(StyleRefinement::default().w_full().h(px(72.))),
+                        ),
                     )
                     .child(
                         div()
@@ -2385,7 +2753,7 @@ impl RodeApp {
                             .items_center()
                             .justify_between()
                             .text_xs()
-                            .text_color(rgb(0x767d8d))
+                            .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
                             .child("Shift+Enter for a new line")
                             .child(if self.creating_worktree {
                                 "Creating worktree"
@@ -2398,7 +2766,7 @@ impl RodeApp {
             )
     }
 
-    fn render_terminal(&self, cx: &mut Context<Self>) -> Div {
+    fn render_terminal(&self, expanded: bool, cx: &mut Context<Self>) -> Div {
         let terminal = self.terminal_sessions.get(&self.thread_id).cloned();
         let (title, exited) = terminal.as_ref().map_or_else(
             || ("Preparing terminal…".to_owned(), false),
@@ -2407,15 +2775,21 @@ impl RodeApp {
                 (terminal.title().to_owned(), terminal.exited())
             },
         );
+        let terminal_style = if expanded {
+            StyleRefinement::default().w_full().h_full()
+        } else {
+            StyleRefinement::default().w_full().h(px(250.))
+        };
         div()
-            .h(px(300.))
-            .min_h(px(180.))
-            .flex_none()
+            .when(expanded, |panel| panel.flex_1().min_h_0())
+            .when(!expanded, |panel| {
+                panel.h(px(300.)).min_h(px(180.)).flex_none()
+            })
             .flex()
             .flex_col()
             .border_t_1()
-            .border_color(rgb(0x292c33))
-            .bg(rgb(0x0f1115))
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
+            .bg(rgb(theme::tokens(self.theme).colors.root))
             .child(
                 div()
                     .h(px(34.))
@@ -2424,14 +2798,18 @@ impl RodeApp {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .bg(rgb(0x17191f))
+                    .bg(rgb(theme::tokens(self.theme).colors.chrome))
                     .border_b_1()
-                    .border_color(rgb(0x292c33))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
                     .child(
                         div()
                             .min_w_0()
                             .text_xs()
-                            .text_color(if exited { rgb(0xf87171) } else { rgb(0xb9bec9) })
+                            .text_color(if exited {
+                                rgb(theme::tokens(self.theme).colors.error)
+                            } else {
+                                rgb(theme::tokens(self.theme).colors.muted_text)
+                            })
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(if exited {
@@ -2449,10 +2827,18 @@ impl RodeApp {
                             .rounded_md()
                             .cursor_pointer()
                             .text_sm()
-                            .text_color(rgb(0x8b93a3))
-                            .hover(|style| style.bg(rgb(0x292d36)).text_color(rgb(0xf3f4f6)))
+                            .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                            .hover(|style| {
+                                style
+                                    .bg(rgb(theme::tokens(self.theme).colors.overlay))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.text))
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_terminal(&ToggleTerminal, window, cx)
+                                if this.route == AppRoute::Terminal {
+                                    this.navigate_to(AppRoute::Workspace, window, cx);
+                                } else {
+                                    this.toggle_terminal(&ToggleTerminal, window, cx);
+                                }
                             }))
                             .child("×"),
                     ),
@@ -2463,8 +2849,7 @@ impl RodeApp {
                     .min_h_0()
                     .p_2()
                     .when_some(terminal, |panel, terminal| {
-                        panel
-                            .child(terminal.cached(StyleRefinement::default().w_full().h(px(250.))))
+                        panel.child(terminal.cached(terminal_style))
                     }),
             )
     }
@@ -2476,8 +2861,8 @@ impl RodeApp {
             .flex_none()
             .p_3()
             .border_b_1()
-            .border_color(rgb(0x292f38))
-            .bg(rgb(0x11161d))
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
+            .bg(rgb(theme::tokens(self.theme).colors.root))
             .flex()
             .flex_col()
             .gap_2()
@@ -2492,10 +2877,10 @@ impl RodeApp {
                     .items_center()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x303742))
-                    .bg(rgb(0x171c24))
+                    .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
+                    .bg(rgb(theme::tokens(self.theme).colors.chrome))
                     .text_sm()
-                    .text_color(rgb(0xe6edf3))
+                    .text_color(rgb(theme::tokens(self.theme).colors.text))
                     .child(
                         self.commit_editor
                             .clone()
@@ -2511,18 +2896,21 @@ impl RodeApp {
                         "commit-all",
                         "Commit all",
                         busy,
+                        self.theme,
                         cx.listener(|this, _, _, cx| this.commit_changes(cx)),
                     ))
                     .child(publish_button(
                         "push-branch",
                         "Push",
                         busy,
+                        self.theme,
                         cx.listener(|this, _, _, cx| this.push_changes(cx)),
                     ))
                     .child(publish_button(
                         "create-pr",
                         "Create PR",
                         busy,
+                        self.theme,
                         cx.listener(|this, _, _, cx| this.create_pr(cx)),
                     ))
                     .when_some(self.git_operation, |row, operation| {
@@ -2530,7 +2918,7 @@ impl RodeApp {
                             div()
                                 .ml_auto()
                                 .text_xs()
-                                .text_color(rgb(0x93c5fd))
+                                .text_color(rgb(theme::tokens(self.theme).colors.info))
                                 .child(format!("{operation}…")),
                         )
                     }),
@@ -2541,16 +2929,16 @@ impl RodeApp {
                         .text_xs()
                         .line_height(px(18.))
                         .text_color(if status.starts_with("Git workflow failed") {
-                            rgb(0xfca5a5)
+                            rgb(theme::tokens(self.theme).colors.error)
                         } else {
-                            rgb(0x86efac)
+                            rgb(theme::tokens(self.theme).colors.success)
                         })
                         .child(status),
                 )
             })
     }
 
-    fn render_diff(&self, cx: &mut Context<Self>) -> Div {
+    fn render_diff(&self, width: Option<f32>, cx: &mut Context<Self>) -> Div {
         let document = DiffDocument::parse(&self.repo.diff);
         let mut files = div()
             .id("diff-scroll")
@@ -2570,10 +2958,10 @@ impl RodeApp {
                     .p_5()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x292f38))
-                    .bg(rgb(0x141820))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
+                    .bg(rgb(theme::tokens(self.theme).colors.panel))
                     .text_sm()
-                    .text_color(rgb(0x88919f))
+                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                     .child("No uncommitted diff"),
             );
         } else {
@@ -2583,14 +2971,14 @@ impl RodeApp {
         }
 
         div()
-            .w(px(720.))
+            .when_some(width, |panel, width| panel.w(px(width)).flex_none())
+            .when(width.is_none(), |panel| panel.flex_1().min_w_0())
             .h_full()
-            .flex_none()
             .flex()
             .flex_col()
-            .bg(rgb(0x0d1117))
+            .bg(rgb(theme::tokens(self.theme).colors.root))
             .border_l_1()
-            .border_color(rgb(0x292f38))
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
             .child(
                 div()
                     .h(px(58.))
@@ -2600,7 +2988,7 @@ impl RodeApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x292f38))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
                     .child(
                         div()
                             .flex()
@@ -2610,7 +2998,7 @@ impl RodeApp {
                                 div()
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xe6edf3))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.text))
                                     .child("Working tree"),
                             )
                             .child(
@@ -2618,9 +3006,9 @@ impl RodeApp {
                                     .px_2()
                                     .py_1()
                                     .rounded_md()
-                                    .bg(rgb(0x202630))
+                                    .bg(rgb(theme::tokens(self.theme).colors.raised))
                                     .text_xs()
-                                    .text_color(rgb(0x9da7b5))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                                     .child(format!("{} files", self.repo.changed_files)),
                             ),
                     )
@@ -2628,9 +3016,9 @@ impl RodeApp {
                         tabs::tab_list()
                             .p_1()
                             .rounded_md()
-                            .bg(rgb(0x171c24))
+                            .bg(rgb(theme::tokens(self.theme).colors.chrome))
                             .border_1()
-                            .border_color(rgb(0x303742))
+                            .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
                             .flex()
                             .items_center()
                             .child(self.render_diff_mode_button(
@@ -2653,10 +3041,10 @@ impl RodeApp {
                     .py_2()
                     .flex_none()
                     .border_b_1()
-                    .border_color(rgb(0x292f38))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
                     .text_xs()
                     .whitespace_normal()
-                    .text_color(rgb(0x8b949e))
+                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                     .child(self.repo.diff_stat.clone()),
             )
             .child(self.render_publish_controls(cx))
@@ -2675,6 +3063,7 @@ impl RodeApp {
             id,
             label,
             selected,
+            self.theme,
             cx.listener(move |this, _, _, cx| {
                 this.diff_view = mode;
                 cx.notify();
@@ -2692,11 +3081,11 @@ impl RodeApp {
                     .h(px(28.))
                     .flex()
                     .items_center()
-                    .bg(rgb(0x151a21))
+                    .bg(rgb(theme::tokens(self.theme).colors.panel))
                     .border_b_1()
-                    .border_color(rgb(0x2a3039))
+                    .border_color(rgb(theme::tokens(self.theme).colors.border))
                     .text_xs()
-                    .text_color(rgb(0x7d8794))
+                    .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
                     .child(
                         div()
                             .w_1_2()
@@ -2708,7 +3097,7 @@ impl RodeApp {
                             .w_1_2()
                             .px_3()
                             .border_l_1()
-                            .border_color(rgb(0x343b46))
+                            .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
                             .child(format!("Modified · {}", file.new_path)),
                     ),
             );
@@ -2717,11 +3106,11 @@ impl RodeApp {
         for hunk in &file.hunks {
             let hidden = hunk.old_start.saturating_sub(previous_old_end);
             if hidden > 0 {
-                body = body.child(render_unchanged_band(hidden));
+                body = body.child(render_unchanged_band(hidden, self.theme));
             }
             body = body.child(match self.diff_view {
-                DiffViewMode::Stack => render_stack_hunk(hunk),
-                DiffViewMode::Split => render_split_hunk(hunk),
+                DiffViewMode::Stack => render_stack_hunk(hunk, self.theme),
+                DiffViewMode::Split => render_split_hunk(hunk, self.theme),
             });
             previous_old_end = hunk.old_start.saturating_add(hunk.old_count);
         }
@@ -2730,9 +3119,9 @@ impl RodeApp {
             body = body.child(
                 div()
                     .p_4()
-                    .bg(rgb(0x11161d))
+                    .bg(rgb(theme::tokens(self.theme).colors.root))
                     .text_xs()
-                    .text_color(rgb(0x8b949e))
+                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
                     .child(if file.binary {
                         "Binary file changed"
                     } else {
@@ -2747,8 +3136,8 @@ impl RodeApp {
             .rounded_lg()
             .overflow_hidden()
             .border_1()
-            .border_color(rgb(0x303742))
-            .bg(rgb(0x0f141b))
+            .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
+            .bg(rgb(theme::tokens(self.theme).colors.root))
             .child(
                 div()
                     .h(px(42.))
@@ -2756,21 +3145,26 @@ impl RodeApp {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .bg(rgb(0x1a2029))
+                    .bg(rgb(theme::tokens(self.theme).colors.panel))
                     .border_b_1()
-                    .border_color(rgb(0x303742))
+                    .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
                     .child(
                         div()
                             .min_w_0()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_color(rgb(0x6e7681)).text_xs().child("▾"))
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
+                                    .text_xs()
+                                    .child("▾"),
+                            )
                             .child(
                                 div()
                                     .font_family("monospace")
                                     .text_sm()
-                                    .text_color(rgb(0xd6dde5))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.text))
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .child(file.display_path().to_owned()),
@@ -2781,9 +3175,11 @@ impl RodeApp {
                                         .px_2()
                                         .py_1()
                                         .rounded_md()
-                                        .bg(rgb(0x272e38))
+                                        .bg(rgb(theme::tokens(self.theme).colors.overlay))
                                         .text_xs()
-                                        .text_color(rgb(0xaab4c0))
+                                        .text_color(rgb(theme::tokens(self.theme)
+                                            .colors
+                                            .muted_text))
                                         .child(status),
                                 )
                             }),
@@ -2798,17 +3194,402 @@ impl RodeApp {
                             .text_xs()
                             .child(
                                 div()
-                                    .text_color(rgb(0x3fb950))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.addition))
                                     .child(format!("+{}", file.additions)),
                             )
                             .child(
                                 div()
-                                    .text_color(rgb(0xf85149))
+                                    .text_color(rgb(theme::tokens(self.theme).colors.deletion))
                                     .child(format!("−{}", file.deletions)),
                             ),
                     ),
             )
             .child(body)
+    }
+
+    fn render_rail_item(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        route: AppRoute,
+        disabled: bool,
+        tab_index: isize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = theme::tokens(self.theme).colors;
+        let selected = match (self.route, route) {
+            (
+                AppRoute::Settings(SettingsSection::Account),
+                AppRoute::Settings(SettingsSection::Account),
+            ) => true,
+            (AppRoute::Settings(current), AppRoute::Settings(SettingsSection::Appearance)) => {
+                current != SettingsSection::Account
+            }
+            (current, candidate) => current.same_surface(candidate),
+        };
+        div()
+            .id(id)
+            .key_context("Rail")
+            .role(Role::Button)
+            .aria_label(route.label())
+            .tab_index(tab_index)
+            .tab_stop(!disabled)
+            .size(px(36.))
+            .rounded_md()
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(rgb(if selected {
+                colors.focus_ring
+            } else {
+                colors.chrome
+            }))
+            .bg(rgb(if selected {
+                colors.accent_soft
+            } else {
+                colors.chrome
+            }))
+            .text_sm()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(rgb(if selected {
+                colors.text
+            } else {
+                colors.muted_text
+            }))
+            .focus_visible(move |style| style.border_color(rgb(colors.focus_ring)))
+            .when(!disabled, |item| {
+                item.cursor_pointer()
+                    .hover(move |style| style.bg(rgb(colors.overlay)))
+                    .active(move |style| style.bg(rgb(colors.accent_soft)))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.navigate_to(route, window, cx)),
+                    )
+                    .on_action(cx.listener(move |this, _: &ActivateRailItem, window, cx| {
+                        this.navigate_to(route, window, cx)
+                    }))
+            })
+            .when(disabled, |item| item.opacity(0.4))
+            .child(glyph)
+    }
+
+    fn render_app_rail(&self, cx: &mut Context<Self>) -> Div {
+        let colors = theme::tokens(self.theme).colors;
+        let project_disabled = !self.repo.is_repository;
+        div()
+            .w(px(split_pane::RAIL_WIDTH))
+            .h_full()
+            .flex_none()
+            .py_3()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .border_r_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.chrome))
+            .child(
+                div()
+                    .size(px(36.))
+                    .rounded_lg()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(colors.accent))
+                    .text_color(rgb(colors.on_accent))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("R"),
+            )
+            .child(div().h(px(8.)))
+            .child(self.render_rail_item("rail-workspace", "W", AppRoute::Workspace, false, 1, cx))
+            .child(self.render_rail_item(
+                "rail-source-control",
+                "G",
+                AppRoute::SourceControl,
+                project_disabled,
+                2,
+                cx,
+            ))
+            .child(self.render_rail_item(
+                "rail-terminal",
+                ">_",
+                AppRoute::Terminal,
+                project_disabled,
+                3,
+                cx,
+            ))
+            .child(self.render_rail_item(
+                "rail-settings",
+                "S",
+                AppRoute::Settings(SettingsSection::Appearance),
+                false,
+                4,
+                cx,
+            ))
+            .child(div().flex_1())
+            .child(self.render_rail_item(
+                "rail-account",
+                "A",
+                AppRoute::Settings(SettingsSection::Account),
+                false,
+                5,
+                cx,
+            ))
+    }
+
+    fn render_route_header(&self, title: &'static str, hint: &'static str) -> Div {
+        let colors = theme::tokens(self.theme).colors;
+        div()
+            .h(px(58.))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.chrome))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(colors.text))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(rgb(colors.muted_text))
+                            .child(self.project_name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(colors.faint_text))
+                    .child(hint),
+            )
+    }
+
+    fn render_workspace_route(&self, inspector_width: Option<f32>, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .overflow_hidden()
+            .child(self.render_sidebar(self.panel_layout.sidebar_width, cx))
+            .child(split_pane::divider(
+                "workspace-sidebar-divider",
+                self.active_split == Some(split_pane::SplitTarget::Sidebar),
+                self.theme,
+                cx.listener(|this, _, _, cx| {
+                    this.active_split = Some(split_pane::SplitTarget::Sidebar);
+                    cx.notify();
+                }),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(self.render_header(cx))
+                    .child(self.render_messages(cx))
+                    .when(self.show_terminal, |column| {
+                        column.child(self.render_terminal(false, cx))
+                    })
+                    .child(self.render_composer(cx)),
+            )
+            .when_some(inspector_width.filter(|_| self.show_diff), |root, width| {
+                root.child(split_pane::divider(
+                    "workspace-inspector-divider",
+                    self.active_split == Some(split_pane::SplitTarget::Inspector),
+                    self.theme,
+                    cx.listener(|this, _, _, cx| {
+                        this.active_split = Some(split_pane::SplitTarget::Inspector);
+                        cx.notify();
+                    }),
+                ))
+                .child(self.render_diff(Some(width), cx))
+            })
+    }
+
+    fn render_source_control_route(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(self.render_route_header("Source control", "Ctrl+2"))
+            .child(self.render_diff(None, cx))
+    }
+
+    fn render_terminal_route(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(self.render_route_header("Terminal", "Ctrl+3"))
+            .child(self.render_terminal(true, cx))
+    }
+
+    fn render_settings_route(&self, cx: &mut Context<Self>) -> Div {
+        let colors = theme::tokens(self.theme).colors;
+        let section = match self.route {
+            AppRoute::Settings(section) => section,
+            _ => SettingsSection::Appearance,
+        };
+        let section_list = div()
+            .w(px(220.))
+            .h_full()
+            .flex_none()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_r_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .children(SettingsSection::ALL.into_iter().map(|candidate| {
+                let id = match candidate {
+                    SettingsSection::Appearance => "settings-appearance",
+                    SettingsSection::AgentsAndModels => "settings-agents",
+                    SettingsSection::Terminal => "settings-terminal",
+                    SettingsSection::GitAndWorktrees => "settings-git",
+                    SettingsSection::Keybindings => "settings-keybindings",
+                    SettingsSection::Account => "settings-account",
+                };
+                selectable_row::selectable_row(
+                    id,
+                    candidate.label(),
+                    candidate == section,
+                    false,
+                    self.theme,
+                    cx.listener(move |this, _, _, cx| this.set_settings_section(candidate, cx)),
+                )
+            }));
+
+        let content = if section == SettingsSection::Appearance {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(colors.text))
+                        .child("Theme"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(colors.muted_text))
+                        .child("Choose Rode's native workspace palette."),
+                )
+                .child(
+                    div().flex().flex_wrap().gap_3().children(
+                        ThemeKind::ALL
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, candidate)| {
+                                let candidate_tokens = theme::tokens(candidate);
+                                div()
+                                    .id(("theme-choice", index))
+                                    .role(Role::Button)
+                                    .aria_label(format!("Use {} theme", candidate_tokens.name))
+                                    .tab_index((index + 10) as isize)
+                                    .tab_stop(true)
+                                    .w(px(180.))
+                                    .p_3()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(rgb(if self.theme == candidate {
+                                        colors.focus_ring
+                                    } else {
+                                        colors.border
+                                    }))
+                                    .bg(rgb(candidate_tokens.colors.raised))
+                                    .text_color(rgb(candidate_tokens.colors.text))
+                                    .hover(move |style| style.border_color(rgb(colors.focus_ring)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_theme(candidate, cx)
+                                    }))
+                                    .child(
+                                        div()
+                                            .h(px(36.))
+                                            .mb_3()
+                                            .rounded_md()
+                                            .bg(rgb(candidate_tokens.colors.accent)),
+                                    )
+                                    .child(candidate_tokens.name)
+                            }),
+                    ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .p_5()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(colors.border))
+                .bg(rgb(colors.raised))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(colors.text))
+                        .child(section.label()),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_sm()
+                        .text_color(rgb(colors.muted_text))
+                        .child("This settings section is reserved for its milestone feature."),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(self.render_route_header("Settings", "Ctrl+4"))
+            .child(
+                div().flex_1().min_h_0().flex().child(section_list).child(
+                    div()
+                        .id("settings-content-scroll")
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_y_scroll()
+                        .p_6()
+                        .bg(rgb(colors.root))
+                        .child(content),
+                ),
+            )
     }
 }
 
@@ -2816,55 +3597,65 @@ fn publish_button(
     id: &'static str,
     label: &'static str,
     busy: bool,
+    theme_kind: ThemeKind,
     listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    button::button(id, label, button::ButtonStyle::Primary, busy, listener)
+    button::button(
+        id,
+        label,
+        button::ButtonStyle::Primary,
+        busy,
+        theme_kind,
+        listener,
+    )
 }
 
-fn render_unchanged_band(count: u32) -> Div {
+fn render_unchanged_band(count: u32, theme_kind: ThemeKind) -> Div {
+    let colors = theme::tokens(theme_kind).colors;
     div()
         .h(px(25.))
         .px_2()
         .flex()
         .items_center()
-        .bg(rgb(0x242a33))
+        .bg(rgb(colors.overlay))
         .border_b_1()
-        .border_color(rgb(0x303742))
+        .border_color(rgb(colors.strong_border))
         .font_family("monospace")
         .text_xs()
-        .text_color(rgb(0x8b949e))
+        .text_color(rgb(colors.muted_text))
         .child(format!("▾ {count} unchanged lines"))
 }
 
-fn render_hunk_header(header: &str) -> Div {
+fn render_hunk_header(header: &str, theme_kind: ThemeKind) -> Div {
+    let colors = theme::tokens(theme_kind).colors;
     div()
         .h(px(25.))
         .px_2()
         .flex()
         .items_center()
-        .bg(rgb(0x242a33))
+        .bg(rgb(colors.overlay))
         .border_b_1()
-        .border_color(rgb(0x303742))
+        .border_color(rgb(colors.strong_border))
         .font_family("monospace")
         .text_xs()
-        .text_color(rgb(0x9aa4b2))
+        .text_color(rgb(colors.muted_text))
         .child(header.to_owned())
 }
 
-fn render_stack_hunk(hunk: &DiffHunk) -> Div {
+fn render_stack_hunk(hunk: &DiffHunk, theme_kind: ThemeKind) -> Div {
     let mut element = div()
         .w_full()
         .flex()
         .flex_col()
-        .child(render_hunk_header(&hunk.header));
+        .child(render_hunk_header(&hunk.header, theme_kind));
     for line in &hunk.lines {
-        element = element.child(render_stack_line(line));
+        element = element.child(render_stack_line(line, theme_kind));
     }
     element
 }
 
-fn render_stack_line(line: &DiffLine) -> Div {
-    let (background, foreground, marker) = diff_line_style(line.kind);
+fn render_stack_line(line: &DiffLine, theme_kind: ThemeKind) -> Div {
+    let (background, foreground, marker) = diff_line_style(line.kind, theme_kind);
     div()
         .min_w(px(680.))
         .h(px(21.))
@@ -2875,8 +3666,8 @@ fn render_stack_line(line: &DiffLine) -> Div {
         .text_xs()
         .line_height(px(21.))
         .text_color(rgb(foreground))
-        .child(render_line_number(line.old_line))
-        .child(render_line_number(line.new_line))
+        .child(render_line_number(line.old_line, theme_kind))
+        .child(render_line_number(line.new_line, theme_kind))
         .child(
             div()
                 .w(px(20.))
@@ -2895,29 +3686,30 @@ fn render_stack_line(line: &DiffLine) -> Div {
         )
 }
 
-fn render_split_hunk(hunk: &DiffHunk) -> Div {
+fn render_split_hunk(hunk: &DiffHunk, theme_kind: ThemeKind) -> Div {
     let mut element = div()
         .w_full()
         .flex()
         .flex_col()
-        .child(render_hunk_header(&hunk.header));
+        .child(render_hunk_header(&hunk.header, theme_kind));
     for row in split_rows(hunk) {
         element = element.child(
             div()
                 .min_w(px(680.))
                 .h(px(21.))
                 .flex()
-                .child(render_split_cell(row.left.as_ref(), true))
-                .child(render_split_cell(row.right.as_ref(), false)),
+                .child(render_split_cell(row.left.as_ref(), true, theme_kind))
+                .child(render_split_cell(row.right.as_ref(), false, theme_kind)),
         );
     }
     element
 }
 
-fn render_split_cell(line: Option<&DiffLine>, left: bool) -> Div {
+fn render_split_cell(line: Option<&DiffLine>, left: bool, theme_kind: ThemeKind) -> Div {
+    let colors = theme::tokens(theme_kind).colors;
     let (background, foreground, marker) = line
-        .map(|line| diff_line_style(line.kind))
-        .unwrap_or((0x11161d, 0x6e7681, ""));
+        .map(|line| diff_line_style(line.kind, theme_kind))
+        .unwrap_or((colors.root, colors.faint_text, ""));
     let number = line.and_then(|line| if left { line.old_line } else { line.new_line });
     let text = line.map(|line| line.text.clone()).unwrap_or_default();
 
@@ -2928,12 +3720,14 @@ fn render_split_cell(line: Option<&DiffLine>, left: bool) -> Div {
         .flex()
         .items_center()
         .bg(rgb(background))
-        .when(!left, |cell| cell.border_l_1().border_color(rgb(0x343b46)))
+        .when(!left, |cell| {
+            cell.border_l_1().border_color(rgb(colors.strong_border))
+        })
         .font_family("monospace")
         .text_xs()
         .line_height(px(21.))
         .text_color(rgb(foreground))
-        .child(render_line_number(number))
+        .child(render_line_number(number, theme_kind))
         .child(div().w(px(20.)).flex_none().text_center().child(marker))
         .child(
             div()
@@ -2945,7 +3739,8 @@ fn render_split_cell(line: Option<&DiffLine>, left: bool) -> Div {
         )
 }
 
-fn render_line_number(number: Option<u32>) -> Div {
+fn render_line_number(number: Option<u32>, theme_kind: ThemeKind) -> Div {
+    let colors = theme::tokens(theme_kind).colors;
     div()
         .w(px(42.))
         .h_full()
@@ -2954,31 +3749,46 @@ fn render_line_number(number: Option<u32>) -> Div {
         .flex()
         .items_center()
         .justify_end()
-        .bg(rgb(0x161b22))
+        .bg(rgb(colors.panel))
         .border_r_1()
-        .border_color(rgb(0x2b313a))
-        .text_color(rgb(0x6e7681))
+        .border_color(rgb(colors.border))
+        .text_color(rgb(colors.faint_text))
         .child(number.map(|number| number.to_string()).unwrap_or_default())
 }
 
-fn diff_line_style(kind: DiffLineKind) -> (u32, u32, &'static str) {
+fn diff_line_style(kind: DiffLineKind, theme_kind: ThemeKind) -> (u32, u32, &'static str) {
+    let colors = theme::tokens(theme_kind).colors;
     match kind {
-        DiffLineKind::Context => (0x0f141b, 0xc9d1d9, " "),
-        DiffLineKind::Addition => (0x123523, 0xc8e6d0, "+"),
-        DiffLineKind::Deletion => (0x431d22, 0xf0c5ca, "−"),
-        DiffLineKind::Meta => (0x1a2029, 0x8b949e, ""),
+        DiffLineKind::Context => (colors.root, colors.text, " "),
+        DiffLineKind::Addition => (colors.addition_soft, colors.text, "+"),
+        DiffLineKind::Deletion => (colors.deletion_soft, colors.text, "−"),
+        DiffLineKind::Meta => (colors.panel, colors.muted_text, ""),
     }
 }
 
 impl Render for RodeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = &theme::current().colors;
+        let colors = theme::tokens(self.theme).colors;
         if self.codex_auth.requires_onboarding() {
             return self.render_auth_onboarding(cx);
         }
-        if self.show_terminal {
+        if self.show_terminal || self.route == AppRoute::Terminal {
             self.ensure_terminal(window, cx);
         }
+        let inspector_width = self
+            .panel_layout
+            .inspector_width_for_viewport(f32::from(window.viewport_size().width));
+        let route = match self.route {
+            AppRoute::Workspace => self
+                .render_workspace_route(inspector_width, cx)
+                .into_any_element(),
+            AppRoute::SourceControl => self.render_source_control_route(cx).into_any_element(),
+            AppRoute::Terminal => self.render_terminal_route(cx).into_any_element(),
+            AppRoute::Settings(_) => self.render_settings_route(cx).into_any_element(),
+            AppRoute::Login => self
+                .render_workspace_route(inspector_width, cx)
+                .into_any_element(),
+        };
         div()
             .id("rode-root")
             .key_context(self.route.key_context())
@@ -2990,28 +3800,23 @@ impl Render for RodeApp {
             .on_action(cx.listener(Self::toggle_diff))
             .on_action(cx.listener(Self::toggle_diff_layout))
             .on_action(cx.listener(Self::refresh_repo))
+            .on_action(cx.listener(Self::open_workspace))
+            .on_action(cx.listener(Self::open_source_control))
+            .on_action(cx.listener(Self::open_terminal_route))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::cycle_theme))
+            .on_mouse_move(cx.listener(Self::resize_panels))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_panel_resize))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_resize))
             .size_full()
-            .min_w(px(900.))
+            .min_w_0()
             .relative()
             .flex()
+            .overflow_hidden()
             .bg(rgb(colors.root))
             .text_color(rgb(colors.text))
-            .child(self.render_sidebar(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(self.render_header(cx))
-                    .child(self.render_messages(cx))
-                    .when(self.show_terminal, |column| {
-                        column.child(self.render_terminal(cx))
-                    })
-                    .child(self.render_composer(cx)),
-            )
-            .when(self.show_diff, |root| root.child(self.render_diff(cx)))
+            .child(self.render_app_rail(cx))
+            .child(route)
             .when_some(self.modal, |root, active_modal| {
                 root.child(modal::modal_frame(
                     active_modal.title(),
@@ -3019,6 +3824,7 @@ impl Render for RodeApp {
                         .text_sm()
                         .text_color(rgb(colors.muted_text))
                         .child("This dialog is ready for its feature-specific content."),
+                    self.theme,
                 ))
             })
             .child(
@@ -3030,13 +3836,18 @@ impl Render for RodeApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .children(self.toasts.iter().map(toast::toast)),
+                    .children(
+                        self.toasts
+                            .iter()
+                            .map(|notice| toast::toast(notice, self.theme)),
+                    ),
             )
             .into_any_element()
     }
 }
 
-fn onboarding_status(label: &'static str) -> gpui::AnyElement {
+fn onboarding_status(label: &'static str, theme_kind: ThemeKind) -> gpui::AnyElement {
+    let colors = theme::tokens(theme_kind).colors;
     div()
         .w_full()
         .h(px(44.))
@@ -3044,9 +3855,9 @@ fn onboarding_status(label: &'static str) -> gpui::AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(0x242831))
+        .bg(rgb(colors.overlay))
         .text_sm()
-        .text_color(rgb(0x8f96a5))
+        .text_color(rgb(colors.muted_text))
         .child(label)
         .into_any_element()
 }
@@ -3070,11 +3881,15 @@ fn folder_name(path: &Path) -> String {
         .to_owned()
 }
 
-fn route_after_auth(current: AppRoute, requires_onboarding: bool) -> AppRoute {
+fn route_after_auth(
+    current: AppRoute,
+    last_authenticated: AppRoute,
+    requires_onboarding: bool,
+) -> AppRoute {
     if requires_onboarding {
         AppRoute::Login
     } else if current == AppRoute::Login {
-        AppRoute::Workspace
+        last_authenticated
     } else {
         current
     }
@@ -3082,7 +3897,14 @@ fn route_after_auth(current: AppRoute, requires_onboarding: bool) -> AppRoute {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppRoute, CodexAccount, CodexAuthState, SettingsSection, route_after_auth};
+    use super::{
+        AppRoute, CodexAccount, CodexAuthState, INSPECTOR_WIDTH_SETTING, ROUTE_SETTING,
+        SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, UiPreferences, route_after_auth,
+    };
+    use crate::persistence::StateStore;
+    use crate::theme::ThemeKind;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn workspace_is_only_available_after_codex_authentication() {
@@ -3110,18 +3932,67 @@ mod tests {
     }
 
     #[test]
+    fn application_routes_round_trip_through_stable_names() {
+        for route in [
+            AppRoute::Workspace,
+            AppRoute::SourceControl,
+            AppRoute::Terminal,
+            AppRoute::Settings(SettingsSection::Appearance),
+        ] {
+            assert!(AppRoute::from_storage_name(route.storage_name()).same_surface(route));
+        }
+        assert_eq!(AppRoute::from_storage_name("unknown"), AppRoute::Workspace);
+    }
+
+    #[test]
     fn authentication_routes_to_onboarding_without_clobbering_signed_in_navigation() {
         assert_eq!(
-            route_after_auth(AppRoute::SourceControl, true),
+            route_after_auth(AppRoute::SourceControl, AppRoute::SourceControl, true),
             AppRoute::Login
         );
         assert_eq!(
-            route_after_auth(AppRoute::Login, false),
-            AppRoute::Workspace
+            route_after_auth(AppRoute::Login, AppRoute::SourceControl, false),
+            AppRoute::SourceControl
         );
         assert_eq!(
-            route_after_auth(AppRoute::Terminal, false),
+            route_after_auth(AppRoute::Terminal, AppRoute::Workspace, false),
             AppRoute::Terminal
         );
+    }
+
+    #[test]
+    fn ui_preferences_restore_route_theme_and_bounded_panel_widths() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-ui-preferences-{nonce}"));
+        fs::create_dir_all(&root).expect("create settings fixture");
+        let mut store = StateStore::open(&root.join("state.sqlite3")).expect("open settings store");
+        store
+            .save_string_setting(ROUTE_SETTING, AppRoute::Terminal.storage_name())
+            .unwrap();
+        store
+            .save_string_setting(THEME_SETTING, ThemeKind::Daylight.storage_name())
+            .unwrap();
+        store
+            .save_f32_setting(SIDEBAR_WIDTH_SETTING, 300.0)
+            .unwrap();
+        store
+            .save_f32_setting(INSPECTOR_WIDTH_SETTING, 500.0)
+            .unwrap();
+
+        let preferences = UiPreferences::load(&store);
+        assert_eq!(preferences.route, AppRoute::Terminal);
+        assert_eq!(preferences.theme, ThemeKind::Daylight);
+        assert_eq!(preferences.panels.sidebar_width, 300.0);
+        assert_eq!(preferences.panels.inspector_width, 500.0);
+
+        store
+            .save_string_setting(SIDEBAR_WIDTH_SETTING, "NaN")
+            .unwrap();
+        assert!(UiPreferences::load(&store).panels.sidebar_width.is_finite());
+        drop(store);
+        fs::remove_dir_all(root).expect("clean settings fixture");
     }
 }

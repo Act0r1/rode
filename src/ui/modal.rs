@@ -1,12 +1,13 @@
 use gpui::{IntoElement, SharedString, div, prelude::*, px, rgb, rgba};
 
-use crate::theme;
+use crate::theme::{self, ThemeKind};
 
 pub(crate) fn modal_frame(
     title: impl Into<SharedString>,
     body: impl IntoElement,
+    theme_kind: ThemeKind,
 ) -> impl IntoElement {
-    let colors = &theme::current().colors;
+    let colors = theme::tokens(theme_kind).colors;
     div()
         .id("modal-backdrop")
         .key_context("Modal")

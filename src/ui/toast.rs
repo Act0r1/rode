@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use gpui::{Div, SharedString, div, prelude::*, rgb};
 
-use crate::theme;
+use crate::theme::{self, ThemeKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ToastKind {
@@ -55,8 +55,8 @@ impl ToastQueue {
     }
 }
 
-pub(crate) fn toast(toast: &Toast) -> Div {
-    let colors = &theme::current().colors;
+pub(crate) fn toast(toast: &Toast, theme_kind: ThemeKind) -> Div {
+    let colors = theme::tokens(theme_kind).colors;
     let accent = match toast.kind {
         ToastKind::Info => colors.info,
         ToastKind::Success => colors.success,
