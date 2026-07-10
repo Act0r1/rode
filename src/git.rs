@@ -81,4 +81,3 @@ mod tests {
         assert!(!snapshot.is_repository || !snapshot.branch.is_empty());
     }
 }
-

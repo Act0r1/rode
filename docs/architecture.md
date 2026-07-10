@@ -52,6 +52,7 @@ Zed's Linux code informed several deliberate choices:
 - `app`: GPUI views, focus, actions, and the top-level application state.
 - `editor`: IME-aware multiline input and its low-level shaped-text element.
 - `agent`: provider-neutral turn result plus the first Codex CLI adapter.
+- `codex_auth`: the Codex app-server account client and managed ChatGPT login.
 - `git`: read-only repository snapshots and diffs; worktree and publishing
   operations belong here as the prototype grows.
 
@@ -67,11 +68,18 @@ trait AgentProvider {
 }
 ```
 
-Codex should ultimately use `codex app-server` JSON-RPC because it exposes
-thread/turn lifecycle, streaming items, permission requests, cancellation, and
-process interaction. The first executable slice uses `codex exec --json` and
-retains the emitted thread ID; this already runs real turns, but approval
-prompts and live token deltas require the app-server transport.
+Codex authentication already uses the
+[`codex app-server`](https://developers.openai.com/codex/app-server) JSON-RPC
+account surface. Rode calls `account/read`, starts managed browser OAuth with
+`account/login/start`, opens the returned HTTPS URL, and waits for
+`account/login/completed`. Codex owns the callback listener, token storage, and
+refresh lifecycle; Rode does not handle tokens.
+
+Agent turns should ultimately move to the same app-server transport because it
+also exposes thread/turn lifecycle, streaming items, permission requests,
+cancellation, and process interaction. The first executable slice still uses
+`codex exec --json` and retains the emitted thread ID; approval prompts and live
+token deltas require the app-server transport.
 
 Claude and OpenCode should use ACP where available. A PTY compatibility adapter
 is the fallback for harnesses without a structured protocol.
@@ -111,7 +119,8 @@ created and records the failure.
 
 ## Delivery sequence
 
-1. Native shell, input, provider discovery, Codex turns, and Git diff.
+1. Native shell, input, provider discovery, managed Codex login, Codex turns,
+   and Git diff.
 2. Codex app-server transport with streaming events, cancellation, and approval
    cards.
 3. SQLite event store and restoration of projects/threads/drafts.
@@ -120,4 +129,3 @@ created and records the failure.
 6. Commit/push/PR workflow using the user's `git` and `gh` authentication.
 7. Claude/OpenCode ACP adapters, notifications, desktop-file packaging, and
    Wayland compositor compatibility tests.
-

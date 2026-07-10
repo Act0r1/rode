@@ -12,6 +12,7 @@ that means direct Wayland integration, `xkbcommon` input, and GPU rendering via
 
 - native Wayland window and GPU-rendered three-pane interface;
 - project and provider discovery for Codex and Claude Code;
+- in-app ChatGPT sign-in through Codex's managed OAuth flow;
 - real Codex execution through the installed CLI with persisted thread IDs;
 - Git branch, dirty-file count, diff stats, and an in-app diff view;
 - Unicode/IME-aware prompt editor using GPUI's platform input path;
@@ -33,7 +34,13 @@ cargo run -- /path/to/a/project
 ```
 
 The project path defaults to the current directory. Rode detects agent CLIs
-from `PATH`; authenticate them in their own CLI before launching Rode.
+from `PATH`. If Codex is signed out, use **Sign in with ChatGPT** in the
+sidebar; Rode opens the browser flow exposed by `codex app-server` and updates
+the account card when Codex confirms the login.
+
+Codex owns the OAuth callback, credential persistence, and token refresh. Rode
+only receives the account email and plan needed for status display; it never
+reads or stores OpenAI access or refresh tokens.
 
 ## Why Rust
 
@@ -43,4 +50,3 @@ Rust also has mature libraries for async processes, pseudo-terminals, Git,
 SQLite, accessibility, and desktop portals. Choosing Zig would require
 rebuilding or wrapping most of that infrastructure before reaching the agent
 workflow.
-

@@ -1,18 +1,19 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 mod agent;
+mod codex_auth;
 mod editor;
 mod git;
 
 use std::path::PathBuf;
 
 use agent::{ProviderKind, ProviderStatus, discover_providers, run_codex};
+use codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
 use editor::{Editor, standard_actions};
 use git::RepoSnapshot;
 use gpui::{
     App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, Render, Role,
-    StyleRefinement, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
-    rgb, size,
+    StyleRefinement, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 
@@ -46,11 +47,22 @@ struct Message {
     text: String,
 }
 
+#[derive(Clone, Debug)]
+enum CodexAuthState {
+    Unavailable,
+    Checking,
+    SignedOut,
+    SignedIn(CodexAccount),
+    SigningIn,
+    Error(String),
+}
+
 struct RodeApp {
     project_path: PathBuf,
     project_name: String,
     repo: RepoSnapshot,
     providers: Vec<ProviderStatus>,
+    codex_auth: CodexAuthState,
     messages: Vec<Message>,
     composer: Entity<Editor>,
     codex_thread_id: Option<String>,
@@ -79,11 +91,22 @@ impl RodeApp {
         let composer_focus = composer.read(cx).focus_handle.clone();
         window.focus(&composer_focus, cx);
 
+        let providers = discover_providers();
+        let codex_auth = if providers
+            .iter()
+            .any(|provider| provider.kind == ProviderKind::Codex && provider.available)
+        {
+            CodexAuthState::Checking
+        } else {
+            CodexAuthState::Unavailable
+        };
+
         Self {
             project_path: repo.root.clone(),
             project_name,
             repo,
-            providers: discover_providers(),
+            providers,
+            codex_auth,
             messages: vec![Message {
                 role: MessageRole::System,
                 text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
@@ -102,6 +125,117 @@ impl RodeApp {
             .any(|provider| provider.kind == ProviderKind::Codex && provider.available)
     }
 
+    fn codex_authenticated(&self) -> bool {
+        matches!(self.codex_auth, CodexAuthState::SignedIn(_))
+    }
+
+    fn refresh_codex_account(&mut self, cx: &mut Context<Self>) {
+        if !self.codex_available() {
+            self.codex_auth = CodexAuthState::Unavailable;
+            cx.notify();
+            return;
+        }
+
+        self.codex_auth = CodexAuthState::Checking;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { read_codex_account() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.codex_auth = match result {
+                    Ok(status) => status
+                        .account
+                        .map(CodexAuthState::SignedIn)
+                        .unwrap_or(CodexAuthState::SignedOut),
+                    Err(error) => CodexAuthState::Error(format!("{error:#}")),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn sign_in_codex(&mut self, cx: &mut Context<Self>) {
+        if !self.codex_available() || matches!(self.codex_auth, CodexAuthState::SigningIn) {
+            return;
+        }
+
+        self.codex_auth = CodexAuthState::SigningIn;
+        self.messages.push(Message {
+            role: MessageRole::System,
+            text: "Starting a secure ChatGPT sign-in through Codex…".to_owned(),
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let pending = cx
+                .background_spawn(async move { begin_codex_login() })
+                .await;
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        let detail = format!("{error:#}");
+                        this.codex_auth = CodexAuthState::Error(detail.clone());
+                        this.messages.push(Message {
+                            role: MessageRole::System,
+                            text: format!("Could not start Codex login: {detail}"),
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+
+            let auth_url = pending.auth_url.clone();
+            if this
+                .update(cx, |this, cx| {
+                    cx.open_url(&auth_url);
+                    this.messages.push(Message {
+                        role: MessageRole::System,
+                        text: "Complete sign-in in your browser. Rode is waiting for Codex to confirm it."
+                            .to_owned(),
+                    });
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            let result = cx.background_spawn(async move { pending.wait() }).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(status) => {
+                        this.codex_auth = status
+                            .account
+                            .map(CodexAuthState::SignedIn)
+                            .unwrap_or(CodexAuthState::SignedOut);
+                        this.messages.push(Message {
+                            role: MessageRole::System,
+                            text: "Signed in to OpenAI through Codex. You can now start a thread."
+                                .to_owned(),
+                        });
+                    }
+                    Err(error) => {
+                        let detail = format!("{error:#}");
+                        this.codex_auth = CodexAuthState::Error(detail.clone());
+                        this.messages.push(Message {
+                            role: MessageRole::System,
+                            text: format!("Codex login did not complete: {detail}"),
+                        });
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn send_prompt(&mut self, _: &SendPrompt, _: &mut Window, cx: &mut Context<Self>) {
         if self.running {
             return;
@@ -116,6 +250,15 @@ impl RodeApp {
             self.messages.push(Message {
                 role: MessageRole::System,
                 text: "Codex was not found on PATH. Install and authenticate the Codex CLI, then restart Rode.".to_owned(),
+            });
+            cx.notify();
+            return;
+        }
+        if !self.codex_authenticated() {
+            self.messages.push(Message {
+                role: MessageRole::System,
+                text: "Sign in with ChatGPT from the Codex card in the sidebar before starting a thread."
+                    .to_owned(),
             });
             cx.notify();
             return;
@@ -175,6 +318,102 @@ impl RodeApp {
             .as_deref()
             .map(|id| id.chars().take(8).collect::<String>())
             .unwrap_or_else(|| "not started".to_owned());
+        let (codex_color, codex_label) = match &self.codex_auth {
+            CodexAuthState::Unavailable => (0x6b7280, "Codex · missing".to_owned()),
+            CodexAuthState::Checking => (0xf59e0b, "Codex · checking account".to_owned()),
+            CodexAuthState::SignedOut => (0xf59e0b, "Codex · sign in required".to_owned()),
+            CodexAuthState::SignedIn(account) => {
+                (0x34d399, format!("Codex · {}", account.summary()))
+            }
+            CodexAuthState::SigningIn => (0x60a5fa, "Codex · waiting for browser".to_owned()),
+            CodexAuthState::Error(_) => (0xf87171, "Codex · authentication error".to_owned()),
+        };
+        let codex_error = match &self.codex_auth {
+            CodexAuthState::Error(error) => Some(error.clone()),
+            _ => None,
+        };
+        let claude_provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.kind == ProviderKind::Claude);
+        let claude_available = claude_provider.is_some_and(|provider| provider.available);
+        let claude_path = claude_provider
+            .and_then(|provider| provider.path.as_ref())
+            .map(|path| path.display().to_string());
+        let codex_status = div()
+            .rounded_md()
+            .p_2()
+            .bg(rgb(0x191c22))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(7.)).rounded_full().bg(rgb(codex_color)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(0xb9bec9))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(codex_label),
+                    ),
+            )
+            .when_some(codex_error, |status, error| {
+                status.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xfca5a5))
+                        .line_height(px(16.))
+                        .child(error),
+                )
+            })
+            .when(
+                matches!(self.codex_auth, CodexAuthState::SignedOut),
+                |status| {
+                    status.child(
+                        div()
+                            .id("codex-sign-in")
+                            .role(Role::Button)
+                            .aria_label("Sign in to OpenAI with ChatGPT")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(0x2563eb))
+                            .hover(|style| style.bg(rgb(0x3b82f6)))
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .on_click(cx.listener(|this, _, _, cx| this.sign_in_codex(cx)))
+                            .child("Sign in with ChatGPT"),
+                    )
+                },
+            )
+            .when(
+                matches!(self.codex_auth, CodexAuthState::Error(_)),
+                |status| {
+                    status.child(
+                        div()
+                            .id("codex-auth-retry")
+                            .role(Role::Button)
+                            .aria_label("Retry Codex account check")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(0x343946))
+                            .hover(|style| style.bg(rgb(0x444b5a)))
+                            .text_xs()
+                            .text_color(rgb(0xf3f4f6))
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_codex_account(cx)))
+                            .child("Retry account check"),
+                    )
+                },
+            );
 
         div()
             .w(px(252.))
@@ -302,25 +541,44 @@ impl RodeApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .children(self.providers.iter().map(|provider| {
-                        let color = if provider.available {
-                            rgb(0x34d399)
-                        } else {
-                            rgb(0x6b7280)
-                        };
-                        let state = if provider.available { "ready" } else { "missing" };
+                    .child(codex_status)
+                    .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().size(px(7.)).rounded_full().bg(color))
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(0xb9bec9))
-                                    .child(format!("{} · {state}", provider.kind.label())),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().size(px(7.)).rounded_full().bg(
+                                        if claude_available {
+                                            rgb(0x34d399)
+                                        } else {
+                                            rgb(0x6b7280)
+                                        },
+                                    ))
+                                    .child(
+                                        div().text_xs().text_color(rgb(0xb9bec9)).child(format!(
+                                            "{} · {}",
+                                            ProviderKind::Claude.label(),
+                                            if claude_available { "ready" } else { "missing" }
+                                        )),
+                                    ),
                             )
-                    })),
+                            .when_some(claude_path, |status, path| {
+                                status.child(
+                                    div()
+                                        .pl_4()
+                                        .text_xs()
+                                        .text_color(rgb(0x6b7280))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(path),
+                                )
+                            }),
+                    ),
             )
     }
 
@@ -503,11 +761,9 @@ impl RodeApp {
                     .text_size(px(14.))
                     .text_color(rgb(0xe5e7eb))
                     .child(
-                        self.composer.clone().cached(
-                            StyleRefinement::default()
-                                .w_full()
-                                .h(px(72.)),
-                        ),
+                        self.composer
+                            .clone()
+                            .cached(StyleRefinement::default().w_full().h(px(72.))),
                     )
                     .child(
                         div()
@@ -651,7 +907,9 @@ fn main() {
             },
             move |window, cx| {
                 let project_path = project_path.clone();
-                cx.new(|cx| RodeApp::new(project_path, window, cx))
+                let app = cx.new(|cx| RodeApp::new(project_path, window, cx));
+                app.update(cx, |app, cx| app.refresh_codex_account(cx));
+                app
             },
         )
         .expect("opening the Rode window");
