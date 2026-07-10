@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rode
+Comment=Native Wayland workspace for Codex
+Exec=rode %f
+Icon=dev.rode.Rode
+Terminal=false
+Categories=Development;IDE;
+Keywords=Codex;OpenAI;Git;Terminal;
+MimeType=inode/directory;
+StartupNotify=true
+StartupWMClass=dev.rode.Rode

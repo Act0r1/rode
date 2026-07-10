@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.rode.Rode</id>
+  <name>Rode</name>
+  <summary>Native Wayland workspace for Codex</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <description>
+    <p>
+      Rode is a Linux-native Codex workspace with persistent project threads,
+      isolated Git worktrees, structured diffs, approvals, and a Ghostty-powered
+      host terminal.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.rode.Rode.desktop</launchable>
+  <provides>
+    <binary>rode</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>IDE</category>
+  </categories>
+  <url type="homepage">https://github.com/Act0r1/rode</url>
+</component>

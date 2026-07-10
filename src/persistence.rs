@@ -186,7 +186,7 @@ impl StateStore {
             "SELECT path, name, active_thread_id FROM projects
              ORDER BY last_opened_ms DESC, name COLLATE NOCASE ASC",
         )?;
-        statement
+        let projects = statement
             .query_map([], |row| {
                 Ok(StoredProject {
                     path: PathBuf::from(row.get::<_, String>(0)?),
@@ -195,7 +195,11 @@ impl StateStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to load Rode projects")
+            .context("failed to load Rode projects")?;
+        Ok(projects
+            .into_iter()
+            .filter(|project| project.path.is_dir())
+            .collect())
     }
 
     pub fn load_bool_setting(&self, key: &str, default: bool) -> Result<bool> {
@@ -344,7 +348,6 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{StateStore, StoredMessage, StoredProject, StoredThread};
     use std::fs;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -356,8 +359,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rode-state-test-{nonce}"));
         fs::create_dir_all(&root).expect("create state fixture");
         let database = root.join("state.sqlite3");
-        let project = PathBuf::from("/tmp/rode-project");
-        let worktree = PathBuf::from("/tmp/rode-worktree");
+        let project = root.join("project");
+        let worktree = root.join("worktree");
+        fs::create_dir_all(&project).expect("create project fixture");
+        fs::create_dir_all(&worktree).expect("create worktree fixture");
         let mut store = StateStore::open(&database).expect("open state database");
         let thread = StoredThread {
             id: "thread-1".to_owned(),

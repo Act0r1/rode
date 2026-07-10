@@ -103,6 +103,67 @@ pub fn remove_thread_worktree(repository: &Path, worktree: &ThreadWorktree) -> R
     Ok(())
 }
 
+pub fn commit_all(repository: &Path, message: &str) -> Result<String> {
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("enter a commit message first");
+    }
+    let root = repository_root(repository)?;
+    let status = git_output(&root, &["status", "--porcelain=v1"]).unwrap_or_default();
+    if status.is_empty() {
+        bail!("the working tree has no changes to commit");
+    }
+    git_command(&root, &["add", "--all"])?;
+    git_command(&root, &["commit", "-m", message])?;
+    git_output(&root, &["rev-parse", "--short", "HEAD"])
+        .context("Git did not return the new commit ID")
+}
+
+pub fn push_current_branch(repository: &Path) -> Result<String> {
+    let root = repository_root(repository)?;
+    let branch = git_output(&root, &["branch", "--show-current"])
+        .filter(|branch| !branch.is_empty())
+        .context("cannot push a detached HEAD")?;
+    git_command(&root, &["push", "--set-upstream", "origin", &branch])?;
+    Ok(branch)
+}
+
+pub fn create_pull_request(repository: &Path, title: &str) -> Result<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        bail!("enter a pull-request title first");
+    }
+    let root = repository_root(repository)?;
+    let branch = git_output(&root, &["branch", "--show-current"])
+        .filter(|branch| !branch.is_empty())
+        .context("cannot create a pull request from a detached HEAD")?;
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--title",
+            title,
+            "--body",
+            "Created with Rode.",
+            "--head",
+            &branch,
+        ])
+        .current_dir(&root)
+        .output()
+        .context("failed to start `gh`; install GitHub CLI and authenticate it first")?;
+    if !output.status.success() {
+        bail!(
+            "gh pr create failed: {}",
+            command_detail(&output.stdout, &output.stderr)
+        );
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if url.is_empty() {
+        bail!("gh created the pull request but returned no URL");
+    }
+    Ok(url)
+}
+
 impl RepoSnapshot {
     pub fn load(path: &Path) -> Self {
         let root = canonical_or_original(path);
@@ -156,6 +217,42 @@ impl RepoSnapshot {
 
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn repository_root(path: &Path) -> Result<PathBuf> {
+    let path = canonical_or_original(path);
+    git_output(&path, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .context("the selected workspace is not inside a Git repository")
+}
+
+fn git_command(cwd: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to start `git {}`", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or("command"),
+            command_detail(&output.stdout, &output.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn command_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    if stdout.is_empty() {
+        "command exited unsuccessfully".to_owned()
+    } else {
+        stdout
+    }
 }
 
 fn rode_state_dir() -> Result<PathBuf> {
@@ -265,8 +362,8 @@ fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RepoSnapshot, create_thread_worktree_at, remove_thread_worktree, safe_slug,
-        untracked_file_diff,
+        RepoSnapshot, commit_all, create_thread_worktree_at, git_output, remove_thread_worktree,
+        safe_slug, untracked_file_diff,
     };
     use crate::diff::DiffDocument;
     use std::fs;
@@ -390,5 +487,43 @@ mod tests {
         let document = DiffDocument::parse(&diff);
         assert!(document.files[0].binary);
         assert_eq!(document.files[0].status.as_deref(), Some("Added"));
+    }
+
+    #[test]
+    fn commit_all_stages_and_commits_the_reviewed_worktree() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-commit-test-{nonce}"));
+        fs::create_dir_all(&root).expect("create repository fixture");
+        for args in [
+            ["init", "--quiet"].as_slice(),
+            ["config", "user.name", "Rode Test"].as_slice(),
+            ["config", "user.email", "rode@example.invalid"].as_slice(),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .expect("run git fixture command")
+                    .success()
+            );
+        }
+        fs::write(root.join("README.md"), "reviewed\n").expect("write reviewed change");
+
+        let commit = commit_all(&root, "feat: commit from Rode").expect("commit changes");
+        assert!(!commit.is_empty());
+        assert_eq!(
+            git_output(&root, &["status", "--porcelain=v1"]).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            git_output(&root, &["log", "-1", "--pretty=%s"]).as_deref(),
+            Some("feat: commit from Rode")
+        );
+
+        fs::remove_dir_all(root).expect("clean repository fixture");
     }
 }

@@ -6,6 +6,7 @@ mod codex_auth;
 mod diff;
 mod editor;
 mod git;
+mod notifications;
 mod persistence;
 mod terminal;
 
@@ -19,7 +20,9 @@ use codex::{ApprovalRequest, CodexEvent, CodexSession};
 use codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
 use diff::{DiffDocument, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffViewMode, split_rows};
 use editor::{Editor, standard_actions};
-use git::{RepoSnapshot, create_thread_worktree};
+use git::{
+    RepoSnapshot, commit_all, create_pull_request, create_thread_worktree, push_current_branch,
+};
 use gpui::{
     App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, PathPromptOptions,
     Render, Role, StyleRefinement, Subscription, TitlebarOptions, Window, WindowBounds,
@@ -108,6 +111,12 @@ enum RenameTarget {
     Thread(String),
 }
 
+enum PublishOperation {
+    Commit(String),
+    Push,
+    PullRequest(String),
+}
+
 struct RodeApp {
     state_store: Option<StateStore>,
     known_projects: Vec<StoredProject>,
@@ -120,6 +129,7 @@ struct RodeApp {
     codex_auth: CodexAuthState,
     messages: Vec<Message>,
     composer: Entity<Editor>,
+    commit_editor: Entity<Editor>,
     rename_editor: Entity<Editor>,
     rename_target: Option<RenameTarget>,
     _rename_blur_subscription: Subscription,
@@ -140,6 +150,8 @@ struct RodeApp {
     running: bool,
     show_diff: bool,
     diff_view: DiffViewMode,
+    git_operation: Option<&'static str>,
+    publish_status: Option<String>,
     show_terminal: bool,
     terminal_sessions: HashMap<String, Entity<TerminalView>>,
     thread_number: usize,
@@ -192,6 +204,8 @@ impl RodeApp {
         });
         let composer_focus = composer.read(cx).focus_handle.clone();
         window.focus(&composer_focus, cx);
+        let commit_editor =
+            cx.new(|cx| Editor::new("", "Commit message or pull-request title", window, cx));
         let rename_editor = cx.new(|cx| Editor::new("", "New name", window, cx));
         let rename_focus = rename_editor.read(cx).focus_handle.clone();
         let rename_blur_subscription =
@@ -263,6 +277,7 @@ impl RodeApp {
             codex_auth,
             messages,
             composer,
+            commit_editor,
             rename_editor,
             rename_target: None,
             _rename_blur_subscription: rename_blur_subscription,
@@ -283,6 +298,8 @@ impl RodeApp {
             running: false,
             show_diff: true,
             diff_view: DiffViewMode::Split,
+            git_operation: None,
+            publish_status: None,
             show_terminal: false,
             terminal_sessions: HashMap::new(),
             thread_number,
@@ -366,6 +383,10 @@ impl RodeApp {
         self.active_agent_message = None;
         self.reasoning_preview.clear();
         self.approvals.clear();
+        self.git_operation = None;
+        self.publish_status = None;
+        self.commit_editor
+            .update(cx, |editor, cx| editor.set_text("", cx));
         self.thread_id = thread.id;
         self.thread_branch = thread.branch;
         self.codex_thread_id = thread.provider_thread_id;
@@ -732,6 +753,8 @@ impl RodeApp {
                 self.active_agent_message = None;
                 self.reasoning_preview.clear();
                 self.repo = RepoSnapshot::load(&self.project_path);
+                let failed = error.is_some() || !matches!(status.as_str(), "completed" | "success");
+                notifications::turn_finished(&self.thread_title, &status, failed);
                 if let Some(error) = error {
                     self.messages.push(Message {
                         role: MessageRole::System,
@@ -1028,6 +1051,10 @@ impl RodeApp {
         self.active_agent_message = None;
         self.reasoning_preview.clear();
         self.approvals.clear();
+        self.git_operation = None;
+        self.publish_status = None;
+        self.commit_editor
+            .update(cx, |editor, cx| editor.set_text("", cx));
         self.running = false;
         self.thread_number = self
             .known_threads
@@ -1161,6 +1188,62 @@ impl RodeApp {
     fn refresh_repo(&mut self, _: &RefreshRepo, _: &mut Window, cx: &mut Context<Self>) {
         self.repo = RepoSnapshot::load(&self.project_path);
         cx.notify();
+    }
+
+    fn start_publish_operation(&mut self, operation: PublishOperation, cx: &mut Context<Self>) {
+        if self.git_operation.is_some() {
+            return;
+        }
+        let label = match &operation {
+            PublishOperation::Commit(_) => "Committing",
+            PublishOperation::Push => "Pushing",
+            PublishOperation::PullRequest(_) => "Creating pull request",
+        };
+        let workspace = self.project_path.clone();
+        self.git_operation = Some(label);
+        self.publish_status = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    match operation {
+                        PublishOperation::Commit(message) => commit_all(&workspace, &message)
+                            .map(|commit| format!("Committed {commit}")),
+                        PublishOperation::Push => push_current_branch(&workspace)
+                            .map(|branch| format!("Pushed `{branch}` to origin")),
+                        PublishOperation::PullRequest(title) => {
+                            create_pull_request(&workspace, &title)
+                                .map(|url| format!("Pull request: {url}"))
+                        }
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.git_operation = None;
+                this.publish_status = Some(match result {
+                    Ok(message) => message,
+                    Err(error) => format!("Git workflow failed: {error:#}"),
+                });
+                this.repo = RepoSnapshot::load(&this.project_path);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn commit_changes(&mut self, cx: &mut Context<Self>) {
+        let message = self.commit_editor.read(cx).text();
+        self.start_publish_operation(PublishOperation::Commit(message), cx);
+    }
+
+    fn push_changes(&mut self, cx: &mut Context<Self>) {
+        self.start_publish_operation(PublishOperation::Push, cx);
+    }
+
+    fn create_pr(&mut self, cx: &mut Context<Self>) {
+        let title = self.commit_editor.read(cx).text();
+        self.start_publish_operation(PublishOperation::PullRequest(title), cx);
     }
 
     fn render_inline_rename(&self, cx: &mut Context<Self>) -> Div {
@@ -2349,6 +2432,87 @@ impl RodeApp {
             )
     }
 
+    fn render_publish_controls(&self, cx: &mut Context<Self>) -> Div {
+        let focus = self.commit_editor.read(cx).focus_handle.clone();
+        let busy = self.git_operation.is_some();
+        div()
+            .flex_none()
+            .p_3()
+            .border_b_1()
+            .border_color(rgb(0x292f38))
+            .bg(rgb(0x11161d))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .key_context("CommitMessage")
+                    .track_focus(&focus)
+                    .map(standard_actions(self.commit_editor.clone()))
+                    .h(px(36.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x303742))
+                    .bg(rgb(0x171c24))
+                    .text_sm()
+                    .text_color(rgb(0xe6edf3))
+                    .child(
+                        self.commit_editor
+                            .clone()
+                            .cached(StyleRefinement::default().w_full()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(publish_button(
+                        "commit-all",
+                        "Commit all",
+                        busy,
+                        cx.listener(|this, _, _, cx| this.commit_changes(cx)),
+                    ))
+                    .child(publish_button(
+                        "push-branch",
+                        "Push",
+                        busy,
+                        cx.listener(|this, _, _, cx| this.push_changes(cx)),
+                    ))
+                    .child(publish_button(
+                        "create-pr",
+                        "Create PR",
+                        busy,
+                        cx.listener(|this, _, _, cx| this.create_pr(cx)),
+                    ))
+                    .when_some(self.git_operation, |row, operation| {
+                        row.child(
+                            div()
+                                .ml_auto()
+                                .text_xs()
+                                .text_color(rgb(0x93c5fd))
+                                .child(format!("{operation}…")),
+                        )
+                    }),
+            )
+            .when_some(self.publish_status.clone(), |panel, status| {
+                panel.child(
+                    div()
+                        .text_xs()
+                        .line_height(px(18.))
+                        .text_color(if status.starts_with("Git workflow failed") {
+                            rgb(0xfca5a5)
+                        } else {
+                            rgb(0x86efac)
+                        })
+                        .child(status),
+                )
+            })
+    }
+
     fn render_diff(&self, cx: &mut Context<Self>) -> Div {
         let document = DiffDocument::parse(&self.repo.diff);
         let mut files = div()
@@ -2458,6 +2622,7 @@ impl RodeApp {
                     .text_color(rgb(0x8b949e))
                     .child(self.repo.diff_stat.clone()),
             )
+            .child(self.render_publish_controls(cx))
             .child(files)
     }
 
@@ -2629,6 +2794,31 @@ impl RodeApp {
             )
             .child(body)
     }
+}
+
+fn publish_button(
+    id: &'static str,
+    label: &'static str,
+    busy: bool,
+    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .bg(if busy { rgb(0x252b34) } else { rgb(0x2563eb) })
+        .text_xs()
+        .text_color(if busy { rgb(0x6b7280) } else { rgb(0xffffff) })
+        .when(!busy, |button| {
+            button
+                .hover(|style| style.bg(rgb(0x3b82f6)))
+                .on_click(listener)
+        })
+        .child(label)
 }
 
 fn render_unchanged_band(count: u32) -> Div {
