@@ -2,10 +2,15 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 const INITIALIZE_REQUEST_ID: u64 = 1;
 const ACCOUNT_READ_REQUEST_ID: u64 = 2;
 const LOGIN_REQUEST_ID: u64 = 3;
+const LOGIN_CANCEL_REQUEST_ID: u64 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodexAccount {
@@ -17,9 +22,10 @@ pub enum CodexAccount {
 impl CodexAccount {
     pub fn summary(&self) -> String {
         match self {
-            Self::ChatGpt { email, plan } => {
-                email.clone().unwrap_or_else(|| format!("ChatGPT {plan}"))
-            }
+            Self::ChatGpt { email, plan } => email
+                .as_ref()
+                .map(|email| format!("{email} · ChatGPT {plan}"))
+                .unwrap_or_else(|| format!("ChatGPT {plan}")),
             Self::ApiKey => "OpenAI API key".to_owned(),
             Self::Other(kind) => kind.clone(),
         }
@@ -36,18 +42,98 @@ pub struct PendingCodexLogin {
     session: AppServerSession,
     login_id: String,
     pub auth_url: String,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexLoginOutcome {
+    Complete(CodexAccountStatus),
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoginCancelStatus {
+    Canceled,
+    NotFound,
+}
+
+#[derive(Clone)]
+pub struct PendingCodexLoginCancellation {
+    stdin: Arc<Mutex<ChildStdin>>,
+    login_id: String,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+impl PendingCodexLoginCancellation {
+    pub fn cancel(&self) -> Result<()> {
+        send_message(&self.stdin, &login_cancel_message(&self.login_id))?;
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl PendingCodexLogin {
-    pub fn wait(mut self) -> Result<CodexAccountStatus> {
+    pub fn cancellation(&self) -> PendingCodexLoginCancellation {
+        PendingCodexLoginCancellation {
+            stdin: self.session.stdin.clone(),
+            login_id: self.login_id.clone(),
+            cancel_requested: self.cancel_requested.clone(),
+        }
+    }
+
+    pub fn wait(mut self) -> Result<CodexLoginOutcome> {
         loop {
             let message = self.session.read_message()?;
+            if let Some(cancel) = parse_login_cancel_response(&message) {
+                match cancel? {
+                    LoginCancelStatus::Canceled => return Ok(CodexLoginOutcome::Cancelled),
+                    LoginCancelStatus::NotFound => continue,
+                }
+            }
             if let Some(completion) = parse_login_completion(&message, &self.login_id) {
-                completion?;
-                return self.session.read_account();
+                if let Err(error) = completion {
+                    if self.cancel_requested.load(Ordering::SeqCst) {
+                        return Err(error).context(
+                            "login failed before Codex confirmed the cancellation request",
+                        );
+                    }
+                    return Err(error);
+                }
+                return self.session.read_account().map(CodexLoginOutcome::Complete);
             }
         }
     }
+}
+
+fn login_cancel_message(login_id: &str) -> Value {
+    json!({
+        "id": LOGIN_CANCEL_REQUEST_ID,
+        "method": "account/login/cancel",
+        "params": { "loginId": login_id }
+    })
+}
+
+fn parse_login_cancel_response(message: &Value) -> Option<Result<LoginCancelStatus>> {
+    if message.get("id").and_then(Value::as_u64) != Some(LOGIN_CANCEL_REQUEST_ID) {
+        return None;
+    }
+    if let Some(error) = message.get("error") {
+        return Some(Err(anyhow!(
+            "Codex app-server rejected account/login/cancel: {error}"
+        )));
+    }
+    let Some(status) = message.pointer("/result/status").and_then(Value::as_str) else {
+        return Some(Err(anyhow!(
+            "Codex app-server returned a malformed login cancellation response"
+        )));
+    };
+    Some(match status {
+        "canceled" => Ok(LoginCancelStatus::Canceled),
+        "notFound" => Ok(LoginCancelStatus::NotFound),
+        other => Err(anyhow!(
+            "Codex app-server returned unknown login cancellation status {other:?}"
+        )),
+    })
 }
 
 fn parse_login_completion(message: &Value, expected_login_id: &str) -> Option<Result<()>> {
@@ -98,6 +184,7 @@ pub fn begin_codex_login() -> Result<PendingCodexLogin> {
         session,
         login_id,
         auth_url,
+        cancel_requested: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -122,7 +209,7 @@ fn parse_login_start(result: &Value) -> Result<(String, String)> {
 
 struct AppServerSession {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     stdout: BufReader<ChildStdout>,
 }
 
@@ -145,7 +232,7 @@ impl AppServerSession {
             .context("Codex app-server has no stdout")?;
         let mut session = Self {
             child,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout),
         };
 
@@ -190,15 +277,8 @@ impl AppServerSession {
         }
     }
 
-    fn send(&mut self, message: &Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, message)
-            .context("failed to write to Codex app-server")?;
-        self.stdin
-            .write_all(b"\n")
-            .context("failed to delimit Codex app-server request")?;
-        self.stdin
-            .flush()
-            .context("failed to flush Codex app-server request")
+    fn send(&self, message: &Value) -> Result<()> {
+        send_message(&self.stdin, message)
     }
 
     fn read_message(&mut self) -> Result<Value> {
@@ -213,6 +293,19 @@ impl AppServerSession {
         }
         serde_json::from_str(&line).context("Codex app-server returned invalid JSON")
     }
+}
+
+fn send_message(stdin: &Arc<Mutex<ChildStdin>>, message: &Value) -> Result<()> {
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| anyhow!("Codex app-server stdin lock was poisoned"))?;
+    serde_json::to_writer(&mut *stdin, message).context("failed to write to Codex app-server")?;
+    stdin
+        .write_all(b"\n")
+        .context("failed to delimit Codex app-server request")?;
+    stdin
+        .flush()
+        .context("failed to flush Codex app-server request")
 }
 
 impl Drop for AppServerSession {
@@ -265,8 +358,9 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexAccount, CodexAccountStatus, begin_codex_login, chatgpt_login_params,
-        parse_account_status, parse_login_completion, parse_login_start, read_codex_account,
+        CodexAccount, CodexAccountStatus, LoginCancelStatus, begin_codex_login,
+        chatgpt_login_params, login_cancel_message, parse_account_status,
+        parse_login_cancel_response, parse_login_completion, parse_login_start, read_codex_account,
     };
     use serde_json::json;
 
@@ -361,6 +455,49 @@ mod tests {
             "login-123",
         );
         assert!(completion.is_none());
+    }
+
+    #[test]
+    fn cancels_the_exact_managed_login_id() {
+        assert_eq!(
+            login_cancel_message("login-123"),
+            json!({
+                "id": 4,
+                "method": "account/login/cancel",
+                "params": { "loginId": "login-123" }
+            })
+        );
+        assert_eq!(
+            parse_login_cancel_response(&json!({
+                "id": 4,
+                "result": { "status": "canceled" }
+            }))
+            .unwrap()
+            .unwrap(),
+            LoginCancelStatus::Canceled
+        );
+        assert_eq!(
+            parse_login_cancel_response(&json!({
+                "id": 4,
+                "result": { "status": "notFound" }
+            }))
+            .unwrap()
+            .unwrap(),
+            LoginCancelStatus::NotFound
+        );
+        assert!(
+            parse_login_cancel_response(&json!({
+                "id": 4,
+                "error": { "code": -32602, "message": "bad login" }
+            }))
+            .unwrap()
+            .is_err()
+        );
+        assert!(
+            parse_login_cancel_response(&json!({ "id": 4, "result": {} }))
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]

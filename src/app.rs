@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::actions::{
     ActivateRailItem, CancelRename, CycleTheme, DismissModal, OpenSettings, OpenSourceControl,
@@ -10,7 +7,10 @@ use crate::actions::{
 };
 use crate::agent::{ProviderKind, ProviderStatus, discover_providers};
 use crate::codex::{self, ApprovalRequest, CodexEvent, CodexSession};
-use crate::codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
+use crate::codex_auth::{
+    CodexAccount, CodexLoginOutcome, PendingCodexLoginCancellation, begin_codex_login,
+    read_codex_account,
+};
 use crate::diff::{
     DiffDocument, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffViewMode, split_rows,
 };
@@ -20,13 +20,14 @@ use crate::git::{
 };
 use crate::notifications;
 use crate::persistence::{StateStore, StoredMessage, StoredProject, StoredThread};
+use crate::project::{ValidatedProject, validate_project};
 use crate::terminal::{TerminalCore, TerminalView};
 use crate::theme::{self, ThemeKind};
 use crate::ui::{button, modal, selectable_row, split_pane, tabs, toast};
 use gpui::{
-    App, Context, CursorStyle, Div, Entity, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Render, Role, StyleRefinement, Subscription, Window, div, prelude::*, px,
-    rgb,
+    App, Context, CursorStyle, Div, Entity, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent,
+    MouseUpEvent, PathPromptOptions, Render, Role, StyleRefinement, Subscription, Window, div,
+    prelude::*, px, rgb,
 };
 
 const ISOLATE_NEW_THREADS_SETTING: &str = "isolate_new_threads";
@@ -202,7 +203,16 @@ enum CodexAuthState {
     SignedOut,
     SignedIn(CodexAccount),
     SigningIn,
+    BrowserPending { auth_url: String },
+    Cancelling,
     Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProjectSelectionState {
+    Idle,
+    ChoosingFolder,
+    Validating(PathBuf),
 }
 
 impl CodexAuthState {
@@ -282,12 +292,19 @@ pub(crate) struct RodeApp {
     state_store: Option<StateStore>,
     known_projects: Vec<StoredProject>,
     known_threads: Vec<StoredThread>,
+    project_open: bool,
+    project_selection: ProjectSelectionState,
+    project_selection_generation: u64,
+    project_picker_error: Option<String>,
+    repairing_project: Option<PathBuf>,
     project_root: PathBuf,
     project_path: PathBuf,
     project_name: String,
     repo: RepoSnapshot,
     providers: Vec<ProviderStatus>,
     codex_auth: CodexAuthState,
+    auth_attempt_generation: u64,
+    pending_codex_login: Option<PendingCodexLoginCancellation>,
     messages: Vec<Message>,
     composer: Entity<Editor>,
     commit_editor: Entity<Editor>,
@@ -315,60 +332,73 @@ pub(crate) struct RodeApp {
     publish_status: Option<String>,
     show_terminal: bool,
     terminal_sessions: HashMap<String, Entity<TerminalView>>,
+    drafts: HashMap<String, String>,
     thread_number: usize,
 }
 
 impl RodeApp {
-    pub(crate) fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let initial_repo = RepoSnapshot::load(&project_path);
-        let project_root = initial_repo.root.clone();
-        let (state_store, restored_thread, isolate_new_threads, ui_preferences, persistence_error) =
-            match StateStore::open_default() {
-                Ok(store) => {
-                    let ui_preferences = UiPreferences::load(&store);
-                    let isolate_new_threads = store
-                        .load_bool_setting(ISOLATE_NEW_THREADS_SETTING, false)
-                        .unwrap_or(false);
-                    match store.load_active_thread(&project_root) {
-                        Ok(thread) => (
-                            Some(store),
-                            thread,
-                            isolate_new_threads,
-                            ui_preferences,
-                            None,
-                        ),
-                        Err(error) => (
-                            Some(store),
-                            None,
-                            isolate_new_threads,
-                            ui_preferences,
-                            Some(format!("Could not restore Rode state: {error:#}")),
-                        ),
-                    }
+    pub(crate) fn new(
+        requested_project: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (
+            state_store,
+            known_projects,
+            active_project_id,
+            isolate_new_threads,
+            ui_preferences,
+            persistence_error,
+        ) = match StateStore::open_default() {
+            Ok(store) => {
+                let ui_preferences = UiPreferences::load(&store);
+                let isolate_new_threads = store
+                    .load_bool_setting(ISOLATE_NEW_THREADS_SETTING, false)
+                    .unwrap_or(false);
+                let active_project_id = store.load_active_project_id().ok().flatten();
+                match store.load_projects() {
+                    Ok(projects) => (
+                        Some(store),
+                        projects,
+                        active_project_id,
+                        isolate_new_threads,
+                        ui_preferences,
+                        None,
+                    ),
+                    Err(error) => (
+                        Some(store),
+                        Vec::new(),
+                        active_project_id,
+                        isolate_new_threads,
+                        ui_preferences,
+                        Some(format!("Could not restore Rode projects: {error:#}")),
+                    ),
                 }
-                Err(error) => (
-                    None,
-                    None,
-                    false,
-                    UiPreferences::default(),
-                    Some(format!("Could not open Rode state database: {error:#}")),
-                ),
-            };
-        let restored_workspace = restored_thread
-            .as_ref()
-            .map(|thread| thread.workspace_path.clone())
-            .filter(|path| path.is_dir());
-        let project_path = restored_workspace.unwrap_or_else(|| project_root.clone());
-        let repo = RepoSnapshot::load(&project_path);
-        let restored_route = if ui_preferences.route.requires_project() && !repo.is_repository {
+            }
+            Err(error) => (
+                None,
+                Vec::new(),
+                None,
+                false,
+                UiPreferences::default(),
+                Some(format!("Could not open Rode state database: {error:#}")),
+            ),
+        };
+        let (startup_project, project_picker_error) = select_startup_project(
+            requested_project,
+            &known_projects,
+            active_project_id.as_deref(),
+        );
+        let project_open = false;
+        let project_root = PathBuf::new();
+        let project_path = PathBuf::new();
+        let repo = RepoSnapshot::default();
+        let restored_route = if ui_preferences.route.requires_project() {
             AppRoute::Workspace
         } else {
             ui_preferences.route
         };
-        let project_name = restored_thread
-            .as_ref()
-            .map(|thread| thread.project_name.clone())
-            .unwrap_or_else(|| folder_name(&project_root));
+        let project_name = "Choose a project".to_owned();
         let composer = cx.new(|cx| {
             Editor::new(
                 "",
@@ -377,8 +407,6 @@ impl RodeApp {
                 cx,
             )
         });
-        let composer_focus = composer.read(cx).focus_handle.clone();
-        window.focus(&composer_focus, cx);
         let commit_editor =
             cx.new(|cx| Editor::new("", "Commit message or pull-request title", window, cx));
         let rename_editor = cx.new(|cx| Editor::new("", "New name", window, cx));
@@ -396,49 +424,21 @@ impl RodeApp {
             CodexAuthState::Unavailable
         };
 
-        let mut messages = restored_thread
-            .as_ref()
-            .map(|thread| {
-                thread
-                    .messages
-                    .iter()
-                    .map(|message| Message {
-                        role: MessageRole::from_storage_name(&message.role),
-                        text: message.text.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|messages| !messages.is_empty())
-            .unwrap_or_else(|| {
-                vec![Message {
-                    role: MessageRole::System,
-                    text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
-                }]
-            });
-        if let Some(error) = persistence_error {
+        let mut messages = vec![Message {
+            role: MessageRole::System,
+            text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
+        }];
+        for error in [persistence_error].into_iter().flatten() {
             messages.push(Message {
                 role: MessageRole::System,
                 text: error,
             });
         }
-        let thread_id = restored_thread
-            .as_ref()
-            .map(|thread| thread.id.clone())
-            .unwrap_or_else(new_local_thread_id);
-        let thread_branch = restored_thread
-            .as_ref()
-            .and_then(|thread| thread.branch.clone());
-        let codex_thread_id = restored_thread
-            .as_ref()
-            .and_then(|thread| thread.provider_thread_id.clone());
-        let thread_number = restored_thread
-            .as_ref()
-            .map(|thread| thread.ordinal.max(1))
-            .unwrap_or(1);
-        let thread_title = restored_thread
-            .as_ref()
-            .map(|thread| thread.title.clone())
-            .unwrap_or_else(|| format!("Thread {thread_number}"));
+        let thread_id = new_local_thread_id();
+        let thread_branch = None;
+        let codex_thread_id = None;
+        let thread_number = 1;
+        let thread_title = "Thread 1".to_owned();
 
         let mut app = Self {
             route: if codex_auth.requires_onboarding() {
@@ -453,14 +453,21 @@ impl RodeApp {
             modal: None,
             toasts: toast::ToastQueue::default(),
             state_store,
-            known_projects: Vec::new(),
+            known_projects,
             known_threads: Vec::new(),
+            project_open,
+            project_selection: ProjectSelectionState::Idle,
+            project_selection_generation: 0,
+            project_picker_error,
+            repairing_project: None,
             project_root,
             project_path,
             project_name,
             repo,
             providers,
             codex_auth,
+            auth_attempt_generation: 0,
+            pending_codex_login: None,
             messages,
             composer,
             commit_editor,
@@ -488,13 +495,23 @@ impl RodeApp {
             publish_status: None,
             show_terminal: false,
             terminal_sessions: HashMap::new(),
+            drafts: HashMap::new(),
             thread_number,
         };
-        app.persist_current_thread();
+        app.refresh_known_state();
+        if let Some(path) = startup_project {
+            app.validate_project_selection(path, None, cx);
+        }
         app
     }
 
     fn persist_current_thread(&mut self) {
+        if !self.project_open
+            || !self.repo.is_repository
+            || self.project_root.as_os_str().is_empty()
+        {
+            return;
+        }
         let Some(store) = self.state_store.as_mut() else {
             return;
         };
@@ -552,7 +569,10 @@ impl RodeApp {
         if self.thread_id == thread_id {
             return;
         }
-        self.persist_current_thread();
+        if self.project_open {
+            self.save_current_draft(cx);
+            self.persist_current_thread();
+        }
         let Some(thread) = self
             .known_threads
             .iter()
@@ -586,6 +606,17 @@ impl RodeApp {
             self.project_root.clone()
         };
         self.repo = RepoSnapshot::load(&self.project_path);
+        if !self.repo.is_repository {
+            let missing_path = self.project_root.clone();
+            self.close_project();
+            self.project_picker_error = Some(format!(
+                "{} is no longer a Git repository. Repair or remove it below.",
+                missing_path.display()
+            ));
+            cx.notify();
+            return;
+        }
+        self.project_open = true;
         self.reconcile_project_route();
         self.messages = thread
             .messages
@@ -601,8 +632,55 @@ impl RodeApp {
                 text: "Restored thread has no messages yet.".to_owned(),
             });
         }
+        let draft = self
+            .drafts
+            .get(&self.thread_id)
+            .cloned()
+            .unwrap_or_default();
+        self.composer
+            .update(cx, |editor, cx| editor.set_text(draft, cx));
+        self.save_active_project();
         self.persist_current_thread();
         cx.notify();
+    }
+
+    fn save_current_draft(&mut self, cx: &mut Context<Self>) {
+        self.drafts
+            .insert(self.thread_id.clone(), self.composer.read(cx).text());
+    }
+
+    fn save_active_project(&mut self) {
+        let Some(project_id) = self
+            .known_projects
+            .iter()
+            .find(|project| project.path == self.project_root)
+            .map(|project| project.id.clone())
+        else {
+            return;
+        };
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.save_active_project_id(&project_id)
+        {
+            eprintln!("failed to save active Rode project: {error:#}");
+        }
+    }
+
+    fn close_project(&mut self) {
+        self.project_open = false;
+        self.project_root.clear();
+        self.project_path.clear();
+        self.project_name = "Choose a project".to_owned();
+        self.repo = RepoSnapshot::default();
+        self.codex_session = None;
+        self.codex_thread_id = None;
+        self.active_turn_id = None;
+        self.active_agent_message = None;
+        self.running = false;
+        self.creating_worktree = false;
+        self.show_terminal = false;
+        self.terminal_sessions.clear();
+        self.route = AppRoute::Workspace;
+        self.last_authenticated_route = AppRoute::Workspace;
     }
 
     fn codex_available(&self) -> bool {
@@ -785,6 +863,9 @@ impl RodeApp {
     }
 
     pub(crate) fn refresh_codex_account(&mut self, cx: &mut Context<Self>) {
+        self.auth_attempt_generation = self.auth_attempt_generation.wrapping_add(1);
+        self.pending_codex_login = None;
+        let generation = self.auth_attempt_generation;
         if !self.codex_available() {
             self.codex_auth = CodexAuthState::Unavailable;
             self.toasts.push(
@@ -804,6 +885,9 @@ impl RodeApp {
                 .background_spawn(async move { read_codex_account() })
                 .await;
             this.update(cx, |this, cx| {
+                if this.auth_attempt_generation != generation {
+                    return;
+                }
                 this.codex_auth = match result {
                     Ok(status) => status
                         .account
@@ -820,10 +904,20 @@ impl RodeApp {
     }
 
     fn sign_in_codex(&mut self, cx: &mut Context<Self>) {
-        if !self.codex_available() || matches!(self.codex_auth, CodexAuthState::SigningIn) {
+        if !self.codex_available()
+            || matches!(
+                self.codex_auth,
+                CodexAuthState::SigningIn
+                    | CodexAuthState::BrowserPending { .. }
+                    | CodexAuthState::Cancelling
+            )
+        {
             return;
         }
 
+        self.auth_attempt_generation = self.auth_attempt_generation.wrapping_add(1);
+        let generation = self.auth_attempt_generation;
+        self.pending_codex_login = None;
         self.codex_auth = CodexAuthState::SigningIn;
         self.sync_route_with_auth();
         self.messages.push(Message {
@@ -842,6 +936,9 @@ impl RodeApp {
                 Ok(pending) => pending,
                 Err(error) => {
                     this.update(cx, |this, cx| {
+                        if this.auth_attempt_generation != generation {
+                            return;
+                        }
                         let detail = format!("{error:#}");
                         this.codex_auth = CodexAuthState::Error(detail.clone());
                         this.sync_route_with_auth();
@@ -861,8 +958,16 @@ impl RodeApp {
             };
 
             let auth_url = pending.auth_url.clone();
+            let cancellation = pending.cancellation();
             if this
                 .update(cx, |this, cx| {
+                    if this.auth_attempt_generation != generation {
+                        return;
+                    }
+                    this.pending_codex_login = Some(cancellation);
+                    this.codex_auth = CodexAuthState::BrowserPending {
+                        auth_url: auth_url.clone(),
+                    };
                     cx.open_url(&auth_url);
                     this.messages.push(Message {
                         role: MessageRole::System,
@@ -878,20 +983,30 @@ impl RodeApp {
 
             let result = cx.background_spawn(async move { pending.wait() }).await;
             this.update(cx, |this, cx| {
+                if this.auth_attempt_generation != generation {
+                    return;
+                }
+                this.pending_codex_login = None;
                 match result {
-                    Ok(status) => {
-                        this.codex_auth = status
-                            .account
-                            .map(CodexAuthState::SignedIn)
-                            .unwrap_or(CodexAuthState::SignedOut);
+                    Ok(CodexLoginOutcome::Complete(status)) => {
+                        this.codex_auth = status.account.map(CodexAuthState::SignedIn).unwrap_or(
+                            CodexAuthState::SignedOut,
+                        );
                         this.sync_route_with_auth();
                         this.messages.push(Message {
                             role: MessageRole::System,
-                            text: "Signed in to OpenAI through Codex. You can now start a thread."
-                                .to_owned(),
+                            text: "Signed in to OpenAI through Codex.".to_owned(),
                         });
                         this.toasts
                             .push(toast::ToastKind::Success, "ChatGPT sign-in complete.");
+                    }
+                    Ok(CodexLoginOutcome::Cancelled) => {
+                        this.codex_auth = CodexAuthState::SignedOut;
+                        this.sync_route_with_auth();
+                        this.messages.push(Message {
+                            role: MessageRole::System,
+                            text: "ChatGPT sign-in was cancelled.".to_owned(),
+                        });
                     }
                     Err(error) => {
                         let detail = format!("{error:#}");
@@ -914,7 +1029,53 @@ impl RodeApp {
         .detach();
     }
 
+    fn reopen_codex_login(&mut self, cx: &mut Context<Self>) {
+        if let CodexAuthState::BrowserPending { auth_url } = &self.codex_auth {
+            cx.open_url(auth_url);
+        }
+    }
+
+    fn cancel_codex_login(&mut self, cx: &mut Context<Self>) {
+        let Some(cancellation) = self.pending_codex_login.take() else {
+            return;
+        };
+        let generation = self.auth_attempt_generation;
+        let auth_url = match &self.codex_auth {
+            CodexAuthState::BrowserPending { auth_url } => auth_url.clone(),
+            _ => return,
+        };
+        self.codex_auth = CodexAuthState::Cancelling;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let request = cancellation.clone();
+            let result = cx.background_spawn(async move { request.cancel() }).await;
+            this.update(cx, |this, cx| {
+                if this.auth_attempt_generation != generation {
+                    return;
+                }
+                if let Err(error) = result {
+                    this.pending_codex_login = Some(cancellation);
+                    this.codex_auth = CodexAuthState::BrowserPending { auth_url };
+                    this.toasts.push(
+                        toast::ToastKind::Error,
+                        format!("Could not cancel ChatGPT sign-in: {error:#}"),
+                    );
+                }
+                this.sync_route_with_auth();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn send_prompt(&mut self, _: &SendPrompt, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.project_open || !self.repo.is_repository {
+            self.project_picker_error =
+                Some("Open a Git project before starting a thread.".to_owned());
+            cx.notify();
+            return;
+        }
         if self.running || self.creating_worktree {
             return;
         }
@@ -1249,6 +1410,9 @@ impl RodeApp {
 
     fn open_folder_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_create_menu = false;
+        let repair_target = self.repairing_project.take();
+        self.project_selection = ProjectSelectionState::ChoosingFolder;
+        self.project_picker_error = None;
         cx.notify();
         let selection = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1259,20 +1423,31 @@ impl RodeApp {
         cx.spawn_in(window, async move |this, cx| {
             let result = match selection.await {
                 Ok(result) => result,
-                Err(_) => return,
+                Err(_) => {
+                    this.update_in(cx, |this, _, cx| {
+                        this.project_selection = ProjectSelectionState::Idle;
+                        this.project_picker_error =
+                            Some("The desktop folder picker closed unexpectedly.".to_owned());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
             };
             this.update_in(cx, |this, _window, cx| match result {
                 Ok(Some(paths)) => {
                     if let Some(path) = paths.into_iter().next() {
-                        this.add_project(path, cx);
+                        this.validate_project_selection(path, repair_target, cx);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    this.project_selection = ProjectSelectionState::Idle;
+                    cx.notify();
+                }
                 Err(error) => {
-                    this.messages.push(Message {
-                        role: MessageRole::System,
-                        text: format!("Could not open the folder picker: {error:#}"),
-                    });
+                    this.project_selection = ProjectSelectionState::Idle;
+                    this.project_picker_error =
+                        Some(format!("Could not open the folder picker: {error:#}"));
                     cx.notify();
                 }
             })
@@ -1281,50 +1456,143 @@ impl RodeApp {
         .detach();
     }
 
-    fn add_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
-        self.persist_current_thread();
-        self.refresh_known_state();
+    fn validate_project_selection(
+        &mut self,
+        path: PathBuf,
+        repair_target: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_selection_generation = self.project_selection_generation.wrapping_add(1);
+        let generation = self.project_selection_generation;
+        self.project_selection = ProjectSelectionState::Validating(path.clone());
+        self.project_picker_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { validate_project(&path) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.project_selection_generation != generation {
+                    return;
+                }
+                this.project_selection = ProjectSelectionState::Idle;
+                match result {
+                    Ok(project) => this.open_validated_project(project, repair_target, cx),
+                    Err(error) => {
+                        this.project_picker_error = Some(format!("{error:#}"));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
 
-        let existing_project = self
+    fn open_validated_project(
+        &mut self,
+        project: ValidatedProject,
+        repair_target: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.project_open {
+            self.save_current_draft(cx);
+            self.persist_current_thread();
+        }
+        self.refresh_known_state();
+        let duplicate = self
             .known_projects
             .iter()
-            .find(|project| project.path == path)
+            .find(|stored| stored.path == project.root)
             .cloned();
-        if let Some(thread_id) = existing_project
-            .as_ref()
-            .and_then(|project| project.active_thread_id.clone())
-            .or_else(|| {
-                self.known_threads
-                    .iter()
-                    .find(|thread| thread.project_path == path)
-                    .map(|thread| thread.id.clone())
-            })
+        if let Some(old_path) = repair_target.as_ref()
+            && duplicate
+                .as_ref()
+                .is_some_and(|stored| &stored.path != old_path)
         {
-            self.switch_thread(&thread_id, cx);
+            self.project_picker_error = Some(
+                "That repository is already in Recent projects. Open it directly instead."
+                    .to_owned(),
+            );
+            cx.notify();
             return;
         }
 
-        self.project_root = path.clone();
-        self.project_path = path.clone();
-        self.project_name = existing_project
-            .map(|project| project.name)
-            .unwrap_or_else(|| folder_name(&path));
-        self.repo = RepoSnapshot::load(&path);
-        self.reconcile_project_route();
-        if let Some(store) = self.state_store.as_mut()
-            && let Err(error) = store.save_project(&StoredProject {
-                path,
-                name: self.project_name.clone(),
-                active_thread_id: None,
+        let persistence_result = if let Some(old_path) = repair_target.as_ref() {
+            self.state_store
+                .as_mut()
+                .map(|store| store.repair_project_path(old_path, &project.root, &project.name))
+        } else if duplicate.is_none() {
+            self.state_store.as_mut().map(|store| {
+                store.save_project(&StoredProject::new(
+                    project.root.clone(),
+                    project.name.clone(),
+                ))
             })
-        {
-            self.messages.push(Message {
-                role: MessageRole::System,
-                text: format!("Could not save the project folder: {error:#}"),
-            });
+        } else {
+            None
+        };
+        if let Some(Err(error)) = persistence_result {
+            self.project_picker_error = Some(format!("Could not save the project: {error:#}"));
+            cx.notify();
+            return;
         }
-        self.start_new_thread(false, cx);
+
+        self.refresh_known_state();
+        let stored = self
+            .known_projects
+            .iter()
+            .find(|stored| stored.path == project.root)
+            .cloned();
+        self.project_root = project.root.clone();
+        self.project_path = project.root;
+        self.project_name = stored
+            .as_ref()
+            .map(|stored| stored.name.clone())
+            .unwrap_or(project.name);
+        self.repo = RepoSnapshot::load(&self.project_path);
+        if !self.repo.is_repository {
+            self.close_project();
+            self.project_picker_error =
+                Some("Git validation changed while opening the project. Try again.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.project_root = self.repo.root.clone();
+        self.project_open = true;
+        self.project_picker_error = None;
+        let restored_thread_id = self
+            .state_store
+            .as_ref()
+            .and_then(|store| store.load_active_thread(&self.project_root).ok().flatten())
+            .map(|thread| thread.id);
+        if let Some(thread_id) = restored_thread_id {
+            self.project_open = false;
+            self.switch_thread(&thread_id, cx);
+        } else {
+            self.save_active_project();
+            self.start_new_thread(false, cx);
+        }
+    }
+
+    fn repair_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.repairing_project = Some(path);
+        self.open_folder_picker(window, cx);
+    }
+
+    fn remove_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.remove_project(&path)
+        {
+            self.project_picker_error = Some(format!("Could not remove the project: {error:#}"));
+            cx.notify();
+            return;
+        }
+        if self.project_root == path {
+            self.close_project();
+        }
+        self.refresh_known_state();
+        cx.notify();
     }
 
     fn begin_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
@@ -1410,6 +1678,9 @@ impl RodeApp {
     }
 
     fn new_thread(&mut self, cx: &mut Context<Self>) {
+        if !self.project_open || !self.repo.is_repository {
+            return;
+        }
         self.show_create_menu = false;
         self.start_new_thread(true, cx);
     }
@@ -1420,17 +1691,35 @@ impl RodeApp {
         project_name: String,
         cx: &mut Context<Self>,
     ) {
+        if !project_path.is_dir() {
+            self.close_project();
+            self.project_picker_error = Some("That saved project folder is missing.".to_owned());
+            cx.notify();
+            return;
+        }
         self.persist_current_thread();
         self.project_root = project_path.clone();
         self.project_path = project_path;
         self.project_name = project_name;
         self.repo = RepoSnapshot::load(&self.project_path);
+        self.project_open = self.repo.is_repository;
+        if !self.project_open {
+            self.close_project();
+            self.project_picker_error =
+                Some("That saved folder is no longer a Git repository.".to_owned());
+            cx.notify();
+            return;
+        }
         self.reconcile_project_route();
         self.start_new_thread(false, cx);
     }
 
     fn start_new_thread(&mut self, persist_previous: bool, cx: &mut Context<Self>) {
+        if !self.project_open || !self.repo.is_repository {
+            return;
+        }
         if persist_previous {
+            self.save_current_draft(cx);
             self.persist_current_thread();
         }
         self.session_generation += 1;
@@ -1443,6 +1732,8 @@ impl RodeApp {
         self.git_operation = None;
         self.publish_status = None;
         self.commit_editor
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        self.composer
             .update(cx, |editor, cx| editor.set_text("", cx));
         self.running = false;
         self.thread_number = self
@@ -1902,7 +2193,9 @@ impl RodeApp {
             CodexAuthState::Unavailable => (colors.error, "CLI not found"),
             CodexAuthState::Checking => (colors.warning, "Checking account"),
             CodexAuthState::SignedOut => (colors.info, "Ready to connect"),
-            CodexAuthState::SigningIn => (colors.info, "Waiting for browser"),
+            CodexAuthState::SigningIn => (colors.info, "Starting sign-in"),
+            CodexAuthState::BrowserPending { .. } => (colors.info, "Waiting for browser"),
+            CodexAuthState::Cancelling => (colors.warning, "Cancelling sign-in"),
             CodexAuthState::Error(_) => (colors.error, "Connection error"),
             CodexAuthState::SignedIn(_) => (colors.success, "Connected"),
         };
@@ -1913,6 +2206,14 @@ impl RodeApp {
 
         div()
             .id("auth-onboarding")
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key.as_str() == "escape"
+                    && matches!(this.codex_auth, CodexAuthState::BrowserPending { .. })
+                {
+                    this.cancel_codex_login(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .size_full()
             .min_w(px(720.))
             .flex()
@@ -2084,6 +2385,8 @@ impl RodeApp {
                                     .id("onboarding-sign-in")
                                     .role(Role::Button)
                                     .aria_label("Sign in to OpenAI with Codex")
+                                    .tab_index(0)
+                                    .tab_stop(true)
                                     .w_full()
                                     .h(px(44.))
                                     .rounded_lg()
@@ -2099,12 +2402,20 @@ impl RodeApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sign_in_codex(cx)
                                     }))
+                                    .on_key_down(cx.listener(|this, event, _, cx| {
+                                        if is_activation_key(event) {
+                                            this.sign_in_codex(cx);
+                                            cx.stop_propagation();
+                                        }
+                                    }))
                                     .child("Sign in with ChatGPT")
                                     .into_any_element(),
                                 CodexAuthState::Error(_) => div()
                                     .id("onboarding-auth-retry")
                                     .role(Role::Button)
                                     .aria_label("Retry the Codex account check")
+                                    .tab_index(0)
+                                    .tab_stop(true)
                                     .w_full()
                                     .h(px(44.))
                                     .rounded_lg()
@@ -2119,16 +2430,80 @@ impl RodeApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.refresh_codex_account(cx)
                                     }))
+                                    .on_key_down(cx.listener(|this, event, _, cx| {
+                                        if is_activation_key(event) {
+                                            this.refresh_codex_account(cx);
+                                            cx.stop_propagation();
+                                        }
+                                    }))
                                     .child("Try again")
                                     .into_any_element(),
                                 CodexAuthState::Checking => {
                                     onboarding_status("Checking account…", self.theme)
                                 }
                                 CodexAuthState::SigningIn => {
-                                    onboarding_status(
-                                        "Finish signing in in your browser…",
-                                        self.theme,
+                                    onboarding_status("Starting browser sign-in…", self.theme)
+                                }
+                                CodexAuthState::BrowserPending { .. } => div()
+                                    .w_full()
+                                    .flex()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .id("onboarding-reopen-browser")
+                                            .role(Role::Button)
+                                            .aria_label("Open the ChatGPT sign-in page again")
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .flex_1()
+                                            .h(px(44.))
+                                            .rounded_lg()
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(rgb(theme::tokens(self.theme).colors.accent))
+                                            .hover(|style| style.bg(rgb(theme::tokens(self.theme).colors.accent_hover)))
+                                            .text_sm()
+                                            .text_color(rgb(theme::tokens(self.theme).colors.on_accent))
+                                            .on_click(cx.listener(|this, _, _, cx| this.reopen_codex_login(cx)))
+                                            .on_key_down(cx.listener(|this, event, _, cx| {
+                                                if is_activation_key(event) {
+                                                    this.reopen_codex_login(cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .child("Open browser again"),
                                     )
+                                    .child(
+                                        div()
+                                            .id("onboarding-cancel-login")
+                                            .role(Role::Button)
+                                            .aria_label("Cancel ChatGPT sign-in")
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .flex_1()
+                                            .h(px(44.))
+                                            .rounded_lg()
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(rgb(theme::tokens(self.theme).colors.strong_border))
+                                            .text_sm()
+                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                            .on_click(cx.listener(|this, _, _, cx| this.cancel_codex_login(cx)))
+                                            .on_key_down(cx.listener(|this, event, _, cx| {
+                                                if is_activation_key(event) {
+                                                    this.cancel_codex_login(cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .child("Cancel sign-in"),
+                                    )
+                                    .into_any_element(),
+                                CodexAuthState::Cancelling => {
+                                    onboarding_status("Cancelling sign-in…", self.theme)
                                 }
                                 CodexAuthState::Unavailable => {
                                     onboarding_status("Codex CLI required", self.theme)
@@ -2150,6 +2525,333 @@ impl RodeApp {
             .into_any_element()
     }
 
+    fn render_project_onboarding(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = theme::tokens(self.theme).colors;
+        let account = match &self.codex_auth {
+            CodexAuthState::SignedIn(account) => account.summary(),
+            _ => "OpenAI account".to_owned(),
+        };
+        let operation = match &self.project_selection {
+            ProjectSelectionState::Idle => None,
+            ProjectSelectionState::ChoosingFolder => {
+                Some("Waiting for the folder picker…".to_owned())
+            }
+            ProjectSelectionState::Validating(path) => {
+                Some(format!("Validating {}…", path.display()))
+            }
+        };
+        let recent_projects = self
+            .known_projects
+            .iter()
+            .enumerate()
+            .map(|(index, project)| {
+                let path = project.path.clone();
+                let select_path = path.clone();
+                let select_path_key = path.clone();
+                let repair_path = path.clone();
+                let repair_path_key = path.clone();
+                let remove_path = path.clone();
+                let remove_path_key = path.clone();
+                let available = path.is_dir();
+                let status = if available {
+                    "Git project"
+                } else {
+                    "Folder missing"
+                };
+                div()
+                    .id(("recent-project", index))
+                    .w_full()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(if available {
+                        colors.border
+                    } else {
+                        colors.deletion
+                    }))
+                    .bg(rgb(colors.chrome))
+                    .p_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .when(available, |row| {
+                        row.role(Role::Button)
+                            .aria_label(format!("Open project {}", project.name))
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(rgb(colors.overlay)))
+                            .focus_visible(move |style| style.border_color(rgb(colors.focus_ring)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.validate_project_selection(select_path.clone(), None, cx)
+                            }))
+                            .on_key_down(cx.listener(move |this, event, _, cx| {
+                                if is_activation_key(event) {
+                                    this.validate_project_selection(
+                                        select_path_key.clone(),
+                                        None,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }
+                            }))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(colors.text))
+                                    .child(project.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(colors.faint_text))
+                                    .overflow_hidden()
+                                    .child(path.display().to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(if available {
+                                        colors.success
+                                    } else {
+                                        colors.error
+                                    }))
+                                    .child(status),
+                            )
+                            .when(!available, |actions| {
+                                actions
+                                    .child(
+                                        div()
+                                            .id(("repair-project", index))
+                                            .role(Role::Button)
+                                            .aria_label(format!("Repair project {}", project.name))
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(colors.overlay))
+                                            .text_xs()
+                                            .text_color(rgb(colors.text))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.repair_project(repair_path.clone(), window, cx)
+                                            }))
+                                            .on_key_down(cx.listener(
+                                                move |this, event, window, cx| {
+                                                    if is_activation_key(event) {
+                                                        this.repair_project(
+                                                            repair_path_key.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                        cx.stop_propagation();
+                                                    }
+                                                },
+                                            ))
+                                            .child("Repair"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("remove-project", index))
+                                            .role(Role::Button)
+                                            .aria_label(format!(
+                                                "Remove project {} from Rode",
+                                                project.name
+                                            ))
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(colors.deletion_soft))
+                                            .text_xs()
+                                            .text_color(rgb(colors.error))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_project(remove_path.clone(), cx)
+                                            }))
+                                            .on_key_down(cx.listener(move |this, event, _, cx| {
+                                                if is_activation_key(event) {
+                                                    this.remove_project(
+                                                        remove_path_key.clone(),
+                                                        cx,
+                                                    );
+                                                    cx.stop_propagation();
+                                                }
+                                            }))
+                                            .child("Remove"),
+                                    )
+                            }),
+                    )
+                    .into_any_element()
+            });
+
+        div()
+            .id("project-onboarding")
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key.as_str() == "escape"
+                    && !matches!(this.project_selection, ProjectSelectionState::Idle)
+                {
+                    this.project_selection_generation =
+                        this.project_selection_generation.wrapping_add(1);
+                    this.project_selection = ProjectSelectionState::Idle;
+                    this.repairing_project = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .size_full()
+            .min_w(px(720.))
+            .flex()
+            .flex_col()
+            .bg(rgb(colors.root))
+            .text_color(rgb(colors.text))
+            .child(
+                div()
+                    .h(px(64.))
+                    .flex_none()
+                    .px_6()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(colors.overlay))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("RODE"),
+                    )
+                    .child(div().text_xs().text_color(rgb(colors.muted_text)).child(account)),
+            )
+            .child(
+                div()
+                    .id("project-onboarding-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_8()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(640.))
+                            .flex()
+                            .flex_col()
+                            .gap_5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(28.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child("Open a Git project"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .line_height(px(21.))
+                                            .text_color(rgb(colors.muted_text))
+                                            .child("Choose a repository to finish setup. Rode validates the Git root and restores it next time."),
+                                    ),
+                            )
+                            .when_some(operation, |card, operation| {
+                                card.child(
+                                    div()
+                                        .rounded_lg()
+                                        .bg(rgb(colors.accent_soft))
+                                        .p_3()
+                                        .text_sm()
+                                        .text_color(rgb(colors.info))
+                                        .child(operation),
+                                )
+                            })
+                            .when_some(self.project_picker_error.clone(), |card, error| {
+                                card.child(
+                                    div()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(rgb(colors.deletion))
+                                        .bg(rgb(colors.deletion_soft))
+                                        .p_3()
+                                        .text_sm()
+                                        .text_color(rgb(colors.error))
+                                        .child(error),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("browse-project-folder")
+                                    .role(Role::Button)
+                                    .aria_label("Open a Git project folder")
+                                    .tab_index(0)
+                                    .tab_stop(matches!(self.project_selection, ProjectSelectionState::Idle))
+                                    .h(px(44.))
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(colors.accent))
+                                    .hover(move |style| style.bg(rgb(colors.accent_hover)))
+                                    .focus_visible(move |style| style.border_color(rgb(colors.focus_ring)))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_sm()
+                                    .text_color(rgb(colors.on_accent))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.repairing_project = None;
+                                        this.open_folder_picker(window, cx)
+                                    }))
+                                    .on_key_down(cx.listener(|this, event, window, cx| {
+                                        if is_activation_key(event) {
+                                            this.repairing_project = None;
+                                            this.open_folder_picker(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    }))
+                                    .child("Open project folder…"),
+                            )
+                            .when(!self.known_projects.is_empty(), |card| {
+                                card.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(rgb(colors.muted_text))
+                                                .child("RECENT PROJECTS"),
+                                        )
+                                        .children(recent_projects),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> Div {
         let colors = theme::tokens(self.theme).colors;
         let (codex_color, codex_label) = match &self.codex_auth {
@@ -2160,6 +2862,10 @@ impl RodeApp {
                 (colors.success, format!("Codex · {}", account.summary()))
             }
             CodexAuthState::SigningIn => (colors.info, "Codex · waiting for browser".to_owned()),
+            CodexAuthState::BrowserPending { .. } => {
+                (colors.info, "Codex · waiting for browser".to_owned())
+            }
+            CodexAuthState::Cancelling => (colors.warning, "Codex · cancelling sign-in".to_owned()),
             CodexAuthState::Error(_) => (colors.error, "Codex · authentication error".to_owned()),
         };
         let codex_error = match &self.codex_auth {
@@ -3766,11 +4472,22 @@ fn diff_line_style(kind: DiffLineKind, theme_kind: ThemeKind) -> (u32, u32, &'st
     }
 }
 
+impl Drop for RodeApp {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.pending_codex_login.take() {
+            let _ = cancellation.cancel();
+        }
+    }
+}
+
 impl Render for RodeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::tokens(self.theme).colors;
         if self.codex_auth.requires_onboarding() {
             return self.render_auth_onboarding(cx);
+        }
+        if !self.project_open {
+            return self.render_project_onboarding(cx);
         }
         if self.show_terminal || self.route == AppRoute::Terminal {
             self.ensure_terminal(window, cx);
@@ -3862,6 +4579,10 @@ fn onboarding_status(label: &'static str, theme_kind: ThemeKind) -> gpui::AnyEle
         .into_any_element()
 }
 
+fn is_activation_key(event: &KeyDownEvent) -> bool {
+    matches!(event.keystroke.key.as_str(), "enter" | "space")
+}
+
 fn new_local_thread_id() -> String {
     format!(
         "thread-{}-{}",
@@ -3873,12 +4594,32 @@ fn new_local_thread_id() -> String {
     )
 }
 
-fn folder_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Project")
-        .to_owned()
+fn select_startup_project(
+    requested: Option<PathBuf>,
+    recent: &[StoredProject],
+    active_project_id: Option<&str>,
+) -> (Option<PathBuf>, Option<String>) {
+    if let Some(path) = requested {
+        return (Some(path), None);
+    }
+
+    if let Some(active_project_id) = active_project_id {
+        return recent
+            .iter()
+            .find(|project| project.id == active_project_id)
+            .map(|project| (Some(project.path.clone()), None))
+            .unwrap_or_else(|| {
+                (
+                    None,
+                    Some(
+                        "The last active project record is unavailable. Choose a project below."
+                            .to_owned(),
+                    ),
+                )
+            });
+    }
+
+    (recent.first().map(|project| project.path.clone()), None)
 }
 
 fn route_after_auth(
@@ -3900,8 +4641,9 @@ mod tests {
     use super::{
         AppRoute, CodexAccount, CodexAuthState, INSPECTOR_WIDTH_SETTING, ROUTE_SETTING,
         SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, UiPreferences, route_after_auth,
+        select_startup_project,
     };
-    use crate::persistence::StateStore;
+    use crate::persistence::{StateStore, StoredProject};
     use crate::theme::ThemeKind;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3912,6 +4654,13 @@ mod tests {
         assert!(CodexAuthState::Checking.requires_onboarding());
         assert!(CodexAuthState::SignedOut.requires_onboarding());
         assert!(CodexAuthState::SigningIn.requires_onboarding());
+        assert!(
+            CodexAuthState::BrowserPending {
+                auth_url: "https://example.com".to_owned()
+            }
+            .requires_onboarding()
+        );
+        assert!(CodexAuthState::Cancelling.requires_onboarding());
         assert!(CodexAuthState::Error("failed".to_owned()).requires_onboarding());
         assert!(
             !CodexAuthState::SignedIn(CodexAccount::ChatGpt {
@@ -3920,6 +4669,19 @@ mod tests {
             })
             .requires_onboarding()
         );
+    }
+
+    #[test]
+    fn startup_restores_only_the_explicit_active_project() {
+        let first = StoredProject::new("/tmp/first".into(), "First".to_owned());
+        let active = StoredProject::new("/tmp/active".into(), "Active".to_owned());
+        let selected =
+            select_startup_project(None, &[first.clone(), active.clone()], Some(&active.id));
+        assert_eq!(selected, (Some(active.path), None));
+
+        let missing_identity = select_startup_project(None, &[first], Some("removed-id"));
+        assert!(missing_identity.0.is_none());
+        assert!(missing_identity.1.is_some());
     }
 
     #[test]

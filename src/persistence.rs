@@ -1,8 +1,12 @@
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static PROJECT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredMessage {
@@ -12,9 +16,27 @@ pub struct StoredMessage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredProject {
+    pub id: String,
     pub path: PathBuf,
+    pub git_root: PathBuf,
     pub name: String,
     pub active_thread_id: Option<String>,
+    pub last_opened_ms: i64,
+    pub settings_override: Option<String>,
+}
+
+impl StoredProject {
+    pub fn new(path: PathBuf, name: String) -> Self {
+        Self {
+            id: new_project_id(&path),
+            git_root: path.clone(),
+            path,
+            name,
+            active_thread_id: None,
+            last_opened_ms: 0,
+            settings_override: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,9 +73,12 @@ impl StateStore {
                  PRAGMA journal_mode = WAL;
                  CREATE TABLE IF NOT EXISTS projects (
                     path TEXT PRIMARY KEY NOT NULL,
+                    id TEXT,
+                    git_root TEXT,
                     name TEXT NOT NULL,
                     active_thread_id TEXT,
-                    last_opened_ms INTEGER NOT NULL
+                    last_opened_ms INTEGER NOT NULL,
+                    settings_json TEXT
                  );
                  CREATE TABLE IF NOT EXISTS threads (
                     id TEXT PRIMARY KEY NOT NULL,
@@ -82,6 +107,7 @@ impl StateStore {
                  );",
             )
             .context("failed to initialize Rode state schema")?;
+        ensure_project_columns(&connection)?;
         Ok(Self { connection })
     }
 
@@ -93,14 +119,23 @@ impl StateStore {
             .connection
             .transaction()
             .context("failed to begin Rode state transaction")?;
+        let project_id = existing_project_id(&transaction, &thread.project_path)?
+            .unwrap_or_else(|| new_project_id(&thread.project_path));
         transaction.execute(
-            "INSERT INTO projects(path, name, active_thread_id, last_opened_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO projects(path, id, git_root, name, active_thread_id, last_opened_ms)
+             VALUES (?1, ?2, ?1, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET
+                git_root = excluded.git_root,
                 name = excluded.name,
                 active_thread_id = excluded.active_thread_id,
                 last_opened_ms = excluded.last_opened_ms",
-            params![project_path, thread.project_name, thread.id, now],
+            params![
+                project_path,
+                project_id,
+                thread.project_name,
+                thread.id,
+                now
+            ],
         )?;
         transaction.execute(
             "INSERT INTO threads(
@@ -149,19 +184,78 @@ impl StateStore {
 
     pub fn save_project(&mut self, project: &StoredProject) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO projects(path, name, active_thread_id, last_opened_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO projects(
+                path, id, git_root, name, active_thread_id, last_opened_ms, settings_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(path) DO UPDATE SET
+                git_root = excluded.git_root,
                 name = excluded.name,
                 active_thread_id = COALESCE(excluded.active_thread_id, projects.active_thread_id),
-                last_opened_ms = excluded.last_opened_ms",
+                last_opened_ms = excluded.last_opened_ms,
+                settings_json = excluded.settings_json",
             params![
                 path_text(&project.path),
+                project.id,
+                path_text(&project.git_root),
                 project.name,
                 project.active_thread_id,
-                now_ms()
+                now_ms(),
+                project.settings_override,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn remove_project(&mut self, path: &Path) -> Result<()> {
+        let removed_id = existing_project_id(&self.connection, path)?;
+        self.connection.execute(
+            "DELETE FROM projects WHERE path = ?1",
+            params![path_text(path)],
+        )?;
+        if let Some(removed_id) = removed_id
+            && self.load_string_setting("active_project_id")?.as_deref() == Some(&removed_id)
+        {
+            self.connection
+                .execute("DELETE FROM settings WHERE key = 'active_project_id'", [])?;
+        }
+        Ok(())
+    }
+
+    pub fn repair_project_path(
+        &mut self,
+        old_path: &Path,
+        new_path: &Path,
+        new_name: &str,
+    ) -> Result<()> {
+        let old_path = path_text(old_path);
+        let new_path = path_text(new_path);
+        if old_path == new_path {
+            self.connection.execute(
+                "UPDATE projects SET name = ?2, last_opened_ms = ?3 WHERE path = ?1",
+                params![old_path, new_name, now_ms()],
+            )?;
+            return Ok(());
+        }
+
+        let transaction = self.connection.transaction()?;
+        transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        if existing_project_id(&transaction, Path::new(&new_path))?.is_some() {
+            anyhow::bail!("the replacement folder is already a saved Rode project");
+        }
+        transaction.execute(
+            "UPDATE threads SET project_path = ?2 WHERE project_path = ?1",
+            params![old_path, new_path],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE projects
+             SET path = ?2, git_root = ?2, name = ?3, last_opened_ms = ?4
+             WHERE path = ?1",
+            params![old_path, new_path, new_name, now_ms()],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("the project being repaired is no longer saved");
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -183,23 +277,33 @@ impl StateStore {
 
     pub fn load_projects(&self) -> Result<Vec<StoredProject>> {
         let mut statement = self.connection.prepare(
-            "SELECT path, name, active_thread_id FROM projects
+            "SELECT id, path, git_root, name, active_thread_id, last_opened_ms, settings_json
+             FROM projects
              ORDER BY last_opened_ms DESC, name COLLATE NOCASE ASC",
         )?;
         let projects = statement
             .query_map([], |row| {
                 Ok(StoredProject {
-                    path: PathBuf::from(row.get::<_, String>(0)?),
-                    name: row.get(1)?,
-                    active_thread_id: row.get(2)?,
+                    id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    git_root: PathBuf::from(row.get::<_, String>(2)?),
+                    name: row.get(3)?,
+                    active_thread_id: row.get(4)?,
+                    last_opened_ms: row.get(5)?,
+                    settings_override: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to load Rode projects")?;
-        Ok(projects
-            .into_iter()
-            .filter(|project| project.path.is_dir())
-            .collect())
+        Ok(projects)
+    }
+
+    pub fn load_active_project_id(&self) -> Result<Option<String>> {
+        self.load_string_setting("active_project_id")
+    }
+
+    pub fn save_active_project_id(&mut self, id: &str) -> Result<()> {
+        self.save_string_setting("active_project_id", id)
     }
 
     pub fn load_bool_setting(&self, key: &str, default: bool) -> Result<bool> {
@@ -336,6 +440,79 @@ impl StateStore {
     }
 }
 
+fn ensure_project_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(projects)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    if !columns.iter().any(|column| column == "id") {
+        connection.execute("ALTER TABLE projects ADD COLUMN id TEXT", [])?;
+    }
+    if !columns.iter().any(|column| column == "git_root") {
+        connection.execute("ALTER TABLE projects ADD COLUMN git_root TEXT", [])?;
+    }
+    if !columns.iter().any(|column| column == "settings_json") {
+        connection.execute("ALTER TABLE projects ADD COLUMN settings_json TEXT", [])?;
+    }
+
+    let projects = {
+        let mut statement = connection.prepare(
+            "SELECT rowid, path FROM projects WHERE id IS NULL OR id = '' OR git_root IS NULL",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (rowid, path) in projects {
+        connection.execute(
+            "UPDATE projects
+             SET id = COALESCE(NULLIF(id, ''), ?2), git_root = COALESCE(git_root, path)
+             WHERE rowid = ?1",
+            params![rowid, legacy_project_id(&path)],
+        )?;
+    }
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS projects_stable_id ON projects(id)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn existing_project_id(connection: &Connection, path: &Path) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT id FROM projects WHERE path = ?1",
+            params![path_text(path)],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read Rode project identity")
+}
+
+fn new_project_id(path: &Path) -> String {
+    let sequence = PROJECT_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "project-{:x}-{:x}-{:x}",
+        now_ms(),
+        std::process::id(),
+        sequence ^ stable_path_hash(path)
+    )
+}
+
+fn legacy_project_id(path: &str) -> String {
+    format!("legacy-project-{:016x}", stable_path_hash(path))
+}
+
+fn stable_path_hash(path: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn rode_state_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path).join("rode"));
@@ -365,7 +542,8 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{StateStore, StoredMessage, StoredProject, StoredThread};
+    use super::{StateStore, StoredMessage, StoredThread};
+    use rusqlite::Connection;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -411,14 +589,16 @@ mod tests {
             .expect("active thread exists");
         assert_eq!(loaded, thread);
         assert_eq!(store.load_threads(&project).unwrap(), vec![thread]);
-        assert_eq!(
-            store.load_projects().unwrap(),
-            vec![StoredProject {
-                path: project,
-                name: "Rode project".to_owned(),
-                active_thread_id: Some("thread-1".to_owned()),
-            }]
-        );
+        let projects = store.load_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, project);
+        assert_eq!(projects[0].git_root, project);
+        assert_eq!(projects[0].name, "Rode project");
+        assert_eq!(projects[0].active_thread_id.as_deref(), Some("thread-1"));
+        assert!(projects[0].last_opened_ms > 0);
+        assert!(projects[0].settings_override.is_none());
+        let stable_id = projects[0].id.clone();
+        store.save_active_project_id(&stable_id).unwrap();
 
         assert!(!store.load_bool_setting("isolate", false).unwrap());
         store.save_bool_setting("isolate", true).unwrap();
@@ -434,7 +614,66 @@ mod tests {
             284.5
         );
 
+        let repaired_project = root.join("repaired-project");
+        fs::create_dir_all(&repaired_project).expect("create repaired project fixture");
+        store
+            .repair_project_path(&project, &repaired_project, "Repaired project")
+            .expect("repair project path");
+        let repaired = store.load_projects().expect("load repaired project");
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(repaired[0].path, repaired_project);
+        assert_eq!(repaired[0].name, "Repaired project");
+        assert_eq!(repaired[0].id, stable_id);
+        assert_eq!(store.load_active_project_id().unwrap(), Some(stable_id));
+        assert_eq!(
+            store
+                .load_active_thread(&repaired[0].path)
+                .expect("load repaired active thread")
+                .expect("repaired active thread")
+                .project_path,
+            repaired[0].path
+        );
+        store
+            .remove_project(&repaired[0].path)
+            .expect("remove repaired project");
+        assert!(store.load_projects().unwrap().is_empty());
+
         drop(store);
         fs::remove_dir_all(root).expect("clean state fixture");
+    }
+
+    #[test]
+    fn upgrades_legacy_projects_with_stable_identity_and_git_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-state-migration-{nonce}"));
+        fs::create_dir_all(&root).expect("create migration fixture");
+        let database = root.join("state.sqlite3");
+        let connection = Connection::open(&database).expect("open legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                    path TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    active_thread_id TEXT,
+                    last_opened_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO projects(path, name, active_thread_id, last_opened_ms)
+                 VALUES ('/tmp/legacy-rode-project', 'Legacy', NULL, 7);",
+            )
+            .expect("write legacy schema");
+        drop(connection);
+
+        let store = StateStore::open(&database).expect("upgrade state database");
+        let projects = store.load_projects().expect("load upgraded project");
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].id.starts_with("legacy-project-"));
+        assert_eq!(projects[0].git_root, projects[0].path);
+        assert!(projects[0].settings_override.is_none());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("clean migration fixture");
     }
 }

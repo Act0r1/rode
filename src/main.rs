@@ -10,6 +10,7 @@ mod editor;
 mod git;
 mod notifications;
 mod persistence;
+mod project;
 mod terminal;
 mod theme;
 mod ui;
@@ -23,10 +24,7 @@ fn main() {
     use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
     use gpui_platform::application;
 
-    let project_path = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("reading the current directory"));
+    let project_path = std::env::args_os().nth(1).map(PathBuf::from);
 
     application().run(move |cx: &mut App| {
         actions::register(cx);
