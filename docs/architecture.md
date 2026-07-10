@@ -1,0 +1,123 @@
+# Rode architecture
+
+## Product boundary
+
+Rode is an agent workspace, not a code editor and not a model provider. It
+orchestrates locally installed coding-agent harnesses using the user's existing
+authentication. The target workflow is:
+
+1. Open one or more Git projects.
+2. Start parallel agent threads, isolated in branches/worktrees when desired.
+3. Stream agent messages, reasoning summaries, commands, patches, and approval
+   requests into one native UI.
+4. Inspect the working tree and diff while a turn is running.
+5. Open a real PTY terminal in the same thread workspace.
+6. Commit, push, and create a pull request after reviewing the changes.
+
+This matches the durable parts of T3 Code while making Linux/Wayland a primary
+platform rather than a packaged web runtime.
+
+## Native platform stack
+
+```text
+Rode views and state
+        |
+        v
+GPUI elements / layout / text / accessibility
+        |
+        +-- gpui_linux: Wayland protocols, clipboard, xkbcommon, portals
+        +-- gpui_wgpu: scene batching, glyph atlas, WGSL pipelines
+        +-- calloop: compositor and async event-loop integration
+        |
+        v
+Wayland compositor + Vulkan/other wgpu backend
+```
+
+The GPUI dependencies are pinned to Zed commit
+`b2db24e58a085de575a875c151963c98e1a60bec`. Only the `wayland` feature is
+enabled; Rode does not silently fall back through XWayland.
+
+Zed's Linux code informed several deliberate choices:
+
+- native `wayland-client` surfaces and protocol negotiation;
+- `xkbcommon` and the compositor text-input path instead of interpreting raw
+  ASCII key events;
+- a retained scene with batched GPU primitives and a glyph atlas;
+- surface reconfiguration on compositor resize and device-loss recovery;
+- XDG desktop portals for file dialogs, URL opening, and secrets where
+  appropriate.
+
+## Modules
+
+- `app`: GPUI views, focus, actions, and the top-level application state.
+- `editor`: IME-aware multiline input and its low-level shaped-text element.
+- `agent`: provider-neutral turn result plus the first Codex CLI adapter.
+- `git`: read-only repository snapshots and diffs; worktree and publishing
+  operations belong here as the prototype grows.
+
+The target provider interface is event-oriented:
+
+```rust,ignore
+trait AgentProvider {
+    fn discover(&self) -> ProviderStatus;
+    async fn start_thread(&self, request: StartThread) -> EventStream;
+    async fn resume_thread(&self, request: ResumeThread) -> EventStream;
+    async fn respond_to_approval(&self, response: ApprovalResponse);
+    async fn cancel(&self, turn_id: TurnId);
+}
+```
+
+Codex should ultimately use `codex app-server` JSON-RPC because it exposes
+thread/turn lifecycle, streaming items, permission requests, cancellation, and
+process interaction. The first executable slice uses `codex exec --json` and
+retains the emitted thread ID; this already runs real turns, but approval
+prompts and live token deltas require the app-server transport.
+
+Claude and OpenCode should use ACP where available. A PTY compatibility adapter
+is the fallback for harnesses without a structured protocol.
+
+## Safety model
+
+Rode does not equate a polished GUI with blanket command authorization.
+Per-thread runtime modes map to provider-native policies:
+
+- `Read only`: no workspace writes.
+- `Workspace write` (default): writes stay in the selected project/worktree;
+  network or broader access remains denied unless the provider supports a
+  surfaced approval.
+- `Full access`: explicit opt-in, visibly marked, never inferred from a previous
+  thread.
+
+Until the app-server approval flow is implemented, the Codex adapter runs with
+`approval_policy = "never"` and the workspace-write sandbox. A denied operation
+is shown as an agent error; Rode does not auto-upgrade it to full access.
+
+## Persistence and isolation plan
+
+SQLite will store projects, thread metadata, provider session IDs, message
+projections, panel layout, and drafts. Raw provider events will be appended
+before projection so interrupted streams can be replayed.
+
+For an isolated thread, Rode creates:
+
+```text
+$XDG_STATE_HOME/rode/worktrees/<repo-id>/<thread-id>/
+branch: rode/<thread-id>-<slug>
+```
+
+The main checkout remains untouched. Worktree creation is transactional: if
+branch creation succeeds but checkout fails, Rode cleans up only the objects it
+created and records the failure.
+
+## Delivery sequence
+
+1. Native shell, input, provider discovery, Codex turns, and Git diff.
+2. Codex app-server transport with streaming events, cancellation, and approval
+   cards.
+3. SQLite event store and restoration of projects/threads/drafts.
+4. Per-thread Git worktrees and lifecycle management.
+5. PTY terminal with terminal-grid rendering and clipboard support.
+6. Commit/push/PR workflow using the user's `git` and `gh` authentication.
+7. Claude/OpenCode ACP adapters, notifications, desktop-file packaging, and
+   Wayland compositor compatibility tests.
+
