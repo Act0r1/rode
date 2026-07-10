@@ -10,7 +10,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::{Backspace, Delete, End, Home, InsertNewline, Left, Right};
+use crate::actions::{Backspace, Delete, End, Home, InsertNewline, Left, Right};
 
 pub struct Editor {
     pub focus_handle: FocusHandle,

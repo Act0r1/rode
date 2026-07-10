@@ -51,7 +51,14 @@ Zed's Linux code informed several deliberate choices:
 
 ## Modules
 
-- `app`: GPUI views, focus, actions, and the top-level application state.
+- `main`: Linux application startup, dependency wiring, and window creation.
+- `app`: top-level route/modal state, async coordination, and the existing GPUI
+  workspace rendering while views are extracted incrementally.
+- `actions`: the typed GPUI actions, default keybindings, and shared action
+  metadata registry used by future menus and the command palette.
+- `theme`: semantic color, status, diff, shadow, and corner-radius tokens.
+- `ui`: reusable native buttons, modal frame, tabs, toast queue, and selectable
+  rows.
 - `editor`: IME-aware multiline input and its low-level shaped-text element.
 - `agent`: installed Codex discovery.
 - `codex`: persistent app-server JSON-RPC transport, streamed events,
