@@ -12,8 +12,9 @@ use codex_auth::{CodexAccount, begin_codex_login, read_codex_account};
 use editor::{Editor, standard_actions};
 use git::RepoSnapshot;
 use gpui::{
-    App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, Render, Role,
-    StyleRefinement, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    AnyElement, App, Bounds, Context, CursorStyle, Div, Entity, IntoElement, KeyBinding, Render,
+    Role, StyleRefinement, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb,
+    size,
 };
 use gpui_platform::application;
 
@@ -55,6 +56,12 @@ enum CodexAuthState {
     SignedIn(CodexAccount),
     SigningIn,
     Error(String),
+}
+
+impl CodexAuthState {
+    fn requires_onboarding(&self) -> bool {
+        !matches!(self, Self::SignedIn(_))
+    }
 }
 
 struct RodeApp {
@@ -309,6 +316,283 @@ impl RodeApp {
     fn refresh_repo(&mut self, _: &RefreshRepo, _: &mut Window, cx: &mut Context<Self>) {
         self.repo = RepoSnapshot::load(&self.project_path);
         cx.notify();
+    }
+
+    fn render_auth_onboarding(&self, cx: &mut Context<Self>) -> AnyElement {
+        let codex_available = self.codex_available();
+        let (status_color, status_label) = match &self.codex_auth {
+            CodexAuthState::Unavailable => (0xf87171, "CLI not found"),
+            CodexAuthState::Checking => (0xfbbf24, "Checking account"),
+            CodexAuthState::SignedOut => (0x60a5fa, "Ready to connect"),
+            CodexAuthState::SigningIn => (0x60a5fa, "Waiting for browser"),
+            CodexAuthState::Error(_) => (0xf87171, "Connection error"),
+            CodexAuthState::SignedIn(_) => (0x34d399, "Connected"),
+        };
+        let error = match &self.codex_auth {
+            CodexAuthState::Error(error) => Some(error.clone()),
+            _ => None,
+        };
+
+        div()
+            .id("auth-onboarding")
+            .size_full()
+            .min_w(px(720.))
+            .flex()
+            .flex_col()
+            .bg(rgb(0x0f1115))
+            .text_color(rgb(0xd1d5db))
+            .child(
+                div()
+                    .h(px(64.))
+                    .flex_none()
+                    .px_6()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(rgb(0x252932))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xf3f4f6))
+                            .child("RODE"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_8()
+                    .child(
+                        div()
+                            .w(px(580.))
+                            .flex()
+                            .flex_col()
+                            .gap_5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(28.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0xf3f4f6))
+                                            .child("Choose your coding agent"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .line_height(px(21.))
+                                            .text_color(rgb(0x9299a8))
+                                            .child(
+                                                "Connect the agent Rode will use for this workspace. More agents can be added later.",
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("provider-codex")
+                                    .w_full()
+                                    .rounded_xl()
+                                    .border_1()
+                                    .border_color(rgb(0x3b82f6))
+                                    .bg(rgb(0x191d25))
+                                    .p_5()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_4()
+                                            .child(
+                                                div()
+                                                    .size(px(48.))
+                                                    .rounded_lg()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .bg(rgb(0xf3f4f6))
+                                                    .font_family("monospace")
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(rgb(0x111318))
+                                                    .child(">_"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .text_base()
+                                                            .font_weight(
+                                                                gpui::FontWeight::SEMIBOLD,
+                                                            )
+                                                            .text_color(rgb(0xf3f4f6))
+                                                            .child("Codex"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(rgb(0x8f96a5))
+                                                            .child("OpenAI coding agent"),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_full()
+                                            .bg(rgb(0x202a3d))
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .size(px(7.))
+                                                    .rounded_full()
+                                                    .bg(rgb(status_color)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xc5cada))
+                                                    .child(status_label),
+                                            ),
+                                    ),
+                            )
+                            .when(!codex_available, |content| {
+                                content.child(
+                                    div()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(rgb(0x513238))
+                                        .bg(rgb(0x24191c))
+                                        .p_4()
+                                        .text_sm()
+                                        .line_height(px(20.))
+                                        .text_color(rgb(0xfca5a5))
+                                        .child(
+                                            "Install the Codex CLI and make sure `codex` is available on PATH, then restart Rode.",
+                                        ),
+                                )
+                            })
+                            .when_some(error, |content, error| {
+                                content.child(
+                                    div()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(rgb(0x513238))
+                                        .bg(rgb(0x24191c))
+                                        .p_4()
+                                        .text_sm()
+                                        .line_height(px(20.))
+                                        .text_color(rgb(0xfca5a5))
+                                        .child(error),
+                                )
+                            })
+                            .child(match &self.codex_auth {
+                                CodexAuthState::SignedOut => div()
+                                    .id("onboarding-sign-in")
+                                    .role(Role::Button)
+                                    .aria_label("Continue with Codex and sign in with ChatGPT")
+                                    .w_full()
+                                    .h(px(44.))
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(0x2563eb))
+                                    .hover(|style| style.bg(rgb(0x3b82f6)))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sign_in_codex(cx)
+                                    }))
+                                    .child("Continue with Codex")
+                                    .into_any_element(),
+                                CodexAuthState::Error(_) => div()
+                                    .id("onboarding-auth-retry")
+                                    .role(Role::Button)
+                                    .aria_label("Retry the Codex account check")
+                                    .w_full()
+                                    .h(px(44.))
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(0x343946))
+                                    .hover(|style| style.bg(rgb(0x444b5a)))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_sm()
+                                    .text_color(rgb(0xf3f4f6))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_codex_account(cx)
+                                    }))
+                                    .child("Try again")
+                                    .into_any_element(),
+                                CodexAuthState::Checking => div()
+                                    .w_full()
+                                    .h(px(44.))
+                                    .rounded_lg()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(0x242831))
+                                    .text_sm()
+                                    .text_color(rgb(0x8f96a5))
+                                    .child("Checking Codex account…")
+                                    .into_any_element(),
+                                CodexAuthState::SigningIn => div()
+                                    .w_full()
+                                    .h(px(44.))
+                                    .rounded_lg()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(0x202a3d))
+                                    .text_sm()
+                                    .text_color(rgb(0xb9c8e6))
+                                    .child("Finish signing in in your browser…")
+                                    .into_any_element(),
+                                CodexAuthState::Unavailable => div()
+                                    .w_full()
+                                    .h(px(44.))
+                                    .rounded_lg()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(0x242831))
+                                    .text_sm()
+                                    .text_color(rgb(0x777d8b))
+                                    .child("Codex CLI required")
+                                    .into_any_element(),
+                                CodexAuthState::SignedIn(_) => div().into_any_element(),
+                            })
+                            .child(
+                                div()
+                                    .text_center()
+                                    .text_xs()
+                                    .line_height(px(18.))
+                                    .text_color(rgb(0x6f7685))
+                                    .child(
+                                        "Sign-in opens in your default browser. Codex securely stores and refreshes your session.",
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
@@ -851,6 +1135,10 @@ impl RodeApp {
 
 impl Render for RodeApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.codex_auth.requires_onboarding() {
+            return self.render_auth_onboarding(cx);
+        }
+
         div()
             .id("rode-root")
             .on_action(cx.listener(Self::send_prompt))
@@ -874,6 +1162,7 @@ impl Render for RodeApp {
                     .child(self.render_composer(cx)),
             )
             .when(self.show_diff, |root| root.child(self.render_diff()))
+            .into_any_element()
     }
 }
 
@@ -921,4 +1210,25 @@ fn main() {
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("Rode currently targets Linux/Wayland only.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexAccount, CodexAuthState};
+
+    #[test]
+    fn workspace_is_only_available_after_codex_authentication() {
+        assert!(CodexAuthState::Unavailable.requires_onboarding());
+        assert!(CodexAuthState::Checking.requires_onboarding());
+        assert!(CodexAuthState::SignedOut.requires_onboarding());
+        assert!(CodexAuthState::SigningIn.requires_onboarding());
+        assert!(CodexAuthState::Error("failed".to_owned()).requires_onboarding());
+        assert!(
+            !CodexAuthState::SignedIn(CodexAccount::ChatGpt {
+                email: None,
+                plan: "plus".to_owned(),
+            })
+            .requires_onboarding()
+        );
+    }
 }

@@ -34,9 +34,11 @@ cargo run -- /path/to/a/project
 ```
 
 The project path defaults to the current directory. Rode detects agent CLIs
-from `PATH`. If Codex is signed out, use **Sign in with ChatGPT** in the
-sidebar; Rode opens the browser flow exposed by `codex app-server` and updates
-the account card when Codex confirms the login.
+from `PATH`. On first launch, a signed-out user sees the agent chooser (Codex is
+the only supported agent for now). Choose **Continue with Codex** and Rode opens
+the browser flow exposed by `codex app-server`. After Codex confirms the login,
+Rode enters the workspace. Future launches reuse Codex's cached session and
+skip the chooser while that session remains valid.
 
 Codex owns the OAuth callback, credential persistence, and token refresh. Rode
 only receives the account email and plan needed for status display; it never
