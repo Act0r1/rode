@@ -247,6 +247,16 @@ impl Editor {
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
+
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let range = self.selection.clone().unwrap_or(self.cursor..self.cursor);
+        self.value.replace_range(range.clone(), text);
+        self.cursor = range.start + text.len();
+        self.selection = None;
+        self.reset_blink(cx);
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
 }
 
 fn previous_word_boundary(content: &str, offset: usize) -> usize {

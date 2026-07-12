@@ -13,6 +13,7 @@ actions!(
         Home,
         End,
         InsertNewline,
+        Paste,
         SendPrompt,
         SubmitRename,
         SubmitNewThread,
@@ -50,6 +51,7 @@ pub(crate) enum ActionId {
     ComposerHome,
     ComposerEnd,
     ComposerInsertNewline,
+    ComposerPaste,
     ComposerSend,
     RenameBackspace,
     RenameDelete,
@@ -186,6 +188,7 @@ pub(crate) const ACTION_REGISTRY: &[ActionDescriptor] = &[
         "shift-enter",
         Some("Composer"),
     ),
+    action(ActionId::ComposerPaste, "Paste", "ctrl-v", Some("Composer")),
     action(
         ActionId::ComposerSend,
         "Send prompt",
@@ -359,6 +362,7 @@ fn binding(action: &ActionDescriptor) -> KeyBinding {
         ActionId::ComposerInsertNewline => {
             KeyBinding::new(action.shortcut, InsertNewline, action.context)
         }
+        ActionId::ComposerPaste => KeyBinding::new(action.shortcut, Paste, action.context),
         ActionId::ComposerSend => KeyBinding::new(action.shortcut, SendPrompt, action.context),
         ActionId::RenameBackspace => KeyBinding::new(action.shortcut, Backspace, action.context),
         ActionId::RenameDelete => KeyBinding::new(action.shortcut, Delete, action.context),

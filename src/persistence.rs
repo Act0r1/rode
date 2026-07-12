@@ -1,13 +1,15 @@
 use crate::conversation::{CardKind, CardStatus, ConversationCard, NoticeTone};
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static PROJECT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static ATTACHMENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -890,6 +892,41 @@ fn rode_state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/rode"))
 }
 
+pub(crate) fn persist_clipboard_image(bytes: &[u8], extension: &str) -> Result<PathBuf> {
+    persist_clipboard_image_in(&rode_state_dir()?.join("attachments"), bytes, extension)
+}
+
+fn persist_clipboard_image_in(
+    attachments_dir: &Path,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<PathBuf> {
+    fs::create_dir_all(attachments_dir)
+        .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
+    let attachments_dir = attachments_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve attachment directory {}",
+            attachments_dir.display()
+        )
+    })?;
+    let sequence = ATTACHMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = attachments_dir.join(format!(
+        "clipboard-{}-{}-{sequence}.{extension}",
+        now_ms(),
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("failed to create pasted image {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to save pasted image {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync pasted image {}", path.display()))?;
+    Ok(path)
+}
+
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -915,12 +952,33 @@ fn usize_to_i64(value: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{StateStore, StoredMessage, StoredProject, StoredThread};
+    use super::{
+        StateStore, StoredMessage, StoredProject, StoredThread, persist_clipboard_image_in,
+    };
     use crate::conversation::{CardKind, CardStatus, ConversationAttachment, ConversationCard};
     use rusqlite::Connection;
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn pasted_images_are_written_durably_with_the_matching_extension() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-pasted-image-{nonce}"));
+        let bytes = b"encoded png bytes";
+
+        let path = persist_clipboard_image_in(&root, bytes, "png").expect("persist image");
+
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert_eq!(fs::read(&path).expect("read persisted image"), bytes);
+        fs::remove_dir_all(root).expect("clean pasted image fixture");
+    }
 
     #[test]
     fn round_trips_active_thread_and_messages() {

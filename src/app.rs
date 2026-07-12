@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use crate::actions::{
     ActivateRailItem, CancelRename, CycleTheme, DismissModal, OpenSettings, OpenSourceControl,
-    OpenTerminalRoute, OpenWorkspace, RefreshRepo, SendPrompt, SubmitNewThread, SubmitRename,
-    ToggleDiff, ToggleDiffLayout, ToggleTerminal,
+    OpenTerminalRoute, OpenWorkspace, Paste, RefreshRepo, SendPrompt, SubmitNewThread,
+    SubmitRename, ToggleDiff, ToggleDiffLayout, ToggleTerminal,
 };
 use crate::agent::{
     ProviderKind, ProviderModel, ProviderStatus, RuntimeAccess, TurnAttachment, TurnRequest,
@@ -31,16 +32,19 @@ use crate::git::{
     list_local_branches, load_git_history, push_current_branch, switch_local_branch,
 };
 use crate::notifications;
-use crate::persistence::{StateStore, StoredMessage, StoredProject, StoredThread, now_ms};
+use crate::persistence::{
+    StateStore, StoredMessage, StoredProject, StoredThread, now_ms, persist_clipboard_image,
+};
 use crate::project::{ValidatedProject, validate_project};
 use crate::terminal::{TerminalCore, TerminalView};
 use crate::theme::{self, ThemeKind};
 use crate::ui::{button, modal, selectable_row, split_pane, tabs, toast};
 use crate::views::message_card;
 use gpui::{
-    App, Context, CursorStyle, Div, Entity, FollowMode, IntoElement, KeyDownEvent, ListAlignment,
-    ListOffset, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render,
-    Role, StyleRefinement, Subscription, Window, div, list, prelude::*, px, rgb,
+    App, ClipboardEntry, Context, CursorStyle, Div, Entity, FollowMode, ImageFormat, IntoElement,
+    KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Render, Role, StyleRefinement, Subscription, Window, div, list, prelude::*,
+    px, rgb,
 };
 
 const ISOLATE_NEW_THREADS_SETTING: &str = "isolate_new_threads";
@@ -936,7 +940,7 @@ impl RodeApp {
         self.drafts.insert(self.thread_id.clone(), draft.clone());
         self.composer
             .update(cx, |editor, cx| editor.set_text(draft, cx));
-        self.pending_images.clear();
+        self.discard_pending_images();
         if let Some(store) = self.state_store.as_mut() {
             let _ = store.mark_thread_read(&self.thread_id);
             if missing_isolated_workspace {
@@ -1608,7 +1612,45 @@ impl RodeApp {
         cx.notify();
     }
 
-    fn add_image_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn clear_image_attachments(&mut self, cx: &mut Context<Self>) {
+        self.discard_pending_images();
+        cx.notify();
+    }
+
+    fn discard_pending_images(&mut self) {
+        for path in self.pending_images.drain(..) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn paste_into_composer(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+        if !matches!(clipboard.entries().first(), Some(ClipboardEntry::Image(_))) {
+            if let Some(text) = clipboard.text() {
+                self.composer
+                    .update(cx, |editor, cx| editor.paste_text(&text, cx));
+            }
+            return;
+        }
+        let images = clipboard
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) if !image.bytes.is_empty() => Some(image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if images.is_empty() {
+            if let Some(text) = clipboard.text() {
+                self.composer
+                    .update(cx, |editor, cx| editor.paste_text(&text, cx));
+            }
+            return;
+        }
+
         let model_supports_images = self.selected_model.as_ref().is_some_and(|selected| {
             self.available_models
                 .iter()
@@ -1623,74 +1665,29 @@ impl RodeApp {
             cx.notify();
             return;
         }
-        let selection = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Select images".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = selection.await;
-            this.update_in(cx, |this, _, cx| match result {
-                Ok(Ok(Some(paths))) => {
-                    let mut rejected = 0;
-                    for path in paths {
-                        let supported = path
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            .is_some_and(|extension| {
-                                matches!(
-                                    extension.to_ascii_lowercase().as_str(),
-                                    "png"
-                                        | "jpg"
-                                        | "jpeg"
-                                        | "gif"
-                                        | "webp"
-                                        | "bmp"
-                                        | "tif"
-                                        | "tiff"
-                                )
-                            });
-                        match (supported, path.canonicalize()) {
-                            (true, Ok(path)) => {
-                                if !this.pending_images.contains(&path) {
-                                    this.pending_images.push(path);
-                                }
-                            }
-                            _ => rejected += 1,
-                        }
-                    }
-                    if rejected > 0 {
-                        this.toasts.push(
-                            toast::ToastKind::Warning,
-                            format!("Skipped {rejected} unsupported or unreadable image(s)."),
-                        );
-                    }
-                    cx.notify();
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    this.toasts.push(
-                        toast::ToastKind::Error,
-                        format!("Could not open the image picker: {error:#}"),
-                    );
-                    cx.notify();
-                }
-                Err(_) => {
-                    this.toasts.push(
-                        toast::ToastKind::Error,
-                        "The desktop image picker closed unexpectedly.",
-                    );
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
 
-    fn clear_image_attachments(&mut self, cx: &mut Context<Self>) {
-        self.pending_images.clear();
+        let mut rejected = 0;
+        for image in images {
+            let Some(extension) = clipboard_image_extension(image.format) else {
+                rejected += 1;
+                continue;
+            };
+            match persist_clipboard_image(&image.bytes, extension) {
+                Ok(path) => self.pending_images.push(path),
+                Err(error) => {
+                    self.toasts.push(
+                        toast::ToastKind::Error,
+                        format!("Could not save pasted image: {error:#}"),
+                    );
+                }
+            }
+        }
+        if rejected > 0 {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                format!("Skipped {rejected} unsupported clipboard image(s)."),
+            );
+        }
         cx.notify();
     }
 
@@ -3053,7 +3050,7 @@ impl RodeApp {
             .update(cx, |editor, cx| editor.set_text("", cx));
         self.composer
             .update(cx, |editor, cx| editor.set_text("", cx));
-        self.pending_images.clear();
+        self.discard_pending_images();
         self.running = false;
         self.thread_number = self.next_thread_number();
         self.thread_id = new_local_thread_id();
@@ -5761,6 +5758,7 @@ impl RodeApp {
                     .key_context("Composer")
                     .track_focus(&focus_handle)
                     .map(standard_actions(self.composer.clone()))
+                    .on_action(cx.listener(Self::paste_into_composer))
                     .cursor(CursorStyle::IBeam)
                     .w_full()
                     .min_w_0()
@@ -5899,33 +5897,6 @@ impl RodeApp {
                                                 "Diff attached"
                                             } else {
                                                 "Attach diff"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("composer-attach-images")
-                                            .role(Role::Button)
-                                            .aria_label("Attach images")
-                                            .tab_index(0)
-                                            .tab_stop(true)
-                                            .cursor_pointer()
-                                            .rounded_md()
-                                            .px_2()
-                                            .py_1()
-                                            .bg(rgb(if self.pending_images.is_empty() {
-                                                theme::tokens(self.theme).colors.overlay
-                                            } else {
-                                                theme::tokens(self.theme).colors.accent_soft
-                                            }))
-                                            .text_xs()
-                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.add_image_attachments(window, cx)
-                                            }))
-                                            .child(if self.pending_images.is_empty() {
-                                                "Attach images".to_owned()
-                                            } else {
-                                                format!("{} image(s)", self.pending_images.len())
                                             }),
                                     ),
                             )
@@ -7585,19 +7556,47 @@ fn route_after_auth(
     }
 }
 
+fn clipboard_image_extension(format: ImageFormat) -> Option<&'static str> {
+    match format {
+        ImageFormat::Png => Some("png"),
+        ImageFormat::Jpeg => Some("jpg"),
+        ImageFormat::Webp => Some("webp"),
+        ImageFormat::Gif => Some("gif"),
+        ImageFormat::Bmp => Some("bmp"),
+        ImageFormat::Tiff => Some("tiff"),
+        ImageFormat::Svg | ImageFormat::Ico | ImageFormat::Pnm => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AppRoute, CodexAccount, CodexAuthState, INSPECTOR_WIDTH_SETTING, ROUTE_SETTING,
         SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, ThreadActivity, UiPreferences,
-        codex_auth_cache_value, codex_auth_from_cache, model_discovery_workspace_available,
-        relative_activity_time, route_after_auth, select_startup_project,
+        clipboard_image_extension, codex_auth_cache_value, codex_auth_from_cache,
+        model_discovery_workspace_available, relative_activity_time, route_after_auth,
+        select_startup_project,
     };
     use crate::persistence::{StateStore, StoredProject};
     use crate::theme::ThemeKind;
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn clipboard_image_extensions_match_supported_encoded_formats() {
+        use gpui::ImageFormat;
+
+        assert_eq!(clipboard_image_extension(ImageFormat::Png), Some("png"));
+        assert_eq!(clipboard_image_extension(ImageFormat::Jpeg), Some("jpg"));
+        assert_eq!(clipboard_image_extension(ImageFormat::Webp), Some("webp"));
+        assert_eq!(clipboard_image_extension(ImageFormat::Gif), Some("gif"));
+        assert_eq!(clipboard_image_extension(ImageFormat::Bmp), Some("bmp"));
+        assert_eq!(clipboard_image_extension(ImageFormat::Tiff), Some("tiff"));
+        assert_eq!(clipboard_image_extension(ImageFormat::Svg), None);
+        assert_eq!(clipboard_image_extension(ImageFormat::Ico), None);
+        assert_eq!(clipboard_image_extension(ImageFormat::Pnm), None);
+    }
 
     #[test]
     fn workspace_is_only_available_after_codex_authentication() {
