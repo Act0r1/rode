@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::actions::{
     ActivateRailItem, CancelRename, CycleTheme, DismissModal, OpenSettings, OpenSourceControl,
@@ -305,6 +309,10 @@ fn codex_auth_cache_value(state: &CodexAuthState) -> Option<String> {
         CodexAuthState::SignedIn(account) => Some(format!("signed_in:{}", account.summary())),
         _ => None,
     }
+}
+
+fn model_discovery_workspace_available(project_open: bool, project_path: &Path) -> bool {
+    project_open && !project_path.as_os_str().is_empty()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1459,7 +1467,9 @@ impl RodeApp {
     }
 
     fn refresh_codex_models(&mut self, cx: &mut Context<Self>) {
-        if !self.project_open || !self.repo.is_repository || !self.codex_authenticated() {
+        if !model_discovery_workspace_available(self.project_open, &self.project_path)
+            || !self.codex_authenticated()
+        {
             self.model_catalog = ModelCatalogState::Idle;
             return;
         }
@@ -1512,6 +1522,9 @@ impl RodeApp {
 
     fn open_model_picker(&mut self, cx: &mut Context<Self>) {
         self.modal = Some(ModalState::ModelPicker);
+        if matches!(self.model_catalog, ModelCatalogState::Idle) {
+            self.refresh_codex_models(cx);
+        }
         cx.notify();
     }
 
@@ -7384,12 +7397,13 @@ mod tests {
     use super::{
         AppRoute, CodexAccount, CodexAuthState, INSPECTOR_WIDTH_SETTING, ROUTE_SETTING,
         SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, ThreadActivity, UiPreferences,
-        codex_auth_cache_value, codex_auth_from_cache, relative_activity_time, route_after_auth,
-        select_startup_project,
+        codex_auth_cache_value, codex_auth_from_cache, model_discovery_workspace_available,
+        relative_activity_time, route_after_auth, select_startup_project,
     };
     use crate::persistence::{StateStore, StoredProject};
     use crate::theme::ThemeKind;
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -7433,6 +7447,19 @@ mod tests {
             Some(CodexAuthState::SignedOut)
         ));
         assert!(codex_auth_from_cache("broken").is_none());
+    }
+
+    #[test]
+    fn model_discovery_can_start_before_the_git_snapshot_finishes_loading() {
+        assert!(model_discovery_workspace_available(
+            true,
+            Path::new("/tmp/rode-project")
+        ));
+        assert!(!model_discovery_workspace_available(
+            false,
+            Path::new("/tmp/rode-project")
+        ));
+        assert!(!model_discovery_workspace_available(true, Path::new("")));
     }
 
     #[test]
