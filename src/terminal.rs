@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+use crate::perf::{SlowOperation, UI_STALL_THRESHOLD};
 use crate::theme::{self, ThemeKind};
 
 use anyhow::{Context as _, Result};
@@ -480,7 +481,14 @@ impl TerminalWorker {
         while let Ok(command) = commands.recv() {
             match command {
                 WorkerCommand::PtyOutput(output) => {
-                    self.terminal.vt_write(&output);
+                    {
+                        let _timing = SlowOperation::new(
+                            "terminal.pty_parse",
+                            UI_STALL_THRESHOLD,
+                            format!("bytes={}", output.len()),
+                        );
+                        self.terminal.vt_write(&output);
+                    }
                     self.publish_snapshot()?;
                 }
                 WorkerCommand::PtyClosed => {
@@ -633,12 +641,23 @@ impl TerminalWorker {
     }
 
     fn publish_snapshot(&mut self) -> Result<()> {
+        let size = self.size.get();
+        let _timing = SlowOperation::new(
+            "terminal.snapshot",
+            UI_STALL_THRESHOLD,
+            format!(
+                "rows={} columns={} grid_cells={}",
+                size.lines,
+                size.columns,
+                size.lines.saturating_mul(size.columns)
+            ),
+        );
         let snapshot = ghostty_snapshot(
             &self.terminal,
             &mut self.renderer,
             &mut self.rows,
             &mut self.cells,
-            self.size.get(),
+            size,
             self.exited,
         )?;
         let _ = self.events.try_send(TerminalEvent::Snapshot(snapshot));
@@ -817,6 +836,20 @@ impl TerminalView {
     }
 
     fn handle_event(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
+        let context = match &event {
+            TerminalEvent::Snapshot(snapshot) => format!(
+                "kind=snapshot rows={} cells={}",
+                snapshot.size.lines,
+                snapshot.cells.len()
+            ),
+            TerminalEvent::ClipboardStore(text) => {
+                format!("kind=clipboard bytes={}", text.len())
+            }
+            TerminalEvent::Bell => "kind=bell".to_owned(),
+            TerminalEvent::Exited => "kind=exited".to_owned(),
+            TerminalEvent::Error(_) => "kind=error".to_owned(),
+        };
+        let _timing = SlowOperation::new("ui.terminal_event_update", UI_STALL_THRESHOLD, context);
         match event {
             TerminalEvent::Snapshot(snapshot) => {
                 self.title = snapshot.title.clone();

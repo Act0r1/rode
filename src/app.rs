@@ -705,6 +705,15 @@ impl RodeApp {
         {
             return;
         }
+        let _timing = SlowOperation::new(
+            "ui.persist_current_thread",
+            UI_STALL_THRESHOLD,
+            format!(
+                "messages={} events={}",
+                self.messages.len(),
+                self.conversation.cards().len()
+            ),
+        );
         let Some(store) = self.state_store.as_mut() else {
             return;
         };

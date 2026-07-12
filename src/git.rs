@@ -5,7 +5,7 @@ use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::perf::{PROCESS_THRESHOLD, SlowOperation};
+use crate::perf::{PROCESS_THRESHOLD, SlowOperation, UI_STALL_THRESHOLD};
 
 #[derive(Clone, Debug, Default)]
 pub struct RepoSnapshot {
@@ -66,10 +66,7 @@ pub fn create_thread_worktree(
     let _timing = SlowOperation::new(
         "git.create_worktree",
         PROCESS_THRESHOLD,
-        format!(
-            "repository={} base_branch={base_branch}",
-            repository.display()
-        ),
+        format!("repository={}", repository_name(repository)),
     );
     create_thread_worktree_at(
         repository,
@@ -165,7 +162,7 @@ pub fn load_git_history(repository: &Path) -> Result<GitHistory> {
     let _timing = SlowOperation::new(
         "git.load_history",
         PROCESS_THRESHOLD,
-        format!("repository={}", repository.display()),
+        format!("repository={}", repository_name(repository)),
     );
     let root = repository_root(repository)?;
     let current = git_output(&root, &["branch", "--show-current"]).unwrap_or_default();
@@ -262,7 +259,7 @@ pub fn switch_local_branch(repository: &Path, branch: &str) -> Result<()> {
     let _timing = SlowOperation::new(
         "git.switch_branch",
         PROCESS_THRESHOLD,
-        format!("repository={} branch={branch}", repository.display()),
+        format!("repository={}", repository_name(repository)),
     );
     let root = repository_root(repository)?;
     let branch = branch.trim();
@@ -345,7 +342,7 @@ pub fn commit_all(repository: &Path, message: &str) -> Result<String> {
     let _timing = SlowOperation::new(
         "git.commit",
         PROCESS_THRESHOLD,
-        format!("repository={}", repository.display()),
+        format!("repository={}", repository_name(repository)),
     );
     let message = message.trim();
     if message.is_empty() {
@@ -366,7 +363,7 @@ pub fn push_current_branch(repository: &Path) -> Result<String> {
     let _timing = SlowOperation::new(
         "git.push",
         PROCESS_THRESHOLD,
-        format!("repository={}", repository.display()),
+        format!("repository={}", repository_name(repository)),
     );
     let root = repository_root(repository)?;
     let branch = git_output(&root, &["branch", "--show-current"])
@@ -380,7 +377,7 @@ pub fn create_pull_request(repository: &Path, title: &str) -> Result<String> {
     let _timing = SlowOperation::new(
         "git.create_pull_request",
         PROCESS_THRESHOLD,
-        format!("repository={}", repository.display()),
+        format!("repository={}", repository_name(repository)),
     );
     let title = title.trim();
     if title.is_empty() {
@@ -421,8 +418,8 @@ impl RepoSnapshot {
     pub fn load(path: &Path) -> Self {
         let _timing = SlowOperation::new(
             "git.load_snapshot",
-            PROCESS_THRESHOLD,
-            format!("repository={}", path.display()),
+            UI_STALL_THRESHOLD,
+            format!("repository={}", repository_name(path)),
         );
         let root = canonical_or_original(path);
         if !git_ok(&root, &["rev-parse", "--is-inside-work-tree"]) {
@@ -596,7 +593,10 @@ fn untracked_paths(cwd: &Path) -> Vec<String> {
     let _timing = SlowOperation::new(
         "git.command",
         PROCESS_THRESHOLD,
-        format!("command=ls-files cwd={}", cwd.display()),
+        format!(
+            "command=ls-files.untracked repository={}",
+            repository_name(cwd)
+        ),
     );
     let output = Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
@@ -619,11 +619,44 @@ fn git_command_timing(cwd: &Path, args: &[&str]) -> SlowOperation {
         "git.command",
         PROCESS_THRESHOLD,
         format!(
-            "command={} cwd={}",
-            args.first().copied().unwrap_or("unknown"),
-            cwd.display()
+            "command={} repository={}",
+            git_command_label(args),
+            repository_name(cwd)
         ),
     )
+}
+
+fn git_command_label(args: &[&str]) -> &'static str {
+    match args {
+        ["rev-parse", "--show-toplevel", ..] => "rev-parse.show-toplevel",
+        ["rev-parse", "--is-inside-work-tree", ..] => "rev-parse.is-inside-work-tree",
+        ["rev-parse", "--verify", ..] => "rev-parse.verify",
+        ["rev-parse", "--short", ..] => "rev-parse.short",
+        ["branch", "--show-current", ..] => "branch.show-current",
+        ["status", "--porcelain=v1", ..] => "status.porcelain",
+        ["for-each-ref", ..] => "for-each-ref.local-branches",
+        ["worktree", "list", ..] => "worktree.list",
+        ["worktree", "add", ..] => "worktree.add",
+        ["worktree", "remove", ..] => "worktree.remove",
+        ["log", "-8", ..] => "log.recent",
+        ["log", ..] => "log.history",
+        ["diff", "--stat", ..] => "diff.stat",
+        ["diff", ..] => "diff.patch",
+        ["ls-files", ..] => "ls-files.untracked",
+        ["add", ..] => "add.all",
+        ["commit", ..] => "commit",
+        ["push", ..] => "push",
+        ["switch", ..] => "switch",
+        _ => "other",
+    }
+}
+
+fn repository_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {
@@ -658,9 +691,9 @@ fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RepoSnapshot, commit_all, create_thread_worktree_at, git_output, list_local_branches,
-        load_git_history, remove_thread_worktree, safe_slug, switch_local_branch,
-        untracked_file_diff,
+        RepoSnapshot, commit_all, create_thread_worktree_at, git_command_label, git_output,
+        list_local_branches, load_git_history, remove_thread_worktree, safe_slug,
+        switch_local_branch, untracked_file_diff,
     };
     use crate::diff::DiffDocument;
     use std::fs;
@@ -865,6 +898,23 @@ mod tests {
     fn slug_is_safe_for_branches_and_paths() {
         assert_eq!(safe_slug("  Fix: Wayland / HiDPI  "), "fix-wayland-hidpi");
         assert_eq!(safe_slug("../../"), "");
+    }
+
+    #[test]
+    fn performance_command_labels_do_not_include_arguments() {
+        assert_eq!(
+            git_command_label(&["commit", "-m", "private commit message"]),
+            "commit"
+        );
+        assert_eq!(
+            git_command_label(&["switch", "private-branch-name"]),
+            "switch"
+        );
+        assert_eq!(
+            git_command_label(&["rev-parse", "--verify", "private-ref"]),
+            "rev-parse.verify"
+        );
+        assert_eq!(git_command_label(&["unknown", "private-value"]), "other");
     }
 
     #[test]

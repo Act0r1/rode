@@ -18,7 +18,12 @@ fn validate_project_with_git(path: &Path, git_binary: &str) -> Result<ValidatedP
     let _timing = SlowOperation::new(
         "project.validate",
         PROCESS_THRESHOLD,
-        format!("path={}", path.display()),
+        format!(
+            "project={}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+        ),
     );
     if !path.exists() {
         bail!("{} does not exist", path.display());

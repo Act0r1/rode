@@ -84,7 +84,12 @@ impl StateStore {
         let _timing = SlowOperation::new(
             "storage.open",
             STORAGE_THRESHOLD,
-            format!("database={}", path.display()),
+            format!(
+                "database={}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+            ),
         );
         let mut connection = Connection::open(path)
             .with_context(|| format!("failed to open Rode state database {}", path.display()))?;
@@ -543,7 +548,13 @@ impl StateStore {
         let _timing = SlowOperation::new(
             "storage.load_threads",
             STORAGE_THRESHOLD,
-            format!("project={}", project_path.display()),
+            format!(
+                "project={}",
+                project_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+            ),
         );
         let mut statement = self.connection.prepare(
             "SELECT id FROM threads WHERE project_path = ?1
