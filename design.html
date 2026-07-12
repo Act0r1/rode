@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rode — четыре дизайн-направления</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --chrome-bg: #0b0c0e; --chrome-panel: #131518; --chrome-border: #24272c;
+    --chrome-text: #d8dbe0; --chrome-muted: #82878f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, monospace;
+    --sans: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  }
+  html, body { background: var(--chrome-bg); color: var(--chrome-text); font-family: var(--sans); }
+  body { min-height: 100vh; display: flex; flex-direction: column; }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; text-align: left; }
+  button:focus-visible { outline: 2px solid #8ab8d8; outline-offset: 2px; }
+  pre, code { font-family: var(--mono); }
+
+  /* ── Page chrome ─────────────────────────────────────────── */
+  .top {
+    display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+    padding: 18px 28px; border-bottom: 1px solid var(--chrome-border);
+    background: var(--chrome-panel); position: sticky; top: 0; z-index: 10;
+  }
+  .wordmark { font-family: var(--mono); font-size: 15px; letter-spacing: .34em; font-weight: 700; }
+  .wordmark small { display: block; letter-spacing: .08em; font-weight: 400; color: var(--chrome-muted); font-size: 10px; margin-top: 3px; text-transform: uppercase; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tabs button { font-family: var(--mono); font-size: 12px; padding: 7px 14px; border: 1px solid var(--chrome-border); border-radius: 4px; color: var(--chrome-muted); text-align: center; }
+  .tabs button:hover { color: var(--chrome-text); }
+  .tabs button[aria-selected="true"] { color: var(--chrome-bg); background: var(--chrome-text); border-color: var(--chrome-text); }
+  .tabs .num { opacity: .55; margin-right: 6px; }
+  .screen-tabs { margin-left: auto; }
+  .hint { width: 100%; font-size: 11px; color: var(--chrome-muted); font-family: var(--mono); }
+  @media (min-width: 1180px) { .hint { width: auto; margin-left: 8px; } }
+
+  .intro { display: none; padding: 20px 28px 2px; gap: 28px; align-items: baseline; flex-wrap: wrap; }
+  .intro.on { display: flex; }
+  .intro h2 { font-size: 20px; }
+  .intro h2 .num { font-family: var(--mono); font-size: 12px; color: var(--chrome-muted); margin-right: 10px; letter-spacing: .2em; }
+  .intro p { color: var(--chrome-muted); font-size: 13px; max-width: 66ch; line-height: 1.55; }
+
+  .stage { flex: 1; padding: 18px 28px 40px; }
+  .dir { display: none; max-width: 1260px; margin: 0 auto; }
+  .dir.on { display: block; }
+  .view { display: none; }
+  .view.on { display: block; }
+
+  /* ════════════════════════════════════════════════════════════
+     01 · PANEL — классическая трёхпанельная IDE
+     ════════════════════════════════════════════════════════════ */
+  #d1 {
+    --bg:#101216; --panel:#16191f; --well:#0c0e11; --text:#d6dae2; --muted:#7c8494;
+    --accent:#cf8a52; --on-accent:#14100b; --good:#7dbd8a; --bad:#d97a7a;
+    --sel:#1d2129; --line:1px solid #23272f;
+    color: var(--text); font-size: 13.5px;
+  }
+  #d1 .win { background: var(--bg); border: var(--line); border-radius: 10px; overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,.5); }
+  #d1 .titlebar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: var(--line); background: var(--panel); font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  #d1 .titlebar b { letter-spacing: .22em; color: var(--text); }
+  #d1 .titlebar .path { margin-left: auto; }
+  #d1 .dots { display: flex; gap: 6px; }
+  #d1 .dots i { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); opacity: .4; }
+
+  #d1 .login { min-height: 580px; display: grid; place-items: center; padding: 40px; }
+  #d1 .login-card { width: min(400px,100%); padding: 36px 32px; text-align: center; background: var(--panel); border: var(--line); border-radius: 10px; }
+  #d1 .login-card h1 { font-family: var(--mono); font-size: 28px; letter-spacing: .32em; }
+  #d1 .login-card .sub { margin-top: 10px; color: var(--muted); font-size: 13px; }
+  #d1 .login-status { margin: 26px 0; padding: 10px 14px; display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11.5px; color: var(--muted); border: var(--line); border-radius: 5px; background: var(--well); }
+  #d1 .login-status .ok { color: var(--good); }
+  #d1 .cta { display: block; width: 100%; padding: 11px 20px; border-radius: 5px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 14px; text-align: center; }
+  #d1 .fine { margin-top: 18px; font-size: 11.5px; color: var(--muted); line-height: 1.55; }
+
+  #d1 .workspace { display: grid; grid-template-columns: 228px 1fr 288px; min-height: 640px; }
+  #d1 .pane { border-right: var(--line); min-width: 0; }
+  #d1 .pane:last-child { border-right: none; }
+  #d1 .pane-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); border-bottom: var(--line); }
+  #d1 .proj-name { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 10px 16px 4px; }
+  #d1 .thread { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin: 2px 8px; border-radius: 5px; font-size: 13px; width: calc(100% - 16px); }
+  #d1 .thread:hover { background: var(--well); }
+  #d1 .thread.active { background: var(--sel); }
+  #d1 .thread i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); opacity: .5; flex: none; }
+  #d1 .thread i.run { background: var(--good); opacity: 1; }
+  #d1 .thread .wt { margin-left: auto; font-family: var(--mono); font-size: 9.5px; border: var(--line); border-radius: 3px; padding: 1px 5px; color: var(--muted); }
+  #d1 .convo { display: flex; flex-direction: column; }
+  #d1 .convo-top { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: var(--line); }
+  #d1 .convo-top .t { font-weight: 600; }
+  #d1 .pill { font-family: var(--mono); font-size: 10.5px; padding: 3px 9px; border: var(--line); border-radius: 4px; color: var(--muted); white-space: nowrap; }
+  #d1 .pill.br { color: var(--accent); }
+  #d1 .grow { flex: 1; }
+  #d1 .ghost { font-size: 11.5px; color: var(--muted); padding: 5px 10px; border: var(--line); border-radius: 5px; }
+  #d1 .ghost:hover { color: var(--text); }
+  #d1 .feed { flex: 1; padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
+  #d1 .msg { max-width: 60ch; line-height: 1.6; }
+  #d1 .msg.user { align-self: flex-end; background: var(--sel); padding: 10px 14px; border-radius: 8px; }
+  #d1 .who { font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  #d1 .reason { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  #d1 .reason::before { content: "▸ "; opacity: .6; }
+  #d1 .card { border: var(--line); border-radius: 8px; background: var(--panel); overflow: hidden; max-width: 560px; }
+  #d1 .card-head { display: flex; gap: 10px; padding: 9px 13px; font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); border-bottom: var(--line); }
+  #d1 .card-head .tag { color: var(--accent); }
+  #d1 .card pre { font-size: 12px; line-height: 1.65; padding: 12px 14px; overflow-x: auto; background: var(--well); }
+  #d1 .card-actions { display: flex; gap: 8px; padding: 10px 13px; border-top: var(--line); }
+  #d1 .mini { font-size: 11.5px; padding: 5px 12px; border-radius: 5px; border: var(--line); color: var(--muted); }
+  #d1 .mini.yes { background: var(--accent); color: var(--on-accent); border-color: transparent; font-weight: 600; }
+  #d1 .add { color: var(--good); } #d1 .del { color: var(--bad); }
+  #d1 .stream { font-family: var(--mono); font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #d1 .stream i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: d1p 1.1s infinite; }
+  @keyframes d1p { 50% { opacity:.25; } }
+  #d1 .composer { border-top: var(--line); padding: 12px 16px; background: var(--panel); }
+  #d1 .input { color: var(--muted); padding: 11px 14px; border: var(--line); border-radius: 8px; background: var(--bg); }
+  #d1 .composer-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  #d1 .send { padding: 6px 18px; border-radius: 5px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 12.5px; }
+  #d1 .file { display: flex; gap: 8px; padding: 7px 14px; font-family: var(--mono); font-size: 11.5px; align-items: center; }
+  #d1 .file .st { width: 14px; text-align: center; font-weight: 700; color: var(--accent); }
+  #d1 .file .st.a { color: var(--good); }
+  #d1 .file .delta { margin-left: auto; color: var(--muted); font-size: 10.5px; }
+  #d1 .snippet { margin: 10px 14px; border: var(--line); border-radius: 5px; overflow: hidden; }
+  #d1 .snippet pre { font-size: 10.5px; line-height: 1.7; padding: 8px 10px; overflow-x: auto; background: var(--well); color: var(--muted); }
+
+  #d1 .settings { min-height: 600px; display: grid; grid-template-columns: 200px 1fr; }
+  #d1 .set-nav { border-right: var(--line); padding: 14px 10px; }
+  #d1 .set-nav button { display: block; width: 100%; padding: 8px 12px; margin: 2px 0; font-size: 13px; color: var(--muted); border-radius: 5px; }
+  #d1 .set-nav .cur { background: var(--sel); color: var(--text); }
+  #d1 .set-body { padding: 28px 34px; max-width: 620px; }
+  #d1 .set-body h3 { font-family: var(--mono); font-size: 18px; letter-spacing: .04em; }
+  #d1 .lead { color: var(--muted); font-size: 13px; margin: 4px 0 22px; }
+  #d1 .row { display: flex; align-items: center; gap: 16px; padding: 15px 0; border-bottom: var(--line); }
+  #d1 .row .info { flex: 1; }
+  #d1 .row .t { font-weight: 600; }
+  #d1 .row .d { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+  #d1 .toggle { width: 38px; height: 21px; border-radius: 12px; border: var(--line); background: var(--well); position: relative; flex: none; }
+  #d1 .toggle i { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%; background: var(--muted); transition: .15s; }
+  #d1 .toggle.on { background: var(--accent); }
+  #d1 .toggle.on i { left: 19px; background: var(--on-accent); }
+  #d1 .select { font-family: var(--mono); font-size: 11.5px; padding: 6px 12px; border: var(--line); border-radius: 5px; background: var(--well); }
+  #d1 .acct { display: flex; align-items: center; gap: 14px; padding: 15px 0; border-bottom: var(--line); }
+  #d1 .ava { width: 38px; height: 38px; border-radius: 50%; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; font-weight: 700; font-family: var(--mono); }
+
+  /* ════════════════════════════════════════════════════════════
+     02 · DECK — диспетчерская параллельных агентов
+     ════════════════════════════════════════════════════════════ */
+  #d2 {
+    --bg:#0c111c; --panel:#131a29; --well:#090d16; --text:#dfe6f2; --muted:#7d8aa3;
+    --accent:#5fd0c7; --on-accent:#06231f; --good:#8fd694; --bad:#e08b8b; --amber:#e8c268;
+    --line:1px solid #1f2940;
+    color: var(--text); font-size: 13.5px;
+  }
+  #d2 .win { background: linear-gradient(180deg, #0e1424 0%, #0b0f1a 100%); border: var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 80px rgba(0,0,0,.6); position: relative; }
+
+  #d2 .boot { min-height: 600px; display: flex; flex-direction: column; padding: 56px 64px 0; }
+  #d2 .boot h1 { font-family: var(--mono); font-size: clamp(56px, 9vw, 104px); letter-spacing: .18em; font-weight: 700; line-height: 1; }
+  #d2 .boot h1 span { color: var(--accent); }
+  #d2 .boot .sub { font-family: var(--mono); font-size: 13px; color: var(--muted); letter-spacing: .28em; text-transform: uppercase; margin: 18px 0 40px; }
+  #d2 .bootlog { font-family: var(--mono); font-size: 12px; line-height: 2.1; color: var(--muted); flex: 1; }
+  #d2 .bootlog .k { display: inline-block; width: 26ch; }
+  #d2 .bootlog .ok { color: var(--good); }
+  #d2 .bootlog .warn { color: var(--amber); }
+  #d2 .bootbar { display: flex; align-items: center; gap: 20px; margin: 40px -64px 0; padding: 20px 64px; border-top: var(--line); background: var(--panel); }
+  #d2 .bootbar .cta { flex: 1; display: flex; justify-content: space-between; align-items: center; padding: 14px 22px; border-radius: 8px; background: var(--accent); color: var(--on-accent); font-weight: 700; font-size: 14px; }
+  #d2 .bootbar .cta small { font-weight: 400; opacity: .75; font-family: var(--mono); font-size: 11px; }
+  #d2 .bootbar .note { font-size: 11px; color: var(--muted); max-width: 34ch; line-height: 1.5; }
+
+  #d2 .deck { min-height: 640px; display: flex; flex-direction: column; }
+  #d2 .rail { display: flex; gap: 12px; padding: 16px 20px; border-bottom: var(--line); overflow-x: auto; background: rgba(9,13,22,.6); }
+  #d2 .tcard { flex: 0 0 208px; padding: 12px 14px; border: var(--line); border-radius: 10px; background: var(--panel); }
+  #d2 .tcard.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 8px 24px rgba(95,208,199,.12); }
+  #d2 .tcard .st { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+  #d2 .tcard .st i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); opacity: .5; }
+  #d2 .tcard.active .st { color: var(--good); }
+  #d2 .tcard.active .st i { background: var(--good); opacity: 1; animation: d1p 1.2s infinite; }
+  #d2 .tcard .nm { font-weight: 600; font-size: 13px; margin: 8px 0 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #d2 .tcard .mt { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  #d2 .tcard .bar { height: 3px; border-radius: 2px; background: var(--well); margin-top: 10px; overflow: hidden; }
+  #d2 .tcard .bar i { display: block; height: 100%; background: var(--accent); }
+  #d2 .tcard.new { display: grid; place-items: center; color: var(--muted); font-family: var(--mono); font-size: 11px; border-style: dashed; background: none; }
+  #d2 .stage2 { flex: 1; display: grid; grid-template-columns: 1fr 264px; gap: 0; min-height: 0; }
+  #d2 .flow { padding: 26px 34px 120px; display: flex; flex-direction: column; gap: 18px; border-right: var(--line); }
+  #d2 .umsg { font-size: 14px; line-height: 1.6; max-width: 66ch; padding-left: 14px; border-left: 3px solid var(--accent); }
+  #d2 .umsg small { display: block; font-family: var(--mono); font-size: 9.5px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  #d2 .amsg { max-width: 66ch; line-height: 1.65; color: var(--text); }
+  #d2 .reason2 { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  #d2 .card2 { border: var(--line); border-radius: 10px; background: var(--panel); max-width: 620px; overflow: hidden; }
+  #d2 .card2-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--amber); }
+  #d2 .card2-head .grow2 { flex: 1; }
+  #d2 .card2 pre { font-size: 12.5px; padding: 4px 14px 14px; overflow-x: auto; color: var(--text); }
+  #d2 .card2 .acts { display: flex; gap: 10px; padding: 12px 14px; border-top: var(--line); background: rgba(9,13,22,.4); }
+  #d2 .key { font-family: var(--mono); font-size: 11px; padding: 5px 12px; border-radius: 6px; border: var(--line); color: var(--muted); }
+  #d2 .key b { color: var(--accent); font-weight: 700; margin-right: 6px; }
+  #d2 .key.go { border-color: var(--accent); color: var(--text); }
+  #d2 .telemetry { padding: 20px; display: flex; flex-direction: column; gap: 14px; background: rgba(9,13,22,.4); }
+  #d2 .stat { border: var(--line); border-radius: 10px; padding: 12px 14px; background: var(--panel); }
+  #d2 .stat .l { font-family: var(--mono); font-size: 9.5px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+  #d2 .stat .v { font-family: var(--mono); font-size: 15px; margin-top: 6px; }
+  #d2 .stat .v em { font-style: normal; color: var(--accent); }
+  #d2 .stat .v .plus { color: var(--good); } #d2 .stat .v .minus { color: var(--bad); }
+  #d2 .qa { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; }
+  #d2 .qa button { font-family: var(--mono); font-size: 10.5px; padding: 10px 8px; text-align: center; border: var(--line); border-radius: 8px; color: var(--muted); }
+  #d2 .qa button:hover { color: var(--text); border-color: var(--accent); }
+  #d2 .cmdbar { position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%); width: min(620px, calc(100% - 48px)); display: flex; align-items: center; gap: 12px; padding: 13px 18px; border-radius: 12px; background: rgba(19,26,41,.92); border: 1px solid #2a3652; box-shadow: 0 16px 48px rgba(0,0,0,.55); backdrop-filter: blur(6px); }
+  #d2 .cmdbar .gt { color: var(--accent); font-family: var(--mono); font-weight: 700; }
+  #d2 .cmdbar .ph { flex: 1; color: var(--muted); font-size: 13.5px; }
+  #d2 .cmdbar .chip { font-family: var(--mono); font-size: 10px; color: var(--muted); border: var(--line); border-radius: 6px; padding: 3px 8px; }
+
+  #d2 .setdeck { min-height: 600px; padding: 40px 48px; }
+  #d2 .setdeck h3 { font-family: var(--mono); font-size: 13px; letter-spacing: .3em; text-transform: uppercase; color: var(--muted); margin-bottom: 24px; }
+  #d2 .set-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  #d2 .scard { border: var(--line); border-radius: 12px; background: var(--panel); padding: 18px 20px; }
+  #d2 .scard .sl { font-family: var(--mono); font-size: 9.5px; letter-spacing: .2em; text-transform: uppercase; color: var(--accent); margin-bottom: 14px; }
+  #d2 .srow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #1a2338; font-size: 12.5px; }
+  #d2 .srow:last-child { border-bottom: none; }
+  #d2 .srow .sd { color: var(--muted); font-size: 11px; margin-top: 2px; line-height: 1.45; }
+  #d2 .sw2 { width: 34px; height: 19px; border-radius: 10px; border: var(--line); background: var(--well); position: relative; flex: none; }
+  #d2 .sw2 i { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--muted); transition: .15s; }
+  #d2 .sw2.on { background: var(--accent); }
+  #d2 .sw2.on i { left: 17px; background: var(--on-accent); }
+  #d2 .mono-v { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+  #d2 .signout { font-family: var(--mono); font-size: 10.5px; color: var(--bad); }
+
+  /* ════════════════════════════════════════════════════════════
+     03 · JOURNAL — тред как документ
+     ════════════════════════════════════════════════════════════ */
+  #d3 {
+    --paper:#f6f5ef; --ink:#26291f; --faded:#75786c; --accent:#1e5c48; --rule:#d9d6c8;
+    --good:#2e6b45; --bad:#96412f; --well:#eeece2;
+    color: var(--ink); font-size: 15px; font-family: var(--serif);
+  }
+  #d3 .win { background: var(--paper); border-radius: 4px; overflow: hidden; box-shadow: 0 24px 60px rgba(30,30,20,.45); border: 1px solid #c9c6b8; }
+
+  #d3 .paper { min-height: 620px; display: flex; flex-direction: column; align-items: center; padding: 72px 32px 48px; text-align: center; }
+  #d3 .paper h1 { font-size: 44px; font-weight: 500; font-style: italic; letter-spacing: .06em; }
+  #d3 .paper .rule { width: 220px; border-top: 1px solid var(--ink); margin: 22px 0; position: relative; }
+  #d3 .paper .rule::after { content: "❦"; position: absolute; left: 50%; top: -11px; transform: translateX(-50%); background: var(--paper); padding: 0 12px; color: var(--accent); font-size: 14px; }
+  #d3 .paper .tag { font-family: var(--sans); font-size: 11px; letter-spacing: .3em; text-transform: uppercase; color: var(--faded); }
+  #d3 .paper .body { max-width: 46ch; margin: 36px 0; line-height: 1.75; font-size: 16px; }
+  #d3 .paper .cta3 { font-family: var(--sans); font-size: 13px; font-weight: 600; letter-spacing: .08em; padding: 13px 34px; border: 1.5px solid var(--accent); color: var(--paper); background: var(--accent); border-radius: 2px; }
+  #d3 .paper .cta3:hover { background: #174a3a; }
+  #d3 .colophon { margin-top: auto; padding-top: 40px; font-family: var(--mono); font-size: 10.5px; color: var(--faded); letter-spacing: .06em; }
+
+  #d3 .journal { display: grid; grid-template-columns: 216px 1fr; min-height: 660px; }
+  #d3 .toc { border-right: 1px solid var(--rule); padding: 34px 0 34px 30px; }
+  #d3 .toc .lbl { font-family: var(--sans); font-size: 10px; letter-spacing: .26em; text-transform: uppercase; color: var(--faded); margin-bottom: 16px; }
+  #d3 .toc .prj { font-family: var(--sans); font-size: 11px; letter-spacing: .1em; color: var(--faded); margin: 18px 0 6px; font-variant: small-caps; text-transform: lowercase; font-size: 13px; }
+  #d3 .chap { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; width: 100%; font-family: var(--serif); font-size: 14.5px; color: var(--faded); }
+  #d3 .chap .n { font-family: var(--mono); font-size: 10px; }
+  #d3 .chap.cur { color: var(--ink); }
+  #d3 .chap.cur .n { color: var(--accent); }
+  #d3 .chap.cur .t3 { border-bottom: 2px solid var(--accent); padding-bottom: 1px; }
+  #d3 .chap:hover { color: var(--ink); }
+  #d3 .doc { padding: 0 56px 48px; max-width: 760px; }
+  #d3 .runhead { display: flex; justify-content: space-between; font-family: var(--sans); font-size: 10.5px; letter-spacing: .18em; text-transform: uppercase; color: var(--faded); padding: 22px 0 14px; border-bottom: 1px solid var(--rule); margin-bottom: 34px; }
+  #d3 .doc h2 { font-size: 30px; font-weight: 500; margin-bottom: 8px; text-wrap: balance; }
+  #d3 .byline { font-family: var(--sans); font-size: 12px; color: var(--faded); margin-bottom: 30px; }
+  #d3 .byline em { color: var(--accent); font-style: normal; }
+  #d3 .uq { border-left: 2px solid var(--ink); padding: 4px 0 4px 20px; margin: 26px 0; font-style: italic; font-size: 16px; line-height: 1.7; max-width: 58ch; }
+  #d3 .uq small { display: block; font-family: var(--sans); font-style: normal; font-size: 10px; letter-spacing: .22em; text-transform: uppercase; color: var(--faded); margin-bottom: 6px; }
+  #d3 .prose { line-height: 1.8; max-width: 62ch; margin: 18px 0; }
+  #d3 .prose code { font-size: 12.5px; background: var(--well); padding: 1px 5px; border-radius: 2px; }
+  #d3 .thought { font-family: var(--sans); font-size: 11.5px; color: var(--faded); margin: 20px 0; }
+  #d3 .fig { margin: 30px 0; max-width: 620px; }
+  #d3 .fig .inset { border: 1px solid var(--rule); background: #fbfaf5; border-left: 3px solid var(--accent); }
+  #d3 .fig pre { font-size: 12px; line-height: 1.7; padding: 14px 18px; overflow-x: auto; }
+  #d3 .fig .acts3 { display: flex; gap: 26px; padding: 10px 18px; border-top: 1px solid var(--rule); font-family: var(--sans); font-size: 12px; }
+  #d3 .fig .acts3 button { color: var(--accent); font-weight: 600; letter-spacing: .04em; }
+  #d3 .fig .acts3 button.deny { color: var(--bad); }
+  #d3 .fig .acts3 button:hover { text-decoration: underline; }
+  #d3 .caption { font-family: var(--sans); font-size: 11.5px; color: var(--faded); margin-top: 8px; }
+  #d3 .caption b { color: var(--ink); font-weight: 600; }
+  #d3 .add3 { color: var(--good); } #d3 .del3 { color: var(--bad); }
+  #d3 .writing { margin-top: 44px; border-top: 1px solid var(--rule); padding-top: 26px; display: flex; align-items: baseline; gap: 16px; max-width: 62ch; }
+  #d3 .writing .line { flex: 1; border-bottom: 1px solid var(--ink); padding: 4px 2px; color: var(--faded); font-style: italic; }
+  #d3 .writing .snd { font-family: var(--sans); font-size: 12px; font-weight: 600; letter-spacing: .1em; color: var(--accent); text-transform: uppercase; }
+
+  #d3 .formdoc { min-height: 620px; padding: 56px 32px; display: flex; justify-content: center; }
+  #d3 .form-in { width: min(560px, 100%); }
+  #d3 .formdoc h2 { font-size: 32px; font-weight: 500; text-align: center; }
+  #d3 .formdoc .fsub { text-align: center; font-family: var(--sans); font-size: 12px; color: var(--faded); margin: 8px 0 40px; }
+  #d3 .sec { margin: 30px 0; }
+  #d3 .sec h4 { font-size: 13px; font-family: var(--sans); letter-spacing: .22em; text-transform: uppercase; color: var(--accent); border-bottom: 1px solid var(--rule); padding-bottom: 8px; margin-bottom: 4px; }
+  #d3 .sec h4 .rn { font-family: var(--serif); font-style: italic; text-transform: none; letter-spacing: 0; color: var(--faded); float: right; }
+  #d3 .frow { display: flex; align-items: baseline; gap: 12px; padding: 12px 0; border-bottom: 1px dotted var(--rule); font-size: 14.5px; }
+  #d3 .frow .fl { flex: 1; }
+  #d3 .frow .fd { font-family: var(--sans); font-size: 11.5px; color: var(--faded); margin-top: 3px; line-height: 1.5; }
+  #d3 .frow .fv { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  #d3 .cbx { font-family: var(--mono); font-size: 15px; color: var(--accent); width: 26px; }
+  #d3 .lnk { font-family: var(--sans); font-size: 12px; color: var(--bad); letter-spacing: .04em; }
+  #d3 .lnk:hover { text-decoration: underline; }
+  #d3 .swrow { display: flex; gap: 8px; padding: 12px 0; }
+  #d3 .swatch3 { width: 40px; height: 40px; border-radius: 2px; border: 1px solid var(--rule); position: relative; }
+  #d3 .swatch3.cur::after { content: "✓"; position: absolute; inset: 0; display: grid; place-items: center; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.6); }
+
+  /* ════════════════════════════════════════════════════════════
+     04 · MOSAIC — tmux-мозаика, всё видно сразу
+     ════════════════════════════════════════════════════════════ */
+  #d4 {
+    --bg:#050505; --text:#d8d5c8; --dim:#77746a; --amber:#ffb000; --good:#8be26a; --bad:#ff6a4d;
+    --bord:#3a382f; --focus:#ffb000;
+    color: var(--text); font-family: var(--mono); font-size: 12.5px;
+  }
+  #d4 .win { background: var(--bg); border: 1px solid var(--bord); overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,.7); }
+
+  #d4 .tui { min-height: 600px; display: grid; place-items: center; padding: 40px 20px; position: relative; }
+  #d4 .tui-box { width: min(460px, 100%); border: 3px double var(--amber); padding: 26px 30px; background: #0a0a08; }
+  #d4 .tui-title { text-align: center; color: var(--amber); letter-spacing: .3em; font-weight: 700; margin-bottom: 4px; }
+  #d4 .tui-sub { text-align: center; color: var(--dim); font-size: 11px; margin-bottom: 26px; }
+  #d4 .tui-row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; font-size: 12px; }
+  #d4 .tui-row .lab { color: var(--dim); }
+  #d4 .tui-row .ok4 { color: var(--good); }
+  #d4 .tui-row .off { color: var(--bad); }
+  #d4 .tui-btn { display: block; width: 100%; text-align: center; margin: 26px 0 8px; padding: 12px; background: var(--amber); color: #1a1200; font-weight: 700; letter-spacing: .1em; }
+  #d4 .tui-btn:hover { background: #ffc233; }
+  #d4 .tui-note { text-align: center; color: var(--dim); font-size: 10.5px; line-height: 1.7; margin-top: 14px; }
+  #d4 .keybar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: 2px; padding: 0; background: #0d0d0a; border-top: 1px solid var(--bord); font-size: 11px; }
+  #d4 .keybar span { padding: 6px 12px; color: var(--dim); }
+  #d4 .keybar span b { color: var(--amber); font-weight: 400; margin-right: 6px; }
+
+  #d4 .statusbar { display: flex; gap: 0; background: #0d0d0a; border-bottom: 1px solid var(--bord); font-size: 11px; }
+  #d4 .statusbar .sess { background: var(--amber); color: #1a1200; padding: 5px 12px; font-weight: 700; }
+  #d4 .statusbar .wins { padding: 5px 10px; color: var(--dim); }
+  #d4 .statusbar .wins b { color: var(--text); font-weight: 400; }
+  #d4 .statusbar .right4 { margin-left: auto; padding: 5px 12px; color: var(--dim); }
+  #d4 .statusbar .right4 em { font-style: normal; color: var(--amber); }
+  #d4 .mosaic { display: grid; grid-template-columns: 300px 1fr; grid-template-rows: 300px 300px; }
+  #d4 .tpane { border-right: 1px solid var(--bord); border-bottom: 1px solid var(--bord); display: flex; flex-direction: column; min-width: 0; }
+  #d4 .tpane:nth-child(2), #d4 .tpane:nth-child(4) { border-right: none; }
+  #d4 .tpane:nth-child(3), #d4 .tpane:nth-child(4) { border-bottom: none; }
+  #d4 .tpane.focus4 { box-shadow: inset 0 0 0 1px var(--focus); }
+  #d4 .thead { display: flex; justify-content: space-between; padding: 5px 10px; font-size: 10.5px; color: var(--dim); background: #0d0d0a; border-bottom: 1px solid var(--bord); }
+  #d4 .tpane.focus4 .thead { color: #1a1200; background: var(--amber); }
+  #d4 .tbody { flex: 1; padding: 8px 10px; overflow: hidden; line-height: 1.75; font-size: 11.5px; }
+  #d4 .trow { display: flex; gap: 8px; padding: 1px 0; color: var(--dim); width: 100%; }
+  #d4 .trow.cur4 { color: var(--text); background: #16150f; }
+  #d4 .trow .m4 { color: var(--amber); width: 12px; }
+  #d4 .trow .r4 { margin-left: auto; font-size: 10px; }
+  #d4 .trow .run4 { color: var(--good); }
+  #d4 .u4 { color: var(--amber); }
+  #d4 .a4 { color: var(--text); }
+  #d4 .dim4 { color: var(--dim); }
+  #d4 .ask4 { color: var(--amber); }
+  #d4 .ask4 b { color: var(--good); font-weight: 400; }
+  #d4 .ask4 s { color: var(--bad); text-decoration: none; }
+  #d4 .prompt4 { border-top: 1px solid var(--bord); padding: 7px 10px; color: var(--dim); }
+  #d4 .prompt4 b { color: var(--good); font-weight: 400; }
+  #d4 .cursor4 { display: inline-block; width: 7px; height: 13px; background: var(--amber); vertical-align: text-bottom; animation: d4b 1s steps(2) infinite; }
+  @keyframes d4b { 50% { opacity: 0; } }
+  #d4 .g4 { color: var(--good); } #d4 .b4 { color: var(--bad); }
+
+  #d4 .tomlview { min-height: 600px; display: flex; flex-direction: column; }
+  #d4 .toml { flex: 1; display: flex; padding: 14px 0; overflow-x: auto; }
+  #d4 .lns { text-align: right; padding: 0 14px; color: #4a4840; user-select: none; font-size: 12px; line-height: 1.9; }
+  #d4 .src { flex: 1; font-size: 12px; line-height: 1.9; padding-right: 20px; white-space: pre; }
+  #d4 .src .sec4 { color: var(--amber); }
+  #d4 .src .key4 { color: var(--text); }
+  #d4 .src .str4 { color: var(--good); }
+  #d4 .src .cm4 { color: #4a4840; }
+  #d4 .src button.bool4 { color: #6ac2ff; font-family: var(--mono); font-size: 12px; padding: 0 2px; background: #12110c; }
+  #d4 .src button.bool4:hover { background: #1d1b12; }
+  #d4 .modeline { display: flex; justify-content: space-between; background: #0d0d0a; border-top: 1px solid var(--bord); padding: 5px 12px; font-size: 11px; color: var(--dim); }
+  #d4 .modeline b { color: var(--amber); font-weight: 400; }
+
+  @media (max-width: 980px) {
+    #d1 .workspace { grid-template-columns: 200px 1fr; } #d1 .pane.changes { display: none; }
+    #d2 .stage2 { grid-template-columns: 1fr; } #d2 .telemetry { display: none; }
+    #d3 .journal { grid-template-columns: 1fr; } #d3 .toc { display: none; }
+    #d4 .mosaic { grid-template-columns: 1fr; grid-template-rows: auto; }
+    #d4 .tpane { border-right: none !important; border-bottom: 1px solid var(--bord) !important; min-height: 220px; }
+  }
+  @media (max-width: 720px) {
+    .stage { padding: 12px; }
+    #d1 .workspace, #d1 .settings { grid-template-columns: 1fr; }
+    #d1 .pane.sidebar, #d1 .set-nav { display: none; }
+    #d2 .boot { padding: 36px 28px 0; } #d2 .bootbar { margin: 30px -28px 0; padding: 16px 28px; flex-wrap: wrap; }
+    #d3 .doc { padding: 0 22px 40px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wordmark">RODE<small>Design directions · 2026</small></div>
+  <nav class="tabs" id="dirTabs" aria-label="Направление">
+    <button data-d="d1" aria-selected="true"><span class="num">01</span>Panel</button>
+    <button data-d="d2" aria-selected="false"><span class="num">02</span>Deck</button>
+    <button data-d="d3" aria-selected="false"><span class="num">03</span>Journal</button>
+    <button data-d="d4" aria-selected="false"><span class="num">04</span>Mosaic</button>
+  </nav>
+  <nav class="tabs screen-tabs" id="viewTabs" aria-label="Экран">
+    <button data-v="login" aria-selected="true">Login</button>
+    <button data-v="workspace" aria-selected="false">Workspace</button>
+    <button data-v="settings" aria-selected="false">Settings</button>
+  </nav>
+  <div class="hint">клавиши 1–4 — направление · ←→ — экран</div>
+</header>
+
+<section class="intro on" data-for="d1">
+  <h2><span class="num">01</span>Panel — трёхпанельная IDE</h2>
+  <p>Консервативная точка отсчёта: сайдбар проектов и тредов слева, лента агента в центре, панель изменений справа. Всё как в Zed/VS Code — нулевой порог входа, но и нулевая новизна.</p>
+</section>
+<section class="intro" data-for="d2">
+  <h2><span class="num">02</span>Deck — диспетчерская агентов</h2>
+  <p>Rode как пульт управления параллельными агентами: треды — горизонтальная лента карточек со статусами и прогрессом, ниже сцена фокуса с телеметрией, ввод — плавающая командная строка. Логин — экран загрузки системы.</p>
+</section>
+<section class="intro" data-for="d3">
+  <h2><span class="num">03</span>Journal — тред как документ</h2>
+  <p>Разговор с агентом читается как статья: одна колонка текста, оглавление тредов на полях, команды и диффы — «фигуры» с подписями, approve — текстовые ссылки. Логин — фирменный бланк. Ни одной «панели» вообще.</p>
+</section>
+<section class="intro" data-for="d4">
+  <h2><span class="num">04</span>Mosaic — терминальная мозаика</h2>
+  <p>Всё видно одновременно, как в tmux: треды, лента агента, живой терминал и дифф — четыре тайла с 1px-рамками, статусбар, управление с клавиатуры. Логин — TUI-диалог, настройки — прямое редактирование rode.toml.</p>
+</section>
+
+<main class="stage">
+
+  <!-- ═══════════════ 01 · PANEL ═══════════════ -->
+  <div class="dir on" id="d1">
+    <div class="win">
+      <div class="titlebar"><span class="dots"><i></i><i></i><i></i></span><b>RODE</b><span class="path">~/Personal/Rode · wayland · vulkan</span></div>
+
+      <section class="view login on" data-view="login">
+        <div class="login-card">
+          <h1>RODE</h1>
+          <p class="sub">Native control plane for Codex</p>
+          <div class="login-status"><span>codex 0.46 · /usr/bin/codex</span><span class="ok">detected ✓</span></div>
+          <button class="cta">Sign in with ChatGPT</button>
+          <p class="fine">Codex owns the OAuth flow and token storage.<br>Rode only receives your account email and plan.</p>
+        </div>
+      </section>
+
+      <section class="view workspace" data-view="workspace">
+        <aside class="pane sidebar">
+          <div class="pane-head"><span>Projects</span><button aria-label="Новый тред">＋</button></div>
+          <div class="proj-name">rode</div>
+          <button class="thread active"><i class="run"></i>Desktop staging fix</button>
+          <button class="thread"><i></i>Split diff renderer</button>
+          <button class="thread"><i></i>Wayland IME probe<span class="wt">⎇ wt</span></button>
+          <div class="proj-name">dotfiles</div>
+          <button class="thread"><i></i>Migrate zsh config</button>
+        </aside>
+        <div class="pane convo">
+          <div class="convo-top">
+            <span class="t">Desktop staging fix</span>
+            <span class="pill br">⎇ master ↑1 ·3</span>
+            <span class="grow"></span>
+            <button class="ghost">Terminal ⌃J</button><button class="ghost">Commit</button><button class="ghost">PR</button>
+          </div>
+          <div class="feed">
+            <div class="msg user">Move the desktop staging step out of the dependency build so packaging doesn't rebuild gpui every time.</div>
+            <div class="reason">Thought for 12s — traced staging target, checked cargo build graph</div>
+            <div class="msg"><div class="who">Codex</div>The staging step is wired into <code>build.rs</code>, which invalidates the dependency cache. I'll split it into a separate script called from the packaging target only.</div>
+            <div class="card">
+              <div class="card-head"><span class="tag">command</span><span>requires approval · workspace-write</span></div>
+              <pre>cargo build --release --no-default-features --features wayland</pre>
+              <div class="card-actions"><button class="mini yes">Allow once</button><button class="mini">Always allow</button><button class="mini">Deny</button></div>
+            </div>
+            <div class="card">
+              <div class="card-head"><span class="tag">file change</span><span>src/main.rs · +24 −7</span></div>
+              <pre><span class="del">-    stage_desktop_files(&amp;build_dir)?;</span>
+<span class="add">+    // staging moved to packaging/stage.sh</span>
+<span class="add">+    write_desktop_entry(&amp;out_dir)?;</span></pre>
+            </div>
+            <div class="stream"><i></i>running · turn 3 · esc to interrupt</div>
+          </div>
+          <div class="composer">
+            <div class="input">Message Codex — describe the next change…</div>
+            <div class="composer-row"><span class="pill">gpt-5-codex</span><span class="pill">workspace-write</span><span class="grow"></span><button class="send">Send ⏎</button></div>
+          </div>
+        </div>
+        <aside class="pane changes">
+          <div class="pane-head"><span>Changes</span><span>2 files</span></div>
+          <div class="file"><span class="st">M</span>src/main.rs<span class="delta">+24 −7</span></div>
+          <div class="file"><span class="st a">A</span>packaging/stage.sh<span class="delta">+31</span></div>
+          <div class="snippet"><pre>@@ -142,7 +142,8 @@
+ fn install() {
+-  stage_desktop(dir)
++  desktop_entry(out)
+ }</pre></div>
+        </aside>
+      </section>
+
+      <section class="view settings" data-view="settings">
+        <div class="settings">
+          <nav class="set-nav">
+            <button class="cur">Appearance</button><button>Threads</button><button>Agent</button><button>Account</button>
+          </nav>
+          <div class="set-body">
+            <h3>Settings</h3>
+            <p class="lead">Stored in SQLite next to your projects and threads.</p>
+            <div class="acct">
+              <span class="ava">0x</span>
+              <div><div class="t">0xactor@gmail.com</div><div class="d">ChatGPT Pro · via codex app-server</div></div>
+              <span class="grow"></span><button class="ghost">Sign out</button>
+            </div>
+            <div class="row">
+              <div class="info"><div class="t">Isolated worktree</div><div class="d">New threads get their own Git worktree at <code>rode/&lt;thread&gt;-&lt;slug&gt;</code>.</div></div>
+              <button class="toggle on" data-toggle aria-pressed="true" aria-label="Isolated worktree"><i></i></button>
+            </div>
+            <div class="row">
+              <div class="info"><div class="t">Sandbox</div><div class="d">Default execution policy for agent commands.</div></div>
+              <span class="select">workspace-write ▾</span>
+            </div>
+            <div class="row">
+              <div class="info"><div class="t">Desktop notifications</div><div class="d">Notify when a Codex turn finishes while unfocused.</div></div>
+              <button class="toggle on" data-toggle aria-pressed="true" aria-label="Notifications"><i></i></button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 02 · DECK ═══════════════ -->
+  <div class="dir" id="d2">
+    <div class="win">
+
+      <section class="view boot on" data-view="login">
+        <h1>RO<span>DE</span></h1>
+        <p class="sub">Control plane · online</p>
+        <div class="bootlog">
+          <div><span class="k">wayland compositor</span><span class="ok">connected · hyprland</span></div>
+          <div><span class="k">vulkan renderer</span><span class="ok">ok · radv</span></div>
+          <div><span class="k">codex binary</span><span class="ok">0.46 · /usr/bin/codex</span></div>
+          <div><span class="k">codex app-server</span><span class="ok">handshake ok</span></div>
+          <div><span class="k">account</span><span class="warn">signed out — authentication required</span></div>
+        </div>
+        <div class="bootbar">
+          <button class="cta">Sign in with ChatGPT<small>codex app-server → managed OAuth</small></button>
+          <p class="note">Codex owns the OAuth flow and tokens. Rode only receives your email and plan.</p>
+        </div>
+      </section>
+
+      <section class="view deck" data-view="workspace">
+        <div class="rail">
+          <div class="tcard active">
+            <div class="st"><i></i>running · turn 3</div>
+            <div class="nm">Desktop staging fix</div>
+            <div class="mt">rode · gpt-5-codex</div>
+            <div class="bar"><i style="width:62%"></i></div>
+          </div>
+          <div class="tcard">
+            <div class="st"><i></i>waiting approval</div>
+            <div class="nm">Split diff renderer</div>
+            <div class="mt">rode · gpt-5-codex</div>
+            <div class="bar"><i style="width:38%; background:var(--amber)"></i></div>
+          </div>
+          <div class="tcard">
+            <div class="st"><i></i>idle</div>
+            <div class="nm">Wayland IME probe</div>
+            <div class="mt">rode · ⎇ worktree</div>
+            <div class="bar"><i style="width:0"></i></div>
+          </div>
+          <div class="tcard">
+            <div class="st"><i></i>idle</div>
+            <div class="nm">Migrate zsh config</div>
+            <div class="mt">dotfiles</div>
+            <div class="bar"><i style="width:0"></i></div>
+          </div>
+          <button class="tcard new">+ new thread</button>
+        </div>
+        <div class="stage2">
+          <div class="flow">
+            <div class="umsg"><small>you · 14:31</small>Move the desktop staging step out of the dependency build so packaging doesn't rebuild gpui every time.</div>
+            <div class="reason2">⟳ thought for 12s · traced staging target · checked cargo graph</div>
+            <p class="amsg">The staging step is wired into <code>build.rs</code>, which invalidates the dependency cache. I'll split it into a separate script called from the packaging target only.</p>
+            <div class="card2">
+              <div class="card2-head">⚠ approval required<span class="grow2"></span>workspace-write</div>
+              <pre>$ cargo build --release --no-default-features --features wayland</pre>
+              <div class="acts"><button class="key go"><b>Y</b>allow once</button><button class="key"><b>A</b>always</button><button class="key"><b>N</b>deny</button></div>
+            </div>
+          </div>
+          <aside class="telemetry">
+            <div class="stat"><div class="l">branch</div><div class="v"><em>⎇ master</em> ↑1 ·3</div></div>
+            <div class="stat"><div class="l">changes</div><div class="v"><span class="plus">+55</span> <span class="minus">−7</span> · 2 files</div></div>
+            <div class="stat"><div class="l">sandbox</div><div class="v">workspace-write</div></div>
+            <div class="stat"><div class="l">session</div><div class="v">turn 3 · 41s</div></div>
+            <div class="qa">
+              <button>terminal ⌃J</button><button>commit</button><button>pull request</button><button>interrupt esc</button>
+            </div>
+          </aside>
+        </div>
+        <div class="cmdbar"><span class="gt">›</span><span class="ph">Message Codex, or ⌘K for commands…</span><span class="chip">gpt-5-codex</span><span class="chip">⏎ send</span></div>
+      </section>
+
+      <section class="view setdeck" data-view="settings">
+        <h3>/// settings</h3>
+        <div class="set-grid">
+          <div class="scard">
+            <div class="sl">account</div>
+            <div class="srow"><div>0xactor@gmail.com<div class="sd">ChatGPT Pro · via codex app-server</div></div><button class="signout">sign out</button></div>
+            <div class="srow"><div>Model<div class="sd">Default for new threads</div></div><span class="mono-v">gpt-5-codex</span></div>
+          </div>
+          <div class="scard">
+            <div class="sl">threads</div>
+            <div class="srow"><div>Isolated worktree<div class="sd">rode/&lt;thread&gt;-&lt;slug&gt; per new thread</div></div><button class="sw2 on" data-toggle aria-pressed="true" aria-label="Isolated worktree"><i></i></button></div>
+            <div class="srow"><div>Keep finished threads<div class="sd">Archive instead of delete</div></div><button class="sw2 on" data-toggle aria-pressed="true" aria-label="Keep threads"><i></i></button></div>
+          </div>
+          <div class="scard">
+            <div class="sl">agent</div>
+            <div class="srow"><div>Sandbox<div class="sd">Execution policy for commands</div></div><span class="mono-v">workspace-write</span></div>
+            <div class="srow"><div>Notifications<div class="sd">On turn finish, when unfocused</div></div><button class="sw2 on" data-toggle aria-pressed="true" aria-label="Notifications"><i></i></button></div>
+          </div>
+          <div class="scard">
+            <div class="sl">terminal</div>
+            <div class="srow"><div>Shell<div class="sd">Host terminal per thread</div></div><span class="mono-v">$SHELL · zsh</span></div>
+            <div class="srow"><div>Open in workspace<div class="sd">Start in the thread's worktree</div></div><button class="sw2 on" data-toggle aria-pressed="true" aria-label="Open in workspace"><i></i></button></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 03 · JOURNAL ═══════════════ -->
+  <div class="dir" id="d3">
+    <div class="win">
+
+      <section class="view paper on" data-view="login">
+        <h1>Rode</h1>
+        <div class="rule"></div>
+        <p class="tag">A native control plane for Codex</p>
+        <p class="body">Sign in with your ChatGPT account to open your projects. Codex keeps the keys; Rode keeps the record — every thread, every change, every decision, on paper.</p>
+        <button class="cta3">Sign in with ChatGPT</button>
+        <p class="colophon">codex 0.46 — /usr/bin/codex · wayland · vulkan · set in Rust &amp; GPUI</p>
+      </section>
+
+      <section class="view journal" data-view="workspace">
+        <aside class="toc">
+          <div class="lbl">Contents</div>
+          <div class="prj">rode</div>
+          <button class="chap cur"><span class="n">01</span><span class="t3">Desktop staging fix</span></button>
+          <button class="chap"><span class="n">02</span><span class="t3">Split diff renderer</span></button>
+          <button class="chap"><span class="n">03</span><span class="t3">Wayland IME probe</span></button>
+          <div class="prj">dotfiles</div>
+          <button class="chap"><span class="n">04</span><span class="t3">Migrate zsh config</span></button>
+        </aside>
+        <div class="doc">
+          <div class="runhead"><span>rode — thread 01</span><span>⎇ master ↑1 ·3</span></div>
+          <h2>Desktop staging fix</h2>
+          <p class="byline">gpt-5-codex · workspace-write · turn 3 · <em>running</em></p>
+          <blockquote class="uq"><small>you</small>Move the desktop staging step out of the dependency build so packaging doesn't rebuild gpui every time.</blockquote>
+          <p class="thought">— considered for 12 seconds: traced the staging target, checked the cargo build graph —</p>
+          <p class="prose">The staging step is wired into <code>build.rs</code>, which invalidates the dependency cache on every packaging run. I'll split it into a separate script and call it from the packaging target only.</p>
+          <figure class="fig">
+            <div class="inset">
+              <pre>cargo build --release --no-default-features --features wayland</pre>
+              <div class="acts3"><button>Allow once</button><button>Always allow</button><button class="deny">Deny</button></div>
+            </div>
+            <figcaption class="caption"><b>Command 1.</b> Awaiting approval — sandbox: workspace-write.</figcaption>
+          </figure>
+          <figure class="fig">
+            <div class="inset">
+              <pre><span class="del3">-  stage_desktop_files(&amp;build_dir)?;</span>
+<span class="add3">+  // staging moved to packaging/stage.sh</span>
+<span class="add3">+  write_desktop_entry(&amp;out_dir)?;</span></pre>
+            </div>
+            <figcaption class="caption"><b>Change 1.</b> src/main.rs, +24 −7 — staging extracted from the build script.</figcaption>
+          </figure>
+          <div class="writing"><span class="line">Continue the thread…</span><button class="snd">Send</button></div>
+        </div>
+      </section>
+
+      <section class="view formdoc" data-view="settings">
+        <div class="form-in">
+          <h2>Settings</h2>
+          <p class="fsub">Kept in SQLite, beside your projects and threads.</p>
+          <div class="sec">
+            <h4>Account<span class="rn">i.</span></h4>
+            <div class="frow"><div class="fl">0xactor@gmail.com<div class="fd">ChatGPT Pro, via codex app-server. Rode never sees your tokens.</div></div><button class="lnk">sign out</button></div>
+          </div>
+          <div class="sec">
+            <h4>Threads<span class="rn">ii.</span></h4>
+            <div class="frow"><button class="cbx" data-cbx aria-pressed="true">☒</button><div class="fl">Isolated worktree<div class="fd">Every new thread gets its own Git worktree at rode/&lt;thread&gt;-&lt;slug&gt;.</div></div></div>
+            <div class="frow"><button class="cbx" data-cbx aria-pressed="true">☒</button><div class="fl">Keep finished threads<div class="fd">Archive completed threads instead of deleting them.</div></div></div>
+          </div>
+          <div class="sec">
+            <h4>Agent<span class="rn">iii.</span></h4>
+            <div class="frow"><div class="fl">Sandbox<div class="fd">Execution policy for agent commands.</div></div><span class="fv">workspace-write</span></div>
+            <div class="frow"><button class="cbx" data-cbx aria-pressed="true">☒</button><div class="fl">Desktop notifications<div class="fd">When a turn finishes while the window is unfocused.</div></div></div>
+          </div>
+          <div class="sec">
+            <h4>Appearance<span class="rn">iv.</span></h4>
+            <div class="swrow">
+              <span class="swatch3" style="background:#16191f"></span>
+              <span class="swatch3" style="background:#131a29"></span>
+              <span class="swatch3 cur" style="background:#f6f5ef"></span>
+              <span class="swatch3" style="background:#050505"></span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 04 · MOSAIC ═══════════════ -->
+  <div class="dir" id="d4">
+    <div class="win">
+
+      <section class="view tui on" data-view="login">
+        <div class="tui-box">
+          <div class="tui-title">RODE</div>
+          <div class="tui-sub">control plane for codex // sign in</div>
+          <div class="tui-row"><span class="lab">codex</span><span class="ok4">0.46 · /usr/bin/codex [ok]</span></div>
+          <div class="tui-row"><span class="lab">app-server</span><span class="ok4">handshake [ok]</span></div>
+          <div class="tui-row"><span class="lab">wayland / vulkan</span><span class="ok4">hyprland / radv [ok]</span></div>
+          <div class="tui-row"><span class="lab">account</span><span class="off">signed out</span></div>
+          <button class="tui-btn">[ SIGN IN WITH CHATGPT ]</button>
+          <p class="tui-note">codex owns oauth + tokens<br>rode receives email + plan only</p>
+        </div>
+        <div class="keybar"><span><b>enter</b>sign in</span><span><b>q</b>quit</span><span><b>?</b>about</span></div>
+      </section>
+
+      <section class="view" data-view="workspace">
+        <div class="statusbar">
+          <span class="sess">rode</span>
+          <span class="wins">0:threads <b>1:convo*</b> 2:term 3:diff</span>
+          <span class="right4">⎇ master ↑1 ·3 │ ws-write │ <em>turn 3 · running</em> │ 14:32</span>
+        </div>
+        <div class="mosaic">
+          <div class="tpane">
+            <div class="thead"><span>[0] threads</span><span>rode +1</span></div>
+            <div class="tbody">
+              <div class="dim4">— rode —</div>
+              <button class="trow cur4"><span class="m4">▶</span>desktop-staging-fix<span class="r4 run4">run</span></button>
+              <button class="trow"><span class="m4"> </span>split-diff-renderer<span class="r4">idle</span></button>
+              <button class="trow"><span class="m4"> </span>wayland-ime-probe<span class="r4">⎇wt</span></button>
+              <div class="dim4">— dotfiles —</div>
+              <button class="trow"><span class="m4"> </span>migrate-zsh-config<span class="r4">idle</span></button>
+              <div class="dim4" style="margin-top:6px">[n] new · [d] archive</div>
+            </div>
+          </div>
+          <div class="tpane focus4">
+            <div class="thead"><span>[1] convo — desktop-staging-fix</span><span>gpt-5-codex</span></div>
+            <div class="tbody">
+              <div class="u4">you│ move desktop staging out of the dependency build —</div>
+              <div class="u4">   │ packaging keeps rebuilding gpui</div>
+              <div class="dim4">…thought 12s: traced staging target, checked cargo graph</div>
+              <div class="a4">cdx│ staging is wired into build.rs and invalidates the</div>
+              <div class="a4">   │ cache. splitting into packaging/stage.sh.</div>
+              <div class="ask4">?  │ run: cargo build --release --features wayland</div>
+              <div class="ask4">   │ approve? <b>[y]es</b> [a]lways <s>[n]o</s> · ws-write</div>
+            </div>
+            <div class="prompt4"><b>›</b> message codex…<span class="cursor4"></span></div>
+          </div>
+          <div class="tpane">
+            <div class="thead"><span>[2] term — zsh</span><span>~/Personal/Rode</span></div>
+            <div class="tbody">
+              <div><span class="g4">➜ Rode</span> git status -sb</div>
+              <div class="dim4">## master...origin/master [ahead 1]</div>
+              <div class="dim4"> M src/main.rs</div>
+              <div><span class="g4">➜ Rode</span> cargo check -q</div>
+              <div class="dim4">Finished dev [unoptimized] in 4.2s</div>
+              <div><span class="g4">➜ Rode</span> <span class="cursor4"></span></div>
+            </div>
+          </div>
+          <div class="tpane">
+            <div class="thead"><span>[3] diff — src/main.rs</span><span>+24 −7</span></div>
+            <div class="tbody">
+              <div class="dim4">@@ -142,7 +142,8 @@ fn install()</div>
+              <div class="b4">-    stage_desktop_files(&amp;build_dir)?;</div>
+              <div class="g4">+    // staging moved to packaging/stage.sh</div>
+              <div class="g4">+    write_desktop_entry(&amp;out_dir)?;</div>
+              <div class="dim4">packaging/stage.sh (new, +31)</div>
+              <div class="dim4">[c] commit · [p] push · [r] pull-request</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view tomlview" data-view="settings">
+        <div class="statusbar">
+          <span class="sess">rode</span>
+          <span class="wins">settings — <b>rode.toml</b></span>
+          <span class="right4">sqlite-backed │ live reload</span>
+        </div>
+        <div class="toml">
+          <div class="lns">1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10<br>11<br>12<br>13<br>14<br>15<br>16<br>17</div>
+          <pre class="src"><span class="cm4"># rode.toml — click a value to change it</span>
+
+<span class="sec4">[account]</span>
+<span class="key4">email</span> = <span class="str4">"0xactor@gmail.com"</span>   <span class="cm4"># ChatGPT Pro, via codex app-server</span>
+<span class="key4">model</span> = <span class="str4">"gpt-5-codex"</span>
+
+<span class="sec4">[threads]</span>
+<span class="key4">isolated_worktree</span> = <button class="bool4" data-bool>true</button>    <span class="cm4"># rode/&lt;thread&gt;-&lt;slug&gt;</span>
+<span class="key4">keep_finished</span> = <button class="bool4" data-bool>true</button>
+
+<span class="sec4">[agent]</span>
+<span class="key4">sandbox</span> = <span class="str4">"workspace-write"</span>
+<span class="key4">notifications</span> = <button class="bool4" data-bool>true</button>
+
+<span class="sec4">[terminal]</span>
+<span class="key4">shell</span> = <span class="str4">"$SHELL"</span>              <span class="cm4"># zsh, opens in thread workspace</span>
+<span class="key4">open_key</span> = <span class="str4">"ctrl+j"</span></pre>
+        </div>
+        <div class="modeline"><span><b>:w</b> saved to sqlite</span><span>toml │ utf-8 │ 17 lines</span></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+(function () {
+  var dirTabs = document.getElementById("dirTabs");
+  var viewTabs = document.getElementById("viewTabs");
+  var dirs = ["d1", "d2", "d3", "d4"];
+  var views = ["login", "workspace", "settings"];
+  var curView = "login";
+
+  function setDir(d) {
+    dirs.forEach(function (id) {
+      document.getElementById(id).classList.toggle("on", id === d);
+    });
+    dirTabs.querySelectorAll("button").forEach(function (b) {
+      b.setAttribute("aria-selected", String(b.dataset.d === d));
+    });
+    document.querySelectorAll(".intro").forEach(function (s) {
+      s.classList.toggle("on", s.dataset.for === d);
+    });
+  }
+
+  function setView(v) {
+    curView = v;
+    viewTabs.querySelectorAll("button").forEach(function (b) {
+      b.setAttribute("aria-selected", String(b.dataset.v === v));
+    });
+    document.querySelectorAll(".view").forEach(function (s) {
+      s.classList.toggle("on", s.dataset.view === v);
+    });
+  }
+
+  dirTabs.addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (b) setDir(b.dataset.d);
+  });
+  viewTabs.addEventListener("click", function (e) {
+    var b = e.target.closest("button");
+    if (b) setView(b.dataset.v);
+  });
+
+  document.addEventListener("click", function (e) {
+    var t = e.target.closest("[data-toggle]");
+    if (t) {
+      t.classList.toggle("on");
+      t.setAttribute("aria-pressed", t.classList.contains("on"));
+      return;
+    }
+    var c = e.target.closest("[data-cbx]");
+    if (c) {
+      var on = c.textContent === "☒";
+      c.textContent = on ? "☐" : "☒";
+      c.setAttribute("aria-pressed", String(!on));
+      return;
+    }
+    var b = e.target.closest("[data-bool]");
+    if (b) b.textContent = b.textContent === "true" ? "false" : "true";
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (/^[1-4]$/.test(e.key)) { setDir("d" + e.key); return; }
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      var j = views.indexOf(curView) + (e.key === "ArrowRight" ? 1 : -1);
+      setView(views[(j + views.length) % views.length]);
+    }
+  });
+})();
+</script>
+</body>
+</html>
