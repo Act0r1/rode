@@ -32,6 +32,7 @@ use crate::git::{
     list_local_branches, load_git_history, push_current_branch, switch_local_branch,
 };
 use crate::notifications;
+use crate::perf::{SlowOperation, UI_STALL_THRESHOLD};
 use crate::persistence::{
     StateStore, StoredMessage, StoredProject, StoredThread, now_ms, persist_clipboard_image,
 };
@@ -1997,9 +1998,15 @@ impl RodeApp {
                         Err(_) => break,
                     }
                 }
+                let batch_len = batch.len();
                 if this
                     .update(cx, |this, cx| {
                         if this.session_generation == generation {
+                            let _timing = SlowOperation::new(
+                                "ui.codex_event_batch",
+                                UI_STALL_THRESHOLD,
+                                format!("events={batch_len}"),
+                            );
                             for event in batch {
                                 this.handle_codex_event(event, cx);
                             }

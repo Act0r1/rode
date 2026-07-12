@@ -5,6 +5,8 @@ use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::perf::{PROCESS_THRESHOLD, SlowOperation};
+
 #[derive(Clone, Debug, Default)]
 pub struct RepoSnapshot {
     pub is_repository: bool,
@@ -61,6 +63,14 @@ pub fn create_thread_worktree(
     title: &str,
     base_branch: &str,
 ) -> Result<ThreadWorktree> {
+    let _timing = SlowOperation::new(
+        "git.create_worktree",
+        PROCESS_THRESHOLD,
+        format!(
+            "repository={} base_branch={base_branch}",
+            repository.display()
+        ),
+    );
     create_thread_worktree_at(
         repository,
         thread_id,
@@ -152,6 +162,11 @@ pub fn list_local_branches(repository: &Path) -> Result<Vec<String>> {
 }
 
 pub fn load_git_history(repository: &Path) -> Result<GitHistory> {
+    let _timing = SlowOperation::new(
+        "git.load_history",
+        PROCESS_THRESHOLD,
+        format!("repository={}", repository.display()),
+    );
     let root = repository_root(repository)?;
     let current = git_output(&root, &["branch", "--show-current"]).unwrap_or_default();
     let occupancy = worktree_branch_occupancy(&root)?;
@@ -244,6 +259,11 @@ pub fn load_git_history(repository: &Path) -> Result<GitHistory> {
 }
 
 pub fn switch_local_branch(repository: &Path, branch: &str) -> Result<()> {
+    let _timing = SlowOperation::new(
+        "git.switch_branch",
+        PROCESS_THRESHOLD,
+        format!("repository={} branch={branch}", repository.display()),
+    );
     let root = repository_root(repository)?;
     let branch = branch.trim();
     if branch.is_empty()
@@ -322,6 +342,11 @@ pub fn remove_thread_worktree(repository: &Path, worktree: &ThreadWorktree) -> R
 }
 
 pub fn commit_all(repository: &Path, message: &str) -> Result<String> {
+    let _timing = SlowOperation::new(
+        "git.commit",
+        PROCESS_THRESHOLD,
+        format!("repository={}", repository.display()),
+    );
     let message = message.trim();
     if message.is_empty() {
         bail!("enter a commit message first");
@@ -338,6 +363,11 @@ pub fn commit_all(repository: &Path, message: &str) -> Result<String> {
 }
 
 pub fn push_current_branch(repository: &Path) -> Result<String> {
+    let _timing = SlowOperation::new(
+        "git.push",
+        PROCESS_THRESHOLD,
+        format!("repository={}", repository.display()),
+    );
     let root = repository_root(repository)?;
     let branch = git_output(&root, &["branch", "--show-current"])
         .filter(|branch| !branch.is_empty())
@@ -347,6 +377,11 @@ pub fn push_current_branch(repository: &Path) -> Result<String> {
 }
 
 pub fn create_pull_request(repository: &Path, title: &str) -> Result<String> {
+    let _timing = SlowOperation::new(
+        "git.create_pull_request",
+        PROCESS_THRESHOLD,
+        format!("repository={}", repository.display()),
+    );
     let title = title.trim();
     if title.is_empty() {
         bail!("enter a pull-request title first");
@@ -384,6 +419,11 @@ pub fn create_pull_request(repository: &Path, title: &str) -> Result<String> {
 
 impl RepoSnapshot {
     pub fn load(path: &Path) -> Self {
+        let _timing = SlowOperation::new(
+            "git.load_snapshot",
+            PROCESS_THRESHOLD,
+            format!("repository={}", path.display()),
+        );
         let root = canonical_or_original(path);
         if !git_ok(&root, &["rev-parse", "--is-inside-work-tree"]) {
             return Self::default();
@@ -463,6 +503,7 @@ fn repository_root(path: &Path) -> Result<PathBuf> {
 }
 
 fn git_command(cwd: &Path, args: &[&str]) -> Result<()> {
+    let _timing = git_command_timing(cwd, args);
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -530,6 +571,7 @@ fn safe_slug(value: &str) -> String {
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    let _timing = git_command_timing(cwd, args);
     Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -538,6 +580,7 @@ fn git_ok(cwd: &Path, args: &[&str]) -> bool {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let _timing = git_command_timing(cwd, args);
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -550,6 +593,11 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn untracked_paths(cwd: &Path) -> Vec<String> {
+    let _timing = SlowOperation::new(
+        "git.command",
+        PROCESS_THRESHOLD,
+        format!("command=ls-files cwd={}", cwd.display()),
+    );
     let output = Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .current_dir(cwd)
@@ -564,6 +612,18 @@ fn untracked_paths(cwd: &Path) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8_lossy(path).into_owned())
         .collect()
+}
+
+fn git_command_timing(cwd: &Path, args: &[&str]) -> SlowOperation {
+    SlowOperation::new(
+        "git.command",
+        PROCESS_THRESHOLD,
+        format!(
+            "command={} cwd={}",
+            args.first().copied().unwrap_or("unknown"),
+            cwd.display()
+        ),
+    )
 }
 
 fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {

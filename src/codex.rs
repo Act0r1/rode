@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::agent::{ProviderModel, RuntimeAccess, TurnRequest};
+use crate::perf::{RPC_THRESHOLD, SlowOperation};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -353,6 +354,7 @@ impl CodexSession {
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let _timing = SlowOperation::new("codex.rpc", RPC_THRESHOLD, format!("method={method}"));
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let id_key = id.to_string();
         let (response_tx, response_rx) = mpsc::sync_channel(1);

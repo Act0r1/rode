@@ -2,6 +2,8 @@ use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::perf::{PROCESS_THRESHOLD, SlowOperation};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedProject {
     pub root: PathBuf,
@@ -13,6 +15,11 @@ pub fn validate_project(path: &Path) -> Result<ValidatedProject> {
 }
 
 fn validate_project_with_git(path: &Path, git_binary: &str) -> Result<ValidatedProject> {
+    let _timing = SlowOperation::new(
+        "project.validate",
+        PROCESS_THRESHOLD,
+        format!("path={}", path.display()),
+    );
     if !path.exists() {
         bail!("{} does not exist", path.display());
     }

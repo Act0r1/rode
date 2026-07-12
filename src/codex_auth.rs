@@ -7,6 +7,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use crate::perf::{RPC_THRESHOLD, SlowOperation};
+
 const INITIALIZE_REQUEST_ID: u64 = 1;
 const ACCOUNT_READ_REQUEST_ID: u64 = 2;
 const LOGIN_REQUEST_ID: u64 = 3;
@@ -261,6 +263,8 @@ impl AppServerSession {
     }
 
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+        let _timing =
+            SlowOperation::new("codex.auth_rpc", RPC_THRESHOLD, format!("method={method}"));
         self.send(&json!({ "id": id, "method": method, "params": params }))?;
         loop {
             let message = self.read_message()?;

@@ -11,6 +11,7 @@ mod diff;
 mod editor;
 mod git;
 mod notifications;
+mod perf;
 mod persistence;
 mod project;
 mod terminal;

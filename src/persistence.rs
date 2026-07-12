@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::perf::{STORAGE_THRESHOLD, SlowOperation};
+
 static PROJECT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ATTACHMENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SCHEMA_VERSION: i64 = 4;
@@ -79,6 +81,11 @@ impl StateStore {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
+        let _timing = SlowOperation::new(
+            "storage.open",
+            STORAGE_THRESHOLD,
+            format!("database={}", path.display()),
+        );
         let mut connection = Connection::open(path)
             .with_context(|| format!("failed to open Rode state database {}", path.display()))?;
         connection
@@ -135,6 +142,16 @@ impl StateStore {
     }
 
     pub fn save_thread(&mut self, thread: &StoredThread) -> Result<()> {
+        let _timing = SlowOperation::new(
+            "storage.save_thread",
+            STORAGE_THRESHOLD,
+            format!(
+                "messages={} events={} draft_bytes={}",
+                thread.messages.len(),
+                thread.events.len(),
+                thread.draft.len()
+            ),
+        );
         let project_path = path_text(&thread.project_path);
         let workspace_path = path_text(&thread.workspace_path);
         let now = now_ms();
@@ -240,6 +257,11 @@ impl StateStore {
         thread_id: &str,
         events: &[ConversationCard],
     ) -> Result<()> {
+        let _timing = SlowOperation::new(
+            "storage.save_thread_events",
+            STORAGE_THRESHOLD,
+            format!("events={}", events.len()),
+        );
         let transaction = self
             .connection
             .transaction()
@@ -264,6 +286,11 @@ impl StateStore {
         sequence: usize,
         event: &ConversationCard,
     ) -> Result<()> {
+        let _timing = SlowOperation::new(
+            "storage.upsert_thread_event",
+            STORAGE_THRESHOLD,
+            format!("sequence={sequence}"),
+        );
         let transaction = self
             .connection
             .transaction()
@@ -281,6 +308,11 @@ impl StateStore {
     }
 
     pub fn save_thread_draft(&mut self, id: &str, draft: &str) -> Result<()> {
+        let _timing = SlowOperation::new(
+            "storage.save_thread_draft",
+            STORAGE_THRESHOLD,
+            format!("draft_bytes={}", draft.len()),
+        );
         self.connection.execute(
             "UPDATE threads SET draft = ?2 WHERE id = ?1",
             params![id, draft],
@@ -418,6 +450,8 @@ impl StateStore {
     }
 
     pub fn load_projects(&self) -> Result<Vec<StoredProject>> {
+        let _timing =
+            SlowOperation::new("storage.load_projects", STORAGE_THRESHOLD, "source=sqlite");
         let mut statement = self.connection.prepare(
             "SELECT id, path, git_root, name, active_thread_id, last_opened_ms, settings_json
              FROM projects
@@ -506,6 +540,11 @@ impl StateStore {
     }
 
     pub fn load_threads(&self, project_path: &Path) -> Result<Vec<StoredThread>> {
+        let _timing = SlowOperation::new(
+            "storage.load_threads",
+            STORAGE_THRESHOLD,
+            format!("project={}", project_path.display()),
+        );
         let mut statement = self.connection.prepare(
             "SELECT id FROM threads WHERE project_path = ?1
              ORDER BY ordinal ASC, updated_at_ms ASC",
