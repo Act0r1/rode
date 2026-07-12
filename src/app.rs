@@ -367,6 +367,7 @@ pub(crate) struct RodeApp {
     project_path: PathBuf,
     project_name: String,
     repo: RepoSnapshot,
+    diff_document: DiffDocument,
     pending_repo_validation: bool,
     providers: Vec<ProviderStatus>,
     codex_auth: CodexAuthState,
@@ -565,6 +566,7 @@ impl RodeApp {
             project_path,
             project_name,
             repo,
+            diff_document: DiffDocument::default(),
             pending_repo_validation: false,
             providers,
             codex_auth,
@@ -782,7 +784,7 @@ impl RodeApp {
         } else {
             PathBuf::new()
         };
-        self.repo = RepoSnapshot::default();
+        self.set_repo(RepoSnapshot::default());
         self.reload_repo_snapshot(cx);
         self.project_open = true;
         self.reconcile_project_route();
@@ -1023,7 +1025,7 @@ impl RodeApp {
         self.project_root.clear();
         self.project_path.clear();
         self.project_name = "Choose a project".to_owned();
-        self.repo = RepoSnapshot::default();
+        self.set_repo(RepoSnapshot::default());
         self.codex_session = None;
         self.codex_thread_id = None;
         self.active_turn_id = None;
@@ -2049,7 +2051,7 @@ impl RodeApp {
                 self.active_turn_request = None;
                 self.active_agent_message = None;
                 self.reasoning_preview.clear();
-                self.repo = RepoSnapshot::load(&self.project_path);
+                self.set_repo(RepoSnapshot::load(&self.project_path));
                 let cancelled = matches!(status.as_str(), "cancelled" | "canceled" | "interrupted");
                 let failed = !cancelled
                     && (error.is_some() || !matches!(status.as_str(), "completed" | "success"));
@@ -2463,7 +2465,7 @@ impl RodeApp {
             .as_ref()
             .map(|stored| stored.name.clone())
             .unwrap_or(project.name);
-        self.repo = RepoSnapshot::default();
+        self.set_repo(RepoSnapshot::default());
         self.pending_repo_validation = true;
         self.project_open = true;
         self.project_picker_error = None;
@@ -2721,7 +2723,7 @@ impl RodeApp {
             self.project_root = project_path.clone();
             self.project_path = project_path.clone();
             self.project_name = project_name.clone();
-            self.repo = RepoSnapshot::load(&self.project_path);
+            self.set_repo(RepoSnapshot::load(&self.project_path));
             if !self.repo.is_repository {
                 self.close_project();
                 self.project_picker_error =
@@ -2875,7 +2877,7 @@ impl RodeApp {
                     Ok(worktree) => {
                         this.project_path = worktree.path;
                         this.thread_branch = Some(worktree.branch.clone());
-                        this.repo = RepoSnapshot::load(&this.project_path);
+                        this.set_repo(RepoSnapshot::load(&this.project_path));
                         this.thread_activity = ThreadActivity::Ready;
                         this.thread_error = None;
                         this.worktree_failure = None;
@@ -2893,7 +2895,7 @@ impl RodeApp {
                         let detail = format!("{error:#}");
                         this.project_path.clear();
                         this.thread_branch = None;
-                        this.repo = RepoSnapshot::default();
+                        this.set_repo(RepoSnapshot::default());
                         this.thread_activity = ThreadActivity::Failed;
                         this.thread_error = Some(detail.clone());
                         this.worktree_failure = Some(detail.clone());
@@ -2934,7 +2936,7 @@ impl RodeApp {
         self.modal = None;
         self.worktree_failure = None;
         self.project_path = self.project_root.clone();
-        self.repo = RepoSnapshot::default();
+        self.set_repo(RepoSnapshot::default());
         self.thread_branch = None;
         self.thread_activity = ThreadActivity::Ready;
         self.thread_activity_updated_ms = now_ms();
@@ -3038,7 +3040,7 @@ impl RodeApp {
         let path = self.project_path.clone();
         if path.as_os_str().is_empty() {
             self.pending_repo_validation = false;
-            self.repo = RepoSnapshot::default();
+            self.set_repo(RepoSnapshot::default());
             cx.notify();
             return;
         }
@@ -3062,13 +3064,18 @@ impl RodeApp {
                     cx.notify();
                     return;
                 }
-                this.repo = snapshot;
+                this.set_repo(snapshot);
                 then(this);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn set_repo(&mut self, repo: RepoSnapshot) {
+        self.diff_document = DiffDocument::parse(&repo.diff);
+        self.repo = repo;
     }
 
     fn start_publish_operation(&mut self, operation: PublishOperation, cx: &mut Context<Self>) {
@@ -3105,7 +3112,7 @@ impl RodeApp {
                     Ok(message) => message,
                     Err(error) => format!("Git workflow failed: {error:#}"),
                 });
-                this.repo = RepoSnapshot::load(&this.project_path);
+                this.set_repo(RepoSnapshot::load(&this.project_path));
                 cx.notify();
             })
             .ok();
@@ -5756,7 +5763,7 @@ impl RodeApp {
     }
 
     fn render_diff(&self, width: Option<f32>, cx: &mut Context<Self>) -> Div {
-        let document = DiffDocument::parse(&self.repo.diff);
+        let document = &self.diff_document;
         let mut files = div()
             .id("diff-scroll")
             .flex_1()
