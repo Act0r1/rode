@@ -5,6 +5,9 @@ actions!(
     [
         Backspace,
         Delete,
+        DeleteWordBackward,
+        DeleteWordForward,
+        SelectAll,
         Left,
         Right,
         Home,
@@ -31,6 +34,15 @@ actions!(
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ActionId {
+    CommitBackspace,
+    CommitDelete,
+    CommitDeleteWordBackward,
+    CommitDeleteWordForward,
+    CommitSelectAll,
+    CommitLeft,
+    CommitRight,
+    CommitHome,
+    CommitEnd,
     ComposerBackspace,
     ComposerDelete,
     ComposerLeft,
@@ -78,6 +90,60 @@ pub(crate) struct ActionDescriptor {
 }
 
 pub(crate) const ACTION_REGISTRY: &[ActionDescriptor] = &[
+    action(
+        ActionId::CommitBackspace,
+        "Delete backward",
+        "backspace",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitDelete,
+        "Delete forward",
+        "delete",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitDeleteWordBackward,
+        "Delete previous word",
+        "ctrl-backspace",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitDeleteWordForward,
+        "Delete next word",
+        "ctrl-delete",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitSelectAll,
+        "Select all",
+        "ctrl-a",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitLeft,
+        "Move left",
+        "left",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitRight,
+        "Move right",
+        "right",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitHome,
+        "Move to line start",
+        "home",
+        Some("CommitMessage"),
+    ),
+    action(
+        ActionId::CommitEnd,
+        "Move to line end",
+        "end",
+        Some("CommitMessage"),
+    ),
     action(
         ActionId::ComposerBackspace,
         "Delete backward",
@@ -271,6 +337,19 @@ pub(crate) fn register(cx: &mut App) {
 
 fn binding(action: &ActionDescriptor) -> KeyBinding {
     match action.id {
+        ActionId::CommitBackspace => KeyBinding::new(action.shortcut, Backspace, action.context),
+        ActionId::CommitDelete => KeyBinding::new(action.shortcut, Delete, action.context),
+        ActionId::CommitDeleteWordBackward => {
+            KeyBinding::new(action.shortcut, DeleteWordBackward, action.context)
+        }
+        ActionId::CommitDeleteWordForward => {
+            KeyBinding::new(action.shortcut, DeleteWordForward, action.context)
+        }
+        ActionId::CommitSelectAll => KeyBinding::new(action.shortcut, SelectAll, action.context),
+        ActionId::CommitLeft => KeyBinding::new(action.shortcut, Left, action.context),
+        ActionId::CommitRight => KeyBinding::new(action.shortcut, Right, action.context),
+        ActionId::CommitHome => KeyBinding::new(action.shortcut, Home, action.context),
+        ActionId::CommitEnd => KeyBinding::new(action.shortcut, End, action.context),
         ActionId::ComposerBackspace => KeyBinding::new(action.shortcut, Backspace, action.context),
         ActionId::ComposerDelete => KeyBinding::new(action.shortcut, Delete, action.context),
         ActionId::ComposerLeft => KeyBinding::new(action.shortcut, Left, action.context),

@@ -5671,13 +5671,13 @@ impl RodeApp {
             .bg(rgb(theme::tokens(self.theme).colors.root))
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .child(
                 div()
                     .key_context("CommitMessage")
                     .track_focus(&focus)
                     .map(standard_actions(self.commit_editor.clone()))
-                    .h(px(36.))
+                    .h(px(40.))
                     .px_3()
                     .flex()
                     .items_center()
@@ -5686,11 +5686,14 @@ impl RodeApp {
                     .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
                     .bg(rgb(theme::tokens(self.theme).colors.chrome))
                     .text_sm()
+                    .line_height(px(20.))
                     .text_color(rgb(theme::tokens(self.theme).colors.text))
                     .child(
-                        self.commit_editor
-                            .clone()
-                            .cached(StyleRefinement::default().w_full()),
+                        div().w_full().h(px(20.)).overflow_hidden().child(
+                            self.commit_editor
+                                .clone()
+                                .cached(StyleRefinement::default().w_full().h(px(20.))),
+                        ),
                     ),
             )
             .child(
@@ -5755,7 +5758,8 @@ impl RodeApp {
             .p_3()
             .flex()
             .flex_col()
-            .gap_3();
+            .gap_3()
+            .child(self.render_recent_commits());
 
         if document.files.is_empty() {
             files = files.child(
@@ -5855,6 +5859,76 @@ impl RodeApp {
             )
             .child(self.render_publish_controls(cx))
             .child(files)
+    }
+
+    fn render_recent_commits(&self) -> Div {
+        let mut commits = div().flex().flex_col().gap_1();
+        if self.repo.recent_commits.is_empty() {
+            commits = commits.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
+                    .child("No commits yet"),
+            );
+        } else {
+            for commit in self.repo.recent_commits.iter().take(5) {
+                commits = commits.child(
+                    div()
+                        .h(px(25.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .child(
+                            div()
+                                .w(px(58.))
+                                .flex_none()
+                                .font_family("monospace")
+                                .text_color(rgb(theme::tokens(self.theme).colors.info))
+                                .child(commit.short_hash.clone()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                .child(commit.subject.clone()),
+                        )
+                        .child(
+                            div()
+                                .max_w(px(190.))
+                                .flex_none()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_color(rgb(theme::tokens(self.theme).colors.faint_text))
+                                .child(format!("{} · {}", commit.author, commit.relative_date)),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .flex_none()
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(theme::tokens(self.theme).colors.border))
+            .bg(rgb(theme::tokens(self.theme).colors.panel))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                    .child("Recent commits"),
+            )
+            .child(commits)
     }
 
     fn render_diff_mode_button(

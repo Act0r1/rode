@@ -10,7 +10,10 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::actions::{Backspace, Delete, End, Home, InsertNewline, Left, Right};
+use crate::actions::{
+    Backspace, Delete, DeleteWordBackward, DeleteWordForward, End, Home, InsertNewline, Left,
+    Right, SelectAll,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum EditorEvent {
@@ -23,6 +26,7 @@ pub struct Editor {
     pub focus_handle: FocusHandle,
     value: String,
     cursor: usize,
+    selection: Option<Range<usize>>,
     cursor_visible: bool,
     placeholder: SharedString,
     blink_task: Task<()>,
@@ -50,6 +54,7 @@ impl Editor {
             focus_handle,
             value,
             cursor,
+            selection: None,
             cursor_visible: false,
             placeholder: placeholder.into(),
             blink_task: Task::ready(()),
@@ -64,6 +69,7 @@ impl Editor {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.value.clear();
         self.cursor = 0;
+        self.selection = None;
         self.reset_blink(cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
@@ -72,6 +78,7 @@ impl Editor {
     pub fn set_text(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
         self.value = value.into();
         self.cursor = self.value.len();
+        self.selection = None;
         self.reset_blink(cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
@@ -113,7 +120,9 @@ impl Editor {
     }
 
     pub fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor > 0 {
+        if let Some(selection) = self.selection.take() {
+            self.cursor = selection.start;
+        } else if self.cursor > 0 {
             self.cursor = previous_boundary(&self.value, self.cursor);
         }
         self.reset_blink(cx);
@@ -121,7 +130,9 @@ impl Editor {
     }
 
     pub fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor < self.value.len() {
+        if let Some(selection) = self.selection.take() {
+            self.cursor = selection.end;
+        } else if self.cursor < self.value.len() {
             self.cursor = next_boundary(&self.value, self.cursor);
         }
         self.reset_blink(cx);
@@ -129,23 +140,26 @@ impl Editor {
     }
 
     pub fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        self.selection = None;
         self.cursor = line_start(&self.value, self.cursor);
         self.reset_blink(cx);
         cx.notify();
     }
 
     pub fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        self.selection = None;
         self.cursor = line_end(&self.value, self.cursor);
         self.reset_blink(cx);
         cx.notify();
     }
 
     pub fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        let changed = self.cursor > 0;
-        if self.cursor > 0 {
+        let mut changed = self.delete_selection();
+        if !changed && self.cursor > 0 {
             let previous = previous_boundary(&self.value, self.cursor);
             self.value.drain(previous..self.cursor);
             self.cursor = previous;
+            changed = true;
         }
         self.reset_blink(cx);
         if changed {
@@ -155,10 +169,11 @@ impl Editor {
     }
 
     pub fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        let changed = self.cursor < self.value.len();
-        if self.cursor < self.value.len() {
+        let mut changed = self.delete_selection();
+        if !changed && self.cursor < self.value.len() {
             let next = next_boundary(&self.value, self.cursor);
             self.value.drain(self.cursor..next);
+            changed = true;
         }
         self.reset_blink(cx);
         if changed {
@@ -167,13 +182,100 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.value.is_empty() {
+            self.selection = Some(0..self.value.len());
+            self.cursor = self.value.len();
+        }
+        self.reset_blink(cx);
+        cx.notify();
+    }
+
+    pub fn delete_word_backward(
+        &mut self,
+        _: &DeleteWordBackward,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = self.delete_selection();
+        if !changed && self.cursor > 0 {
+            let start = previous_word_boundary(&self.value, self.cursor);
+            self.value.drain(start..self.cursor);
+            self.cursor = start;
+            changed = true;
+        }
+        self.finish_edit(changed, cx);
+    }
+
+    pub fn delete_word_forward(
+        &mut self,
+        _: &DeleteWordForward,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = self.delete_selection();
+        if !changed && self.cursor < self.value.len() {
+            let end = next_word_boundary(&self.value, self.cursor);
+            self.value.drain(self.cursor..end);
+            changed = true;
+        }
+        self.finish_edit(changed, cx);
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some(selection) = self.selection.take() else {
+            return false;
+        };
+        self.value.drain(selection.clone());
+        self.cursor = selection.start;
+        true
+    }
+
+    fn finish_edit(&mut self, changed: bool, cx: &mut Context<Self>) {
+        self.reset_blink(cx);
+        if changed {
+            cx.emit(EditorEvent::Changed);
+        }
+        cx.notify();
+    }
+
     pub fn insert_newline(&mut self, _: &InsertNewline, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_selection();
         self.value.insert(self.cursor, '\n');
         self.cursor += 1;
         self.reset_blink(cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
+}
+
+fn previous_word_boundary(content: &str, offset: usize) -> usize {
+    let before = &content[..offset];
+    let trimmed = before.trim_end_matches(char::is_whitespace);
+    trimmed
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            character
+                .is_whitespace()
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0)
+}
+
+fn next_word_boundary(content: &str, offset: usize) -> usize {
+    let after = &content[offset..];
+    let word_end = after
+        .char_indices()
+        .find_map(|(index, character)| character.is_whitespace().then_some(index))
+        .unwrap_or(after.len());
+    offset
+        + word_end
+        + after[word_end..]
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>()
 }
 
 fn previous_boundary(content: &str, offset: usize) -> usize {
@@ -251,9 +353,9 @@ impl EntityInputHandler for Editor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let cursor = offset_to_utf16(&self.value, self.cursor);
+        let selection = self.selection.clone().unwrap_or(self.cursor..self.cursor);
         Some(UTF16Selection {
-            range: cursor..cursor,
+            range: range_to_utf16(&self.value, &selection),
             reversed: false,
         })
     }
@@ -274,9 +376,10 @@ impl EntityInputHandler for Editor {
         let range = range
             .as_ref()
             .map(|range| range_from_utf16(&self.value, range))
-            .unwrap_or(self.cursor..self.cursor);
+            .unwrap_or_else(|| self.selection.clone().unwrap_or(self.cursor..self.cursor));
         self.value.replace_range(range.clone(), new_text);
         self.cursor = range.start + new_text.len();
+        self.selection = None;
         self.reset_blink(cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
@@ -327,6 +430,7 @@ struct EditorText {
 
 struct EditorTextPrepaint {
     lines: Vec<ShapedLine>,
+    selections: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
 }
 
@@ -376,6 +480,7 @@ impl Element for EditorText {
         let editor = self.editor.read(cx);
         let content = editor.value.clone();
         let cursor_offset = editor.cursor;
+        let selection = editor.selection.clone();
         let cursor_visible = editor.cursor_visible;
         let is_focused = editor.focus_handle.is_focused(window);
         let placeholder = editor.placeholder.clone();
@@ -419,7 +524,14 @@ impl Element for EditorText {
                 .collect()
         };
 
-        let cursor = if is_focused && cursor_visible {
+        let selections = if is_focused {
+            selection.as_ref().map_or_else(Vec::new, |selection| {
+                selection_quads(&content, &lines, selection.clone(), bounds, line_height)
+            })
+        } else {
+            Vec::new()
+        };
+        let cursor = if is_focused && cursor_visible && selection.is_none() {
             let (cursor_line, offset) = cursor_line_and_offset(&content, cursor_offset);
             let x = if is_placeholder {
                 px(0.)
@@ -440,7 +552,11 @@ impl Element for EditorText {
             None
         };
 
-        EditorTextPrepaint { lines, cursor }
+        EditorTextPrepaint {
+            lines,
+            selections,
+            cursor,
+        }
     }
 
     fn paint(
@@ -461,6 +577,9 @@ impl Element for EditorText {
         );
 
         let line_height = window.line_height();
+        for selection in prepaint.selections.drain(..) {
+            window.paint_quad(selection);
+        }
         for (index, line) in prepaint.lines.iter().enumerate() {
             line.paint(
                 point(bounds.left(), bounds.top() + line_height * index as f32),
@@ -478,6 +597,43 @@ impl Element for EditorText {
     }
 }
 
+fn selection_quads(
+    content: &str,
+    lines: &[ShapedLine],
+    selection: Range<usize>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+) -> Vec<PaintQuad> {
+    let (start_line, start_offset) = cursor_line_and_offset(content, selection.start);
+    let (end_line, end_offset) = cursor_line_and_offset(content, selection.end);
+    (start_line..=end_line)
+        .map(|line_index| {
+            let start = if line_index == start_line {
+                start_offset
+            } else {
+                0
+            };
+            let end = if line_index == end_line {
+                end_offset
+            } else {
+                lines[line_index].len()
+            };
+            let left = lines[line_index].x_for_index(start);
+            let right = lines[line_index].x_for_index(end);
+            fill(
+                Bounds::new(
+                    point(
+                        bounds.left() + left,
+                        bounds.top() + line_height * line_index as f32,
+                    ),
+                    size((right - left).max(px(1.)), line_height),
+                ),
+                hsla(0.58, 0.75, 0.45, 0.35),
+            )
+        })
+        .collect()
+}
+
 fn cursor_line_and_offset(content: &str, cursor: usize) -> (usize, usize) {
     let mut line = 0;
     let mut line_start = 0;
@@ -491,6 +647,31 @@ fn cursor_line_and_offset(content: &str, cursor: usize) -> (usize, usize) {
         }
     }
     (line, cursor - line_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_word_boundary, previous_word_boundary};
+
+    #[test]
+    fn word_boundaries_follow_linux_style_deletion() {
+        let text = "alpha  beta gamma";
+        assert_eq!(previous_word_boundary(text, text.len()), 12);
+        assert_eq!(previous_word_boundary(text, 12), 7);
+        assert_eq!(next_word_boundary(text, 0), 7);
+        assert_eq!(next_word_boundary(text, 7), 12);
+    }
+
+    #[test]
+    fn word_boundaries_are_valid_for_unicode() {
+        let text = "hello  мир  世界";
+        let world_start = text.find('世').expect("world start");
+        assert_eq!(previous_word_boundary(text, text.len()), world_start);
+        assert_eq!(
+            next_word_boundary(text, 0),
+            text.find('м').expect("Cyrillic start")
+        );
+    }
 }
 
 pub fn standard_actions<E: InteractiveElement>(editor: Entity<Editor>) -> impl FnOnce(E) -> E {
@@ -530,6 +711,28 @@ pub fn standard_actions<E: InteractiveElement>(editor: Entity<Editor>) -> impl F
                 let editor = editor.clone();
                 move |action: &Delete, window, cx| {
                     editor.update(cx, |editor, cx| editor.delete(action, window, cx))
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &DeleteWordBackward, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.delete_word_backward(action, window, cx)
+                    })
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &DeleteWordForward, window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.delete_word_forward(action, window, cx)
+                    })
+                }
+            })
+            .on_action({
+                let editor = editor.clone();
+                move |action: &SelectAll, window, cx| {
+                    editor.update(cx, |editor, cx| editor.select_all(action, window, cx))
                 }
             })
             .on_action(move |action: &InsertNewline, window, cx| {

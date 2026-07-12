@@ -13,6 +13,15 @@ pub struct RepoSnapshot {
     pub changed_files: usize,
     pub diff_stat: String,
     pub diff: String,
+    pub recent_commits: Vec<RecentCommit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentCommit {
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    pub relative_date: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +221,7 @@ impl RepoSnapshot {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "detached HEAD".to_owned());
         let status = git_output(&root, &["status", "--porcelain=v1"]).unwrap_or_default();
+        let recent_commits = recent_commits(&root);
         let changed_files = status.lines().count();
         let untracked = untracked_paths(&root);
         let mut diff_stat = git_output(&root, &["diff", "--stat", "HEAD"]).unwrap_or_default();
@@ -245,8 +255,29 @@ impl RepoSnapshot {
             changed_files,
             diff_stat,
             diff,
+            recent_commits,
         }
     }
+}
+
+fn recent_commits(root: &Path) -> Vec<RecentCommit> {
+    const FIELD_SEPARATOR: char = '\u{1f}';
+    const RECORD_SEPARATOR: char = '\u{1e}';
+    let format = "%h%x1f%s%x1f%an%x1f%cr%x1e";
+    git_output(root, &["log", "-8", &format!("--pretty=format:{format}")])
+        .unwrap_or_default()
+        .split(RECORD_SEPARATOR)
+        .filter_map(|record| {
+            let mut fields = record.trim().split(FIELD_SEPARATOR);
+            let commit = RecentCommit {
+                short_hash: fields.next()?.to_owned(),
+                subject: fields.next()?.to_owned(),
+                author: fields.next()?.to_owned(),
+                relative_date: fields.next()?.to_owned(),
+            };
+            (!commit.short_hash.is_empty()).then_some(commit)
+        })
+        .collect()
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -430,6 +461,58 @@ mod tests {
         assert!(snapshot.diff_stat.contains("1 untracked file"));
         assert!(snapshot.diff.contains("+++ b/new.txt"));
         assert!(snapshot.diff.contains("+hello"));
+
+        fs::remove_dir_all(root).expect("clean temp repository");
+    }
+
+    #[test]
+    fn recent_commits_are_loaded_in_display_order() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-history-test-{nonce}"));
+        fs::create_dir_all(&root).expect("create temp repository");
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.name", "Rode Test"],
+            vec!["config", "user.email", "rode@example.invalid"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .expect("run git fixture command")
+                    .success()
+            );
+        }
+        for (index, subject) in ["first commit", "second commit"].iter().enumerate() {
+            fs::write(root.join("file.txt"), format!("{index}\n")).expect("write fixture");
+            assert!(
+                Command::new("git")
+                    .args(["add", "file.txt"])
+                    .current_dir(&root)
+                    .status()
+                    .expect("git add fixture")
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .args(["commit", "--quiet", "-m", subject])
+                    .current_dir(&root)
+                    .status()
+                    .expect("git commit fixture")
+                    .success()
+            );
+        }
+
+        let snapshot = RepoSnapshot::load(&root);
+        assert_eq!(snapshot.recent_commits.len(), 2);
+        assert_eq!(snapshot.recent_commits[0].subject, "second commit");
+        assert_eq!(snapshot.recent_commits[0].author, "Rode Test");
+        assert!(!snapshot.recent_commits[0].short_hash.is_empty());
+        assert!(!snapshot.recent_commits[0].relative_date.is_empty());
 
         fs::remove_dir_all(root).expect("clean temp repository");
     }
