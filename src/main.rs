@@ -45,7 +45,7 @@ fn main() {
             move |window, cx| {
                 let project_path = project_path.clone();
                 let app = cx.new(|cx| RodeApp::new(project_path, window, cx));
-                app.update(cx, |app, cx| app.refresh_codex_account(cx));
+                app.update(cx, |app, cx| app.check_codex_account_on_startup(cx));
                 app
             },
         )

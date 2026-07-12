@@ -54,8 +54,9 @@ reads or stores OpenAI access or refresh tokens.
 
 Use the sidebar **+** menu to start a thread in the active project or add
 another folder. New threads share the selected folder by default. Enable
-**Settings → Isolated worktree** to create a separate Git worktree for every
-future thread.
+**Settings → Isolated worktree** when you want future threads to get separate
+Git worktrees and thread-specific working-tree diffs. Rode remembers this
+setting until you turn it off again.
 
 The terminal button (or `Ctrl+J`) opens the active thread's host terminal. Rode
 starts the exact shell selected by `$SHELL`; zsh/bash startup configuration,

@@ -4,7 +4,7 @@ use crate::theme::{self, ThemeKind};
 
 pub(crate) const RAIL_WIDTH: f32 = 52.0;
 pub(crate) const DIVIDER_WIDTH: f32 = 5.0;
-pub(crate) const MIN_CENTER_WIDTH: f32 = 420.0;
+pub(crate) const MIN_CENTER_WIDTH: f32 = 560.0;
 pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 210.0;
 pub(crate) const MAX_SIDEBAR_WIDTH: f32 = 420.0;
 pub(crate) const MIN_INSPECTOR_WIDTH: f32 = 320.0;
@@ -25,8 +25,8 @@ pub(crate) struct PanelLayout {
 impl Default for PanelLayout {
     fn default() -> Self {
         Self {
-            sidebar_width: 252.0,
-            inspector_width: 460.0,
+            sidebar_width: 228.0,
+            inspector_width: 360.0,
         }
     }
 }
@@ -118,7 +118,7 @@ mod tests {
             wide.inspector_width_for_viewport(1_800.0)
                 .is_some_and(|width| width >= MIN_INSPECTOR_WIDTH)
         );
-        let screenshot_width = 1_286.0;
+        let screenshot_width = 1_348.0;
         let default_layout = PanelLayout::default();
         let inspector = default_layout
             .inspector_width_for_viewport(screenshot_width)
@@ -129,6 +129,7 @@ mod tests {
             - inspector
             - DIVIDER_WIDTH * 2.0;
         assert!(center >= MIN_CENTER_WIDTH);
+        assert!(center > inspector);
         let invalid = PanelLayout {
             sidebar_width: f32::NAN,
             inspector_width: f32::INFINITY,

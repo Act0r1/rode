@@ -39,6 +39,7 @@ use gpui::{
 };
 
 const ISOLATE_NEW_THREADS_SETTING: &str = "isolate_new_threads";
+const CODEX_AUTH_CACHE_SETTING: &str = "codex.auth.cached_state";
 const ROUTE_SETTING: &str = "ui.route";
 const THEME_SETTING: &str = "ui.theme";
 const SIDEBAR_WIDTH_SETTING: &str = "ui.workspace.sidebar_width";
@@ -287,6 +288,25 @@ impl CodexAuthState {
     }
 }
 
+fn codex_auth_from_cache(value: &str) -> Option<CodexAuthState> {
+    if value == "signed_out" {
+        Some(CodexAuthState::SignedOut)
+    } else {
+        value
+            .strip_prefix("signed_in:")
+            .filter(|summary| !summary.is_empty())
+            .map(|summary| CodexAuthState::SignedIn(CodexAccount::Other(summary.to_owned())))
+    }
+}
+
+fn codex_auth_cache_value(state: &CodexAuthState) -> Option<String> {
+    match state {
+        CodexAuthState::SignedOut => Some("signed_out".to_owned()),
+        CodexAuthState::SignedIn(account) => Some(format!("signed_in:{}", account.summary())),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RenameTarget {
     Project(PathBuf),
@@ -511,11 +531,21 @@ impl RodeApp {
             cx.on_blur(&rename_focus, window, |this, _, cx| this.clear_rename(cx));
 
         let providers = discover_providers();
-        let codex_auth = if providers
+        let codex_available = providers
             .iter()
-            .any(|provider| provider.kind == ProviderKind::Codex && provider.available)
-        {
-            CodexAuthState::Checking
+            .any(|provider| provider.kind == ProviderKind::Codex && provider.available);
+        let codex_auth = if codex_available {
+            state_store
+                .as_ref()
+                .and_then(|store| {
+                    store
+                        .load_string_setting(CODEX_AUTH_CACHE_SETTING)
+                        .ok()
+                        .flatten()
+                })
+                .as_deref()
+                .and_then(codex_auth_from_cache)
+                .unwrap_or(CodexAuthState::Checking)
         } else {
             CodexAuthState::Unavailable
         };
@@ -616,7 +646,7 @@ impl RodeApp {
             show_settings: false,
             running: false,
             show_diff: true,
-            diff_view: DiffViewMode::Split,
+            diff_view: DiffViewMode::Stack,
             git_operation: None,
             publish_status: None,
             show_terminal: false,
@@ -1249,6 +1279,7 @@ impl RodeApp {
                         .unwrap_or(CodexAuthState::SignedOut),
                     Err(error) => CodexAuthState::Error(format!("{error:#}")),
                 };
+                this.cache_codex_auth_state();
                 this.sync_route_with_auth();
                 if this.codex_authenticated() && this.project_open {
                     this.refresh_codex_models(cx);
@@ -1258,6 +1289,23 @@ impl RodeApp {
             .ok();
         })
         .detach();
+    }
+
+    pub(crate) fn check_codex_account_on_startup(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.codex_auth, CodexAuthState::Checking) {
+            self.refresh_codex_account(cx);
+        }
+    }
+
+    fn cache_codex_auth_state(&mut self) {
+        let Some(value) = codex_auth_cache_value(&self.codex_auth) else {
+            return;
+        };
+        if let Some(store) = self.state_store.as_mut()
+            && let Err(error) = store.save_string_setting(CODEX_AUTH_CACHE_SETTING, &value)
+        {
+            eprintln!("failed to cache Codex authentication state: {error:#}");
+        }
     }
 
     fn sign_in_codex(&mut self, cx: &mut Context<Self>) {
@@ -1349,6 +1397,7 @@ impl RodeApp {
                         this.codex_auth = status.account.map(CodexAuthState::SignedIn).unwrap_or(
                             CodexAuthState::SignedOut,
                         );
+                        this.cache_codex_auth_state();
                         this.sync_route_with_auth();
                         this.messages.push(Message {
                             role: MessageRole::System,
@@ -2634,13 +2683,17 @@ impl RodeApp {
     fn start_new_thread(&mut self, persist_previous: bool, cx: &mut Context<Self>) {
         let next = self.next_thread_number();
         let base_branch = self.repo.branch.clone();
+        let isolated = self.isolate_new_threads;
         self.initialize_thread(
             persist_previous,
             format!("Thread {next}"),
             base_branch,
-            false,
+            isolated,
             cx,
         );
+        if isolated {
+            self.spawn_worktree_creation(cx);
+        }
     }
 
     fn open_new_thread_modal_for(
@@ -2751,7 +2804,9 @@ impl RodeApp {
             cx,
         );
         if self.isolate_new_threads {
-            self.spawn_worktree_creation(window, cx);
+            let focus = self.composer.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            self.spawn_worktree_creation(cx);
         } else {
             let focus = self.composer.read(cx).focus_handle.clone();
             window.focus(&focus, cx);
@@ -2840,7 +2895,7 @@ impl RodeApp {
         cx.notify();
     }
 
-    fn spawn_worktree_creation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn spawn_worktree_creation(&mut self, cx: &mut Context<Self>) {
         if !self.creating_worktree {
             return;
         }
@@ -2851,13 +2906,13 @@ impl RodeApp {
         let Some(base_branch) = self.thread_base_branch.clone() else {
             return;
         };
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     create_thread_worktree(&repository, &thread_id, &title, &base_branch)
                 })
                 .await;
-            this.update_in(cx, |this, window, cx| {
+            this.update(cx, |this, cx| {
                 if this.session_generation != generation {
                     return;
                 }
@@ -2876,8 +2931,6 @@ impl RodeApp {
                                 worktree.branch
                             ),
                         }];
-                        let focus = this.composer.read(cx).focus_handle.clone();
-                        window.focus(&focus, cx);
                     }
                     Err(error) => {
                         let detail = format!("{error:#}");
@@ -2913,7 +2966,9 @@ impl RodeApp {
         self.thread_activity = ThreadActivity::CreatingWorktree;
         self.thread_activity_updated_ms = now_ms();
         self.persist_current_thread();
-        self.spawn_worktree_creation(window, cx);
+        let focus = self.composer.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+        self.spawn_worktree_creation(cx);
     }
 
     fn use_current_checkout_after_worktree_failure(
@@ -6689,7 +6744,8 @@ mod tests {
     use super::{
         AppRoute, CodexAccount, CodexAuthState, INSPECTOR_WIDTH_SETTING, ROUTE_SETTING,
         SIDEBAR_WIDTH_SETTING, SettingsSection, THEME_SETTING, ThreadActivity, UiPreferences,
-        relative_activity_time, route_after_auth, select_startup_project,
+        codex_auth_cache_value, codex_auth_from_cache, relative_activity_time, route_after_auth,
+        select_startup_project,
     };
     use crate::persistence::{StateStore, StoredProject};
     use crate::theme::ThemeKind;
@@ -6717,6 +6773,26 @@ mod tests {
             })
             .requires_onboarding()
         );
+    }
+
+    #[test]
+    fn cached_auth_skips_a_new_account_probe_without_storing_credentials() {
+        let signed_in = CodexAuthState::SignedIn(CodexAccount::ChatGpt {
+            email: Some("dev@example.com".to_owned()),
+            plan: "plus".to_owned(),
+        });
+        let cached = codex_auth_cache_value(&signed_in).expect("cacheable auth state");
+        assert_eq!(cached, "signed_in:dev@example.com · ChatGPT plus");
+        assert!(matches!(
+            codex_auth_from_cache(&cached),
+            Some(CodexAuthState::SignedIn(CodexAccount::Other(summary)))
+                if summary == "dev@example.com · ChatGPT plus"
+        ));
+        assert!(matches!(
+            codex_auth_from_cache("signed_out"),
+            Some(CodexAuthState::SignedOut)
+        ));
+        assert!(codex_auth_from_cache("broken").is_none());
     }
 
     #[test]
