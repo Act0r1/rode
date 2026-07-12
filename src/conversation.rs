@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -121,7 +122,7 @@ impl ConversationCard {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConversationProjection {
-    cards: Vec<ConversationCard>,
+    cards: Rc<Vec<ConversationCard>>,
     index_by_id: HashMap<String, usize>,
 }
 
@@ -130,36 +131,41 @@ impl ConversationProjection {
         &self.cards
     }
 
+    pub fn shared_cards(&self) -> Rc<Vec<ConversationCard>> {
+        self.cards.clone()
+    }
+
     pub fn cards_mut(&mut self) -> &mut [ConversationCard] {
-        &mut self.cards
+        Rc::make_mut(&mut self.cards).as_mut_slice()
     }
 
     pub fn get_mut(&mut self, id: &str) -> Option<(usize, &mut ConversationCard)> {
         let index = self.index_by_id.get(id).copied()?;
-        Some((index, &mut self.cards[index]))
+        Some((index, &mut Rc::make_mut(&mut self.cards)[index]))
     }
 
     pub fn replace(&mut self, cards: Vec<ConversationCard>) {
-        self.cards = cards;
+        self.cards = Rc::new(cards);
         self.rebuild_index();
     }
 
     pub fn clear(&mut self) {
-        self.cards.clear();
+        Rc::make_mut(&mut self.cards).clear();
         self.index_by_id.clear();
     }
 
     pub fn push(&mut self, card: ConversationCard) -> usize {
         let id = card.id.clone();
-        self.cards.push(card);
-        let index = self.cards.len() - 1;
+        let cards = Rc::make_mut(&mut self.cards);
+        cards.push(card);
+        let index = cards.len() - 1;
         self.index_by_id.insert(id, index);
         index
     }
 
     pub fn upsert(&mut self, card: ConversationCard) -> usize {
         if let Some(index) = self.index_by_id.get(&card.id).copied() {
-            let existing = &mut self.cards[index];
+            let existing = &mut Rc::make_mut(&mut self.cards)[index];
             let created_at_ms = existing.created_at_ms;
             *existing = card;
             existing.created_at_ms = created_at_ms;
@@ -172,7 +178,7 @@ impl ConversationProjection {
     pub fn append_assistant_delta(&mut self, item_id: &str, turn_id: &str, delta: &str) -> usize {
         let id = format!("assistant-{item_id}");
         if let Some(index) = self.index_by_id.get(&id).copied() {
-            let card = &mut self.cards[index];
+            let card = &mut Rc::make_mut(&mut self.cards)[index];
             if let CardKind::AssistantMessage { text } = &mut card.kind {
                 text.push_str(delta);
                 card.status = CardStatus::Running;
@@ -198,7 +204,7 @@ impl ConversationProjection {
     ) -> usize {
         let id = format!("reasoning-{item_id}-{content_index}");
         if let Some(index) = self.index_by_id.get(&id).copied() {
-            let card = &mut self.cards[index];
+            let card = &mut Rc::make_mut(&mut self.cards)[index];
             if let CardKind::Reasoning { text } = &mut card.kind {
                 text.push_str(delta);
                 card.status = CardStatus::Running;
@@ -217,7 +223,7 @@ impl ConversationProjection {
 
     pub fn toggle_collapsed(&mut self, id: &str) -> Option<usize> {
         let index = self.index_by_id.get(id).copied()?;
-        let card = &mut self.cards[index];
+        let card = &mut Rc::make_mut(&mut self.cards)[index];
         if !card.is_collapsible() {
             return None;
         }
@@ -227,7 +233,7 @@ impl ConversationProjection {
 
     pub fn reconcile_after_restart(&mut self) -> bool {
         let mut changed = false;
-        for card in &mut self.cards {
+        for card in Rc::make_mut(&mut self.cards) {
             if matches!(card.status, CardStatus::Pending | CardStatus::Running) {
                 card.status = match card.kind {
                     CardKind::Approval { .. } => CardStatus::Failed,

@@ -387,6 +387,8 @@ pub(crate) struct RodeApp {
     project_path: PathBuf,
     project_name: String,
     repo: RepoSnapshot,
+    diff_document: DiffDocument,
+    pending_repo_validation: bool,
     git_history: GitHistory,
     git_history_loading: bool,
     git_history_error: Option<String>,
@@ -600,6 +602,8 @@ impl RodeApp {
             project_path,
             project_name,
             repo,
+            diff_document: DiffDocument::default(),
+            pending_repo_validation: false,
             git_history: GitHistory::default(),
             git_history_loading: false,
             git_history_error: None,
@@ -822,11 +826,8 @@ impl RodeApp {
         } else {
             PathBuf::new()
         };
-        self.repo = if self.project_path.as_os_str().is_empty() {
-            RepoSnapshot::default()
-        } else {
-            RepoSnapshot::load(&self.project_path)
-        };
+        self.set_repo(RepoSnapshot::default());
+        self.reload_repo_snapshot(cx);
         self.project_open = true;
         self.reconcile_project_route();
         self.messages = thread
@@ -1066,7 +1067,7 @@ impl RodeApp {
         self.project_root.clear();
         self.project_path.clear();
         self.project_name = "Choose a project".to_owned();
-        self.repo = RepoSnapshot::default();
+        self.set_repo(RepoSnapshot::default());
         self.codex_session = None;
         self.codex_thread_id = None;
         self.active_turn_id = None;
@@ -2112,7 +2113,7 @@ impl RodeApp {
                 self.active_turn_request = None;
                 self.active_agent_message = None;
                 self.reasoning_preview.clear();
-                self.repo = RepoSnapshot::load(&self.project_path);
+                self.set_repo(RepoSnapshot::load(&self.project_path));
                 let cancelled = matches!(status.as_str(), "cancelled" | "canceled" | "interrupted");
                 let failed = !cancelled
                     && (error.is_some() || !matches!(status.as_str(), "completed" | "success"));
@@ -2526,15 +2527,8 @@ impl RodeApp {
             .as_ref()
             .map(|stored| stored.name.clone())
             .unwrap_or(project.name);
-        self.repo = RepoSnapshot::load(&self.project_path);
-        if !self.repo.is_repository {
-            self.close_project();
-            self.project_picker_error =
-                Some("Git validation changed while opening the project. Try again.".to_owned());
-            cx.notify();
-            return;
-        }
-        self.project_root = self.repo.root.clone();
+        self.set_repo(RepoSnapshot::default());
+        self.pending_repo_validation = true;
         self.project_open = true;
         self.project_picker_error = None;
         let restored_thread_id = self
@@ -2789,28 +2783,61 @@ impl RodeApp {
             return;
         };
         let changing_project = self.new_thread_target_project.take();
-        if let Some((project_path, project_name)) = changing_project.as_ref() {
+        if let Some((project_path, project_name)) = changing_project {
             self.save_current_draft(cx);
             self.persist_current_thread();
             self.project_root = project_path.clone();
             self.project_path = project_path.clone();
-            self.project_name = project_name.clone();
-            self.repo = RepoSnapshot::load(&self.project_path);
-            if !self.repo.is_repository {
-                self.close_project();
-                self.project_picker_error =
-                    Some("That saved folder is no longer a Git repository.".to_owned());
-                cx.notify();
-                return;
-            }
-            self.project_open = true;
-            self.refresh_known_state();
-            self.save_active_project();
+            self.project_name = project_name;
+            self.set_repo(RepoSnapshot::default());
+            self.project_open = false;
+            self.modal = None;
+            self.worktree_failure = None;
+            cx.notify();
+            cx.spawn_in(window, async move |this, cx| {
+                let snapshot = cx
+                    .background_spawn({
+                        let project_path = project_path.clone();
+                        async move { RepoSnapshot::load(&project_path) }
+                    })
+                    .await;
+                this.update_in(cx, |this, window, cx| {
+                    if this.project_path != project_path {
+                        return;
+                    }
+                    if !snapshot.is_repository {
+                        this.close_project();
+                        this.project_picker_error =
+                            Some("That saved folder is no longer a Git repository.".to_owned());
+                        cx.notify();
+                        return;
+                    }
+                    this.set_repo(snapshot);
+                    this.project_open = true;
+                    this.refresh_known_state();
+                    this.save_active_project();
+                    this.finish_new_thread_confirmation(false, title, base_branch, window, cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
         }
+        self.finish_new_thread_confirmation(true, title, base_branch, window, cx);
+    }
+
+    fn finish_new_thread_confirmation(
+        &mut self,
+        persist_previous: bool,
+        title: String,
+        base_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.modal = None;
         self.worktree_failure = None;
         self.initialize_thread(
-            changing_project.is_none(),
+            persist_previous,
             title,
             base_branch,
             self.isolate_new_threads,
@@ -2883,12 +2910,30 @@ impl RodeApp {
         self.thread_error = None;
         self.thread_unread = false;
         self.project_path = self.project_root.clone();
-        self.repo = RepoSnapshot::load(&self.project_path);
         self.thread_branch = if isolated {
             None
         } else {
             (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone())
         };
+        if isolated {
+            self.reload_repo_snapshot(cx);
+        } else {
+            let generation = self.session_generation;
+            self.reload_repo_snapshot_then(
+                move |this| {
+                    if this.session_generation != generation {
+                        return;
+                    }
+                    let branch = (!this.repo.branch.is_empty()).then(|| this.repo.branch.clone());
+                    this.thread_branch = branch.clone();
+                    if this.thread_base_branch.as_deref() == Some("") {
+                        this.thread_base_branch = branch;
+                    }
+                    this.persist_current_thread();
+                },
+                cx,
+            );
+        }
         self.thread_activity = if isolated {
             ThreadActivity::CreatingWorktree
         } else {
@@ -2929,11 +2974,11 @@ impl RodeApp {
                 if this.session_generation != generation {
                     return;
                 }
-                match result {
+                let persist_after_snapshot = match result {
                     Ok(worktree) => {
                         this.project_path = worktree.path;
                         this.thread_branch = Some(worktree.branch.clone());
-                        this.repo = RepoSnapshot::load(&this.project_path);
+                        this.set_repo(RepoSnapshot::default());
                         this.thread_activity = ThreadActivity::Ready;
                         this.thread_error = None;
                         this.worktree_failure = None;
@@ -2944,12 +2989,21 @@ impl RodeApp {
                                 worktree.branch
                             ),
                         }];
+                        this.reload_repo_snapshot_then(
+                            move |this| {
+                                if this.session_generation == generation {
+                                    this.persist_current_thread();
+                                }
+                            },
+                            cx,
+                        );
+                        true
                     }
                     Err(error) => {
                         let detail = format!("{error:#}");
                         this.project_path.clear();
                         this.thread_branch = None;
-                        this.repo = RepoSnapshot::default();
+                        this.set_repo(RepoSnapshot::default());
                         this.thread_activity = ThreadActivity::Failed;
                         this.thread_error = Some(detail.clone());
                         this.worktree_failure = Some(detail.clone());
@@ -2960,11 +3014,14 @@ impl RodeApp {
                                 "Could not create the isolated worktree: {detail}. Retry or explicitly use the current checkout."
                             ),
                         }];
+                        false
                     }
-                }
+                };
                 this.creating_worktree = false;
                 this.thread_activity_updated_ms = now_ms();
-                this.persist_current_thread();
+                if !persist_after_snapshot {
+                    this.persist_current_thread();
+                }
                 cx.notify();
             })
             .ok();
@@ -2992,8 +3049,8 @@ impl RodeApp {
         self.modal = None;
         self.worktree_failure = None;
         self.project_path = self.project_root.clone();
-        self.repo = RepoSnapshot::load(&self.project_path);
-        self.thread_branch = (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone());
+        self.set_repo(RepoSnapshot::default());
+        self.thread_branch = None;
         self.thread_activity = ThreadActivity::Ready;
         self.thread_activity_updated_ms = now_ms();
         self.thread_error = None;
@@ -3006,6 +3063,18 @@ impl RodeApp {
         let focus = self.composer.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
         cx.notify();
+        let generation = self.session_generation;
+        self.reload_repo_snapshot_then(
+            move |this| {
+                if this.session_generation != generation {
+                    return;
+                }
+                this.thread_branch =
+                    (!this.repo.branch.is_empty()).then(|| this.repo.branch.clone());
+                this.persist_current_thread();
+            },
+            cx,
+        );
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -3069,11 +3138,60 @@ impl RodeApp {
     }
 
     fn refresh_repo(&mut self, _: &RefreshRepo, _: &mut Window, cx: &mut Context<Self>) {
-        self.repo = RepoSnapshot::load(&self.project_path);
+        self.reload_repo_snapshot(cx);
         if self.route == AppRoute::SourceControl {
             self.refresh_git_history(cx);
         }
-        cx.notify();
+    }
+
+    fn reload_repo_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.reload_repo_snapshot_then(|_| {}, cx);
+    }
+
+    fn reload_repo_snapshot_then(
+        &mut self,
+        then: impl FnOnce(&mut Self) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.project_path.clone();
+        if path.as_os_str().is_empty() {
+            self.pending_repo_validation = false;
+            self.set_repo(RepoSnapshot::default());
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move { RepoSnapshot::load(&path) }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.project_path != path {
+                    return;
+                }
+                let validating = std::mem::take(&mut this.pending_repo_validation);
+                if validating && !snapshot.is_repository {
+                    this.close_project();
+                    this.project_picker_error = Some(
+                        "Git validation changed while opening the project. Try again.".to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                this.set_repo(snapshot);
+                then(this);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_repo(&mut self, repo: RepoSnapshot) {
+        self.diff_document = DiffDocument::parse(&repo.diff);
+        self.repo = repo;
     }
 
     fn refresh_git_history(&mut self, cx: &mut Context<Self>) {
@@ -3154,7 +3272,7 @@ impl RodeApp {
                 this.switching_branch = None;
                 match result {
                     Ok((repo, history)) => {
-                        this.repo = repo;
+                        this.set_repo(repo);
                         this.thread_branch = Some(branch.clone());
                         this.git_history = history;
                         this.publish_status = Some(format!("Switched to `{branch}`"));
@@ -3206,7 +3324,7 @@ impl RodeApp {
                     Ok(message) => message,
                     Err(error) => format!("Git workflow failed: {error:#}"),
                 });
-                this.repo = RepoSnapshot::load(&this.project_path);
+                this.set_repo(RepoSnapshot::load(&this.project_path));
                 cx.notify();
             })
             .ok();
@@ -5102,7 +5220,7 @@ impl RodeApp {
     fn render_messages(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = theme::tokens(self.theme).colors;
         if !self.conversation.cards().is_empty() {
-            let cards = self.conversation.cards().to_vec();
+            let cards = self.conversation.shared_cards();
             let live_approvals = self
                 .approvals
                 .iter()
@@ -5860,7 +5978,7 @@ impl RodeApp {
     }
 
     fn render_diff(&self, width: Option<f32>, cx: &mut Context<Self>) -> Div {
-        let document = DiffDocument::parse(&self.repo.diff);
+        let document = &self.diff_document;
         let mut files = div()
             .id("diff-scroll")
             .flex_1()
