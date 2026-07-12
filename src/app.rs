@@ -3116,6 +3116,19 @@ impl RodeApp {
         }
     }
 
+    fn show_occupied_branch(
+        &mut self,
+        branch: &str,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_history_error = Some(format!(
+            "`{branch}` is checked out at {}. Open that worktree to use the branch; Git keeps a branch active in only one worktree at a time.",
+            path.display()
+        ));
+        cx.notify();
+    }
+
     fn switch_branch(&mut self, branch: String, cx: &mut Context<Self>) {
         if self.switching_branch.is_some() || branch == self.repo.branch {
             self.show_branch_picker = false;
@@ -6525,6 +6538,9 @@ impl RodeApp {
             .enumerate()
             .map(|(index, branch)| {
                 let branch_name = branch.name.clone();
+                let occupied_path = branch.checked_out_at.clone();
+                let occupied_click = branch.checked_out_at.clone();
+                let occupied_branch = branch.name.clone();
                 div()
                     .id(("history-branch", index))
                     .role(Role::Button)
@@ -6533,7 +6549,6 @@ impl RodeApp {
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .cursor_pointer()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -6543,19 +6558,57 @@ impl RodeApp {
                     } else {
                         colors.text
                     }))
-                    .hover(move |style| style.bg(rgb(colors.overlay)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.switch_branch(branch_name.clone(), cx)
-                    }))
-                    .child(branch.name.clone())
-                    .when(branch.current, |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(colors.success))
-                                .child("Current"),
-                        )
+                    .when(occupied_path.is_none(), |row| {
+                        row.cursor_pointer()
+                            .hover(move |style| style.bg(rgb(colors.overlay)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.switch_branch(branch_name.clone(), cx)
+                            }))
                     })
+                    .when(occupied_path.is_some(), |row| {
+                        row.opacity(0.78)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(path) = occupied_click.as_deref() {
+                                    this.show_occupied_branch(&occupied_branch, path, cx);
+                                }
+                            }))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(branch.name.clone())
+                            .when_some(occupied_path.clone(), |column, path| {
+                                column.child(
+                                    div()
+                                        .max_w(px(360.))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .text_xs()
+                                        .text_color(rgb(colors.faint_text))
+                                        .child(path.display().to_string()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(if branch.current {
+                                colors.success
+                            } else {
+                                colors.warning
+                            }))
+                            .child(if branch.current {
+                                "Current"
+                            } else if branch.checked_out_at.is_some() {
+                                "Other worktree"
+                            } else {
+                                ""
+                            }),
+                    )
             });
         let mut commits = div()
             .id("git-history-scroll")

@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, bail};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ pub struct GitHistory {
 pub struct GitBranch {
     pub name: String,
     pub current: bool,
+    pub checked_out_at: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,10 +155,15 @@ pub fn list_local_branches(repository: &Path) -> Result<Vec<String>> {
 pub fn load_git_history(repository: &Path) -> Result<GitHistory> {
     let root = repository_root(repository)?;
     let current = git_output(&root, &["branch", "--show-current"]).unwrap_or_default();
+    let occupancy = worktree_branch_occupancy(&root)?;
     let branches = list_local_branches(&root)?
         .into_iter()
         .map(|name| GitBranch {
             current: name == current,
+            checked_out_at: occupancy
+                .get(&name)
+                .filter(|path| canonical_or_original(path) != root)
+                .cloned(),
             name,
         })
         .collect();
@@ -252,12 +258,48 @@ pub fn switch_local_branch(repository: &Path, branch: &str) -> Result<()> {
     if current == branch {
         return Ok(());
     }
+    if let Some(path) = worktree_branch_occupancy(&root)?.get(branch)
+        && canonical_or_original(path) != root
+    {
+        bail!(
+            "branch {branch:?} is already checked out at {}; open that worktree to use this branch",
+            path.display()
+        );
+    }
     let status = git_output(&root, &["status", "--porcelain=v1"]).unwrap_or_default();
     if !status.is_empty() {
         bail!("commit or stash your working-tree changes before switching branches");
     }
-    git_command(&root, &["switch", branch])
-        .with_context(|| format!("could not switch to branch {branch:?}"))
+    let output = Command::new("git")
+        .args(["switch", branch])
+        .current_dir(&root)
+        .output()
+        .context("failed to start `git switch`")?;
+    if !output.status.success() {
+        bail!(
+            "could not switch to branch {branch:?}; Git left the current branch unchanged. Confirm the branch is not in another worktree and retry"
+        );
+    }
+    Ok(())
+}
+
+fn worktree_branch_occupancy(repository: &Path) -> Result<HashMap<String, PathBuf>> {
+    let output = git_output(repository, &["worktree", "list", "--porcelain"])
+        .context("failed to inspect Git worktrees")?;
+    let mut occupancy = HashMap::new();
+    let mut worktree = None;
+    for line in output.lines().chain(std::iter::once("")) {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            worktree = Some(PathBuf::from(path));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            if let Some(path) = worktree.take() {
+                occupancy.insert(branch.to_owned(), path);
+            }
+        } else if line.is_empty() {
+            worktree = None;
+        }
+    }
+    Ok(occupancy)
 }
 
 #[allow(dead_code)] // Used by the upcoming persisted thread-deletion UI and by lifecycle tests.
@@ -827,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn history_lists_commits_and_switches_clean_branches() {
+    fn history_is_worktree_aware_and_switches_only_safe_branches() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
@@ -877,6 +919,45 @@ mod tests {
         assert_eq!(
             git_output(&root, &["branch", "--show-current"]).as_deref(),
             Some("topic")
+        );
+
+        let other_worktree =
+            std::env::temp_dir().join(format!("rode-history-main-worktree-{nonce}"));
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "--quiet"])
+                .arg(&other_worktree)
+                .arg("main")
+                .current_dir(&root)
+                .status()
+                .expect("create second worktree")
+                .success()
+        );
+        let history = load_git_history(&root).expect("reload worktree-aware history");
+        let main = history
+            .branches
+            .iter()
+            .find(|branch| branch.name == "main")
+            .expect("main branch metadata");
+        assert_eq!(
+            main.checked_out_at.as_deref(),
+            Some(other_worktree.as_path())
+        );
+        let error = switch_local_branch(&root, "main").expect_err("occupied switch must fail");
+        assert!(error.to_string().contains("already checked out"));
+        assert!(
+            error
+                .to_string()
+                .contains(&other_worktree.display().to_string())
+        );
+        assert!(
+            Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&other_worktree)
+                .current_dir(&root)
+                .status()
+                .expect("remove second worktree")
+                .success()
         );
 
         fs::write(root.join("README.md"), "dirty\n").expect("dirty fixture");
