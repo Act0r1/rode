@@ -2717,28 +2717,61 @@ impl RodeApp {
             return;
         };
         let changing_project = self.new_thread_target_project.take();
-        if let Some((project_path, project_name)) = changing_project.as_ref() {
+        if let Some((project_path, project_name)) = changing_project {
             self.save_current_draft(cx);
             self.persist_current_thread();
             self.project_root = project_path.clone();
             self.project_path = project_path.clone();
-            self.project_name = project_name.clone();
-            self.set_repo(RepoSnapshot::load(&self.project_path));
-            if !self.repo.is_repository {
-                self.close_project();
-                self.project_picker_error =
-                    Some("That saved folder is no longer a Git repository.".to_owned());
-                cx.notify();
-                return;
-            }
-            self.project_open = true;
-            self.refresh_known_state();
-            self.save_active_project();
+            self.project_name = project_name;
+            self.set_repo(RepoSnapshot::default());
+            self.project_open = false;
+            self.modal = None;
+            self.worktree_failure = None;
+            cx.notify();
+            cx.spawn_in(window, async move |this, cx| {
+                let snapshot = cx
+                    .background_spawn({
+                        let project_path = project_path.clone();
+                        async move { RepoSnapshot::load(&project_path) }
+                    })
+                    .await;
+                this.update_in(cx, |this, window, cx| {
+                    if this.project_path != project_path {
+                        return;
+                    }
+                    if !snapshot.is_repository {
+                        this.close_project();
+                        this.project_picker_error =
+                            Some("That saved folder is no longer a Git repository.".to_owned());
+                        cx.notify();
+                        return;
+                    }
+                    this.set_repo(snapshot);
+                    this.project_open = true;
+                    this.refresh_known_state();
+                    this.save_active_project();
+                    this.finish_new_thread_confirmation(false, title, base_branch, window, cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
         }
+        self.finish_new_thread_confirmation(true, title, base_branch, window, cx);
+    }
+
+    fn finish_new_thread_confirmation(
+        &mut self,
+        persist_previous: bool,
+        title: String,
+        base_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.modal = None;
         self.worktree_failure = None;
         self.initialize_thread(
-            changing_project.is_none(),
+            persist_previous,
             title,
             base_branch,
             self.isolate_new_threads,
@@ -2873,11 +2906,11 @@ impl RodeApp {
                 if this.session_generation != generation {
                     return;
                 }
-                match result {
+                let persist_after_snapshot = match result {
                     Ok(worktree) => {
                         this.project_path = worktree.path;
                         this.thread_branch = Some(worktree.branch.clone());
-                        this.set_repo(RepoSnapshot::load(&this.project_path));
+                        this.set_repo(RepoSnapshot::default());
                         this.thread_activity = ThreadActivity::Ready;
                         this.thread_error = None;
                         this.worktree_failure = None;
@@ -2890,6 +2923,15 @@ impl RodeApp {
                         }];
                         let focus = this.composer.read(cx).focus_handle.clone();
                         window.focus(&focus, cx);
+                        this.reload_repo_snapshot_then(
+                            move |this| {
+                                if this.session_generation == generation {
+                                    this.persist_current_thread();
+                                }
+                            },
+                            cx,
+                        );
+                        true
                     }
                     Err(error) => {
                         let detail = format!("{error:#}");
@@ -2906,11 +2948,14 @@ impl RodeApp {
                                 "Could not create the isolated worktree: {detail}. Retry or explicitly use the current checkout."
                             ),
                         }];
+                        false
                     }
-                }
+                };
                 this.creating_worktree = false;
                 this.thread_activity_updated_ms = now_ms();
-                this.persist_current_thread();
+                if !persist_after_snapshot {
+                    this.persist_current_thread();
+                }
                 cx.notify();
             })
             .ok();
