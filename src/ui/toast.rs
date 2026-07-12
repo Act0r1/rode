@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use gpui::{Div, SharedString, div, prelude::*, rgb};
+use gpui::{App, ClickEvent, Div, Role, SharedString, Window, div, prelude::*, px, rgb};
 
 use crate::theme::{self, ThemeKind};
 
@@ -55,7 +55,11 @@ impl ToastQueue {
     }
 }
 
-pub(crate) fn toast(toast: &Toast, theme_kind: ThemeKind) -> Div {
+pub(crate) fn toast(
+    toast: &Toast,
+    theme_kind: ThemeKind,
+    dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
     let colors = theme::tokens(theme_kind).colors;
     let accent = match toast.kind {
         ToastKind::Info => colors.info,
@@ -71,7 +75,28 @@ pub(crate) fn toast(toast: &Toast, theme_kind: ThemeKind) -> Div {
         .border_color(rgb(accent))
         .bg(rgb(colors.raised))
         .text_color(rgb(colors.text))
-        .child(toast.message.clone())
+        .flex()
+        .items_start()
+        .gap_2()
+        .child(div().min_w_0().flex_1().child(toast.message.clone()))
+        .child(
+            div()
+                .id(("dismiss-toast", toast.id))
+                .role(Role::Button)
+                .aria_label("Close notification")
+                .flex_none()
+                .w(px(24.))
+                .h(px(24.))
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(rgb(colors.muted_text))
+                .hover(move |style| style.bg(rgb(colors.overlay)).text_color(rgb(colors.text)))
+                .on_click(dismiss)
+                .child("×"),
+        )
 }
 
 #[cfg(test)]

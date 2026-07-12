@@ -48,6 +48,7 @@ const ROUTE_SETTING: &str = "ui.route";
 const THEME_SETTING: &str = "ui.theme";
 const SIDEBAR_WIDTH_SETTING: &str = "ui.workspace.sidebar_width";
 const INSPECTOR_WIDTH_SETTING: &str = "ui.workspace.inspector_width";
+const TOAST_DURATION: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum SettingsSection {
@@ -769,14 +770,41 @@ impl RodeApp {
         self.known_threads = threads;
     }
 
+    fn push_toast(
+        &mut self,
+        kind: toast::ToastKind,
+        message: impl Into<gpui::SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.toasts.push(kind, message);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOAST_DURATION).await;
+            this.update(cx, |this, cx| {
+                if this.toasts.dismiss(id) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.toasts.dismiss(id) {
+            cx.notify();
+        }
+    }
+
     fn switch_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if self.thread_id == thread_id {
             return;
         }
         if self.running || self.creating_worktree {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Warning,
                 "Finish or cancel the active operation before switching threads. Rode will never retarget a live session.",
+                cx,
             );
             cx.notify();
             return;
@@ -1122,9 +1150,10 @@ impl RodeApp {
             return;
         }
         if route.requires_project() && !self.repo.is_repository {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Warning,
                 format!("{} requires an open Git project.", route.label()),
+                cx,
             );
             cx.notify();
             return;
@@ -1138,9 +1167,10 @@ impl RodeApp {
         if let Some(store) = self.state_store.as_mut()
             && let Err(error) = store.save_string_setting(ROUTE_SETTING, route.storage_name())
         {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Error,
                 format!("Could not save the selected route: {error:#}"),
+                cx,
             );
         }
 
@@ -1199,9 +1229,10 @@ impl RodeApp {
         if let Some(store) = self.state_store.as_mut()
             && let Err(error) = store.save_string_setting(THEME_SETTING, selected.storage_name())
         {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Error,
                 format!("Could not save the selected theme: {error:#}"),
+                cx,
             );
         }
         cx.notify();
@@ -1214,9 +1245,10 @@ impl RodeApp {
         if let Some(store) = self.state_store.as_mut()
             && let Err(error) = store.save_string_setting(ROUTE_SETTING, route.storage_name())
         {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Error,
                 format!("Could not save the settings section: {error:#}"),
+                cx,
             );
         }
         cx.notify();
@@ -1259,9 +1291,10 @@ impl RodeApp {
             let inspector =
                 store.save_f32_setting(INSPECTOR_WIDTH_SETTING, self.panel_layout.inspector_width);
             if let Err(error) = sidebar.and(inspector) {
-                self.toasts.push(
+                self.push_toast(
                     toast::ToastKind::Error,
                     format!("Could not save panel widths: {error:#}"),
+                    cx,
                 );
             }
         }
@@ -1274,9 +1307,10 @@ impl RodeApp {
         let generation = self.auth_attempt_generation;
         if !self.codex_available() {
             self.codex_auth = CodexAuthState::Unavailable;
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Warning,
                 "Codex is unavailable; authentication cannot start.",
+                cx,
             );
             self.sync_route_with_auth();
             cx.notify();
@@ -1351,8 +1385,7 @@ impl RodeApp {
             role: MessageRole::System,
             text: "Starting a secure ChatGPT sign-in through Codex…".to_owned(),
         });
-        self.toasts
-            .push(toast::ToastKind::Info, "Opening ChatGPT sign-in…");
+        self.push_toast(toast::ToastKind::Info, "Opening ChatGPT sign-in…", cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1373,9 +1406,10 @@ impl RodeApp {
                             role: MessageRole::System,
                             text: format!("Could not start Codex login: {detail}"),
                         });
-                        this.toasts.push(
+                        this.push_toast(
                             toast::ToastKind::Error,
                             "Could not start ChatGPT sign-in.",
+                            cx,
                         );
                         cx.notify();
                     })
@@ -1425,8 +1459,11 @@ impl RodeApp {
                             role: MessageRole::System,
                             text: "Signed in to OpenAI through Codex.".to_owned(),
                         });
-                        this.toasts
-                            .push(toast::ToastKind::Success, "ChatGPT sign-in complete.");
+                        this.push_toast(
+                            toast::ToastKind::Success,
+                            "ChatGPT sign-in complete.",
+                            cx,
+                        );
                         if this.codex_authenticated() && this.project_open {
                             this.refresh_codex_models(cx);
                         }
@@ -1447,9 +1484,10 @@ impl RodeApp {
                             role: MessageRole::System,
                             text: format!("Codex login did not complete: {detail}"),
                         });
-                        this.toasts.push(
+                        this.push_toast(
                             toast::ToastKind::Error,
                             "ChatGPT sign-in did not complete.",
+                            cx,
                         );
                     }
                 }
@@ -1554,9 +1592,10 @@ impl RodeApp {
 
     fn toggle_git_diff_attachment(&mut self, cx: &mut Context<Self>) {
         if self.repo.diff.is_empty() {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Warning,
                 "There is no current Git diff to attach.",
+                cx,
             );
         } else {
             self.attach_git_diff = !self.attach_git_diff;
@@ -1594,9 +1633,10 @@ impl RodeApp {
                 if let Err(error) = result {
                     this.pending_codex_login = Some(cancellation);
                     this.codex_auth = CodexAuthState::BrowserPending { auth_url };
-                    this.toasts.push(
+                    this.push_toast(
                         toast::ToastKind::Error,
                         format!("Could not cancel ChatGPT sign-in: {error:#}"),
+                        cx,
                     );
                 }
                 this.sync_route_with_auth();
@@ -1648,9 +1688,10 @@ impl RodeApp {
         }
 
         let Some(model) = self.selected_model.clone() else {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Warning,
                 "Wait for Codex models to load, or retry model discovery.",
+                cx,
             );
             cx.notify();
             return;
@@ -1683,9 +1724,10 @@ impl RodeApp {
 
     fn begin_turn_request(&mut self, request: TurnRequest, cx: &mut Context<Self>) {
         if request.local_thread_id != self.thread_id || request.cwd != self.project_path {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Error,
                 "The captured turn no longer matches the selected thread.",
+                cx,
             );
             cx.notify();
             return;
@@ -2684,9 +2726,10 @@ impl RodeApp {
         cx: &mut Context<Self>,
     ) {
         if self.running || self.creating_worktree {
-            self.toasts.push(
+            self.push_toast(
                 toast::ToastKind::Warning,
                 "Finish or cancel the active operation before changing projects.",
+                cx,
             );
             cx.notify();
             return;
@@ -7299,11 +7342,16 @@ impl Render for RodeApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .children(
-                        self.toasts
-                            .iter()
-                            .map(|notice| toast::toast(notice, self.theme)),
-                    ),
+                    .children(self.toasts.iter().map(|notice| {
+                        let id = notice.id;
+                        toast::toast(
+                            notice,
+                            self.theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.dismiss_toast(id, cx);
+                            }),
+                        )
+                    })),
             )
             .into_any_element()
     }
