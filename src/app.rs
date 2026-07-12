@@ -22,8 +22,8 @@ use crate::diff::{
 };
 use crate::editor::{Editor, EditorEvent, standard_actions};
 use crate::git::{
-    RepoSnapshot, commit_all, create_pull_request, create_thread_worktree, list_local_branches,
-    push_current_branch,
+    GitCommit, GitHistory, RepoSnapshot, commit_all, create_pull_request, create_thread_worktree,
+    list_local_branches, load_git_history, push_current_branch, switch_local_branch,
 };
 use crate::notifications;
 use crate::persistence::{StateStore, StoredMessage, StoredProject, StoredThread, now_ms};
@@ -387,6 +387,12 @@ pub(crate) struct RodeApp {
     project_path: PathBuf,
     project_name: String,
     repo: RepoSnapshot,
+    git_history: GitHistory,
+    git_history_loading: bool,
+    git_history_error: Option<String>,
+    git_history_generation: u64,
+    show_branch_picker: bool,
+    switching_branch: Option<String>,
     providers: Vec<ProviderStatus>,
     codex_auth: CodexAuthState,
     auth_attempt_generation: u64,
@@ -594,6 +600,12 @@ impl RodeApp {
             project_path,
             project_name,
             repo,
+            git_history: GitHistory::default(),
+            git_history_loading: false,
+            git_history_error: None,
+            git_history_generation: 0,
+            show_branch_picker: false,
+            switching_branch: None,
             providers,
             codex_auth,
             auth_attempt_generation: 0,
@@ -1135,6 +1147,7 @@ impl RodeApp {
                     window.focus(&focus, cx);
                 }
             }
+            AppRoute::SourceControl => self.refresh_git_history(cx),
             _ => {}
         }
         cx.notify();
@@ -3057,7 +3070,93 @@ impl RodeApp {
 
     fn refresh_repo(&mut self, _: &RefreshRepo, _: &mut Window, cx: &mut Context<Self>) {
         self.repo = RepoSnapshot::load(&self.project_path);
+        if self.route == AppRoute::SourceControl {
+            self.refresh_git_history(cx);
+        }
         cx.notify();
+    }
+
+    fn refresh_git_history(&mut self, cx: &mut Context<Self>) {
+        if self.project_path.as_os_str().is_empty() {
+            return;
+        }
+        self.git_history_generation = self.git_history_generation.wrapping_add(1);
+        let generation = self.git_history_generation;
+        let workspace = self.project_path.clone();
+        self.git_history = GitHistory::default();
+        self.git_history_loading = true;
+        self.git_history_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { load_git_history(&workspace) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.git_history_generation != generation {
+                    return;
+                }
+                this.git_history_loading = false;
+                match result {
+                    Ok(history) => this.git_history = history,
+                    Err(error) => {
+                        this.git_history_error = Some(format!("Could not load history: {error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_branch_picker(&mut self, cx: &mut Context<Self>) {
+        if self.switching_branch.is_none() {
+            self.show_branch_picker = !self.show_branch_picker;
+            cx.notify();
+        }
+    }
+
+    fn switch_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        if self.switching_branch.is_some() || branch == self.repo.branch {
+            self.show_branch_picker = false;
+            cx.notify();
+            return;
+        }
+        let workspace = self.project_path.clone();
+        self.switching_branch = Some(branch.clone());
+        self.show_branch_picker = false;
+        self.git_history_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let branch_for_operation = branch.clone();
+            let result = cx
+                .background_spawn(async move {
+                    switch_local_branch(&workspace, &branch_for_operation)?;
+                    let repo = RepoSnapshot::load(&workspace);
+                    let history = load_git_history(&workspace)?;
+                    anyhow::Ok((repo, history))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.switching_branch = None;
+                match result {
+                    Ok((repo, history)) => {
+                        this.repo = repo;
+                        this.thread_branch = Some(branch.clone());
+                        this.git_history = history;
+                        this.publish_status = Some(format!("Switched to `{branch}`"));
+                        this.persist_current_thread();
+                    }
+                    Err(error) => {
+                        this.git_history_error =
+                            Some(format!("Could not switch to `{branch}`: {error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_publish_operation(&mut self, operation: PublishOperation, cx: &mut Context<Self>) {
@@ -6305,6 +6404,294 @@ impl RodeApp {
             })
     }
 
+    fn render_git_commit(&self, index: usize, commit: &GitCommit) -> impl IntoElement {
+        let colors = theme::tokens(self.theme).colors;
+        let graph_color = [
+            colors.accent_hover,
+            colors.success,
+            colors.warning,
+            colors.info,
+        ][commit.graph_column % 4];
+        let graph_width = commit.graph_width.max(commit.graph_column + 1).min(6);
+        let graph = (0..graph_width)
+            .map(|column| {
+                if column == commit.graph_column {
+                    if commit.is_merge { "◆ " } else { "● " }
+                } else {
+                    "│ "
+                }
+            })
+            .collect::<String>();
+        let decorations =
+            commit
+                .decorations
+                .iter()
+                .take(4)
+                .enumerate()
+                .map(|(decoration_index, decoration)| {
+                    div()
+                        .id(("commit-decoration", index * 10 + decoration_index))
+                        .max_w(px(190.))
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .bg(rgb(colors.accent_soft))
+                        .text_xs()
+                        .text_color(rgb(colors.info))
+                        .child(decoration.clone())
+                });
+        div()
+            .id(("git-commit", index))
+            .w_full()
+            .min_h(px(64.))
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .hover(move |style| style.bg(rgb(colors.panel)))
+            .child(
+                div()
+                    .w(px(90.))
+                    .flex_none()
+                    .text_sm()
+                    .text_color(rgb(graph_color))
+                    .child(graph),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(colors.text))
+                                    .child(commit.subject.clone()),
+                            )
+                            .children(decorations),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(colors.muted_text))
+                            .child(commit.author.clone())
+                            .child("·")
+                            .child(commit.relative_date.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(colors.overlay))
+                    .text_xs()
+                    .text_color(rgb(colors.faint_text))
+                    .child(commit.short_hash.clone()),
+            )
+    }
+
+    fn render_git_history(&self, cx: &mut Context<Self>) -> Div {
+        let colors = theme::tokens(self.theme).colors;
+        let branch_label = self
+            .switching_branch
+            .as_ref()
+            .map(|branch| format!("Switching to {branch}…"))
+            .unwrap_or_else(|| format!("⎇  {}", self.repo.branch));
+        let branches = self
+            .git_history
+            .branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                let branch_name = branch.name.clone();
+                div()
+                    .id(("history-branch", index))
+                    .role(Role::Button)
+                    .aria_label(format!("Switch to branch {}", branch.name))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_sm()
+                    .text_color(rgb(if branch.current {
+                        colors.info
+                    } else {
+                        colors.text
+                    }))
+                    .hover(move |style| style.bg(rgb(colors.overlay)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.switch_branch(branch_name.clone(), cx)
+                    }))
+                    .child(branch.name.clone())
+                    .when(branch.current, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(colors.success))
+                                .child("Current"),
+                        )
+                    })
+            });
+        let mut commits = div()
+            .id("git-history-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .bg(rgb(colors.root));
+        if self.git_history.commits.is_empty() {
+            commits = commits.child(
+                div()
+                    .m_4()
+                    .p_5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.panel))
+                    .text_sm()
+                    .text_color(rgb(colors.muted_text))
+                    .child(if self.git_history_loading {
+                        "Loading commit history…"
+                    } else {
+                        "No commits yet. Create the first commit to start the graph."
+                    }),
+            );
+        } else {
+            for (index, commit) in self.git_history.commits.iter().enumerate() {
+                commits = commits.child(self.render_git_commit(index, commit));
+            }
+        }
+
+        div()
+            .flex_1()
+            .min_w(px(420.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .h(px(58.))
+                    .flex_none()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.chrome))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(colors.text))
+                                    .child("Commit graph"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(colors.overlay))
+                                    .text_xs()
+                                    .text_color(rgb(colors.muted_text))
+                                    .child(format!("{} commits", self.git_history.commits.len())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(button::button(
+                                "history-refresh",
+                                if self.git_history_loading {
+                                    "Refreshing…"
+                                } else {
+                                    "Refresh"
+                                },
+                                button::ButtonStyle::Secondary,
+                                self.git_history_loading,
+                                self.theme,
+                                cx.listener(|this, _, _, cx| this.refresh_git_history(cx)),
+                            ))
+                            .child(button::button(
+                                "history-branch-picker",
+                                branch_label,
+                                if self.show_branch_picker {
+                                    button::ButtonStyle::Primary
+                                } else {
+                                    button::ButtonStyle::Secondary
+                                },
+                                self.switching_branch.is_some(),
+                                self.theme,
+                                cx.listener(|this, _, _, cx| this.toggle_branch_picker(cx)),
+                            )),
+                    ),
+            )
+            .when_some(self.git_history_error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .mx_3()
+                        .mt_3()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(colors.error))
+                        .bg(rgb(colors.panel))
+                        .text_xs()
+                        .text_color(rgb(colors.error))
+                        .child(error),
+                )
+            })
+            .when(self.show_branch_picker, |panel| {
+                panel.child(
+                    div()
+                        .id("history-branch-scroll")
+                        .mx_3()
+                        .mt_3()
+                        .p_2()
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(colors.strong_border))
+                        .bg(rgb(colors.raised))
+                        .children(branches),
+                )
+            })
+            .child(commits)
+    }
+
     fn render_source_control_route(&self, cx: &mut Context<Self>) -> Div {
         div()
             .flex_1()
@@ -6314,7 +6701,15 @@ impl RodeApp {
             .flex_col()
             .overflow_hidden()
             .child(self.render_route_header("Source control", "Ctrl+2"))
-            .child(self.render_diff(None, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .overflow_hidden()
+                    .child(self.render_git_history(cx))
+                    .child(self.render_diff(Some(560.), cx)),
+            )
     }
 
     fn render_terminal_route(&self, cx: &mut Context<Self>) -> Div {

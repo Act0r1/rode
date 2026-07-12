@@ -24,6 +24,31 @@ pub struct RecentCommit {
     pub relative_date: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GitHistory {
+    pub branches: Vec<GitBranch>,
+    pub commits: Vec<GitCommit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommit {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    pub relative_date: String,
+    pub decorations: Vec<String>,
+    pub graph_column: usize,
+    pub graph_width: usize,
+    pub is_merge: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThreadWorktree {
     pub path: PathBuf,
@@ -124,6 +149,115 @@ pub fn list_local_branches(repository: &Path) -> Result<Vec<String>> {
     branches.sort();
     branches.dedup();
     Ok(branches)
+}
+
+pub fn load_git_history(repository: &Path) -> Result<GitHistory> {
+    let root = repository_root(repository)?;
+    let current = git_output(&root, &["branch", "--show-current"]).unwrap_or_default();
+    let branches = list_local_branches(&root)?
+        .into_iter()
+        .map(|name| GitBranch {
+            current: name == current,
+            name,
+        })
+        .collect();
+    if !git_ok(&root, &["rev-parse", "--verify", "HEAD"]) {
+        return Ok(GitHistory {
+            branches,
+            commits: Vec::new(),
+        });
+    }
+    let output = git_output(
+        &root,
+        &[
+            "log",
+            "--all",
+            "--topo-order",
+            "--date=relative",
+            "--max-count=200",
+            "--format=%H%x1f%h%x1f%P%x1f%an%x1f%ar%x1f%D%x1f%s",
+        ],
+    )
+    .context("failed to read Git history")?;
+
+    let mut lanes: Vec<String> = Vec::new();
+    let mut commits = Vec::new();
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let fields = line.split('\x1f').collect::<Vec<_>>();
+        if fields.len() != 7 {
+            continue;
+        }
+        let hash = fields[0].to_owned();
+        let parents = fields[2]
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let graph_column = lanes
+            .iter()
+            .position(|lane| lane == &hash)
+            .unwrap_or_else(|| {
+                lanes.insert(0, hash.clone());
+                0
+            });
+        if let Some(first_parent) = parents.first() {
+            lanes[graph_column] = first_parent.clone();
+            for parent in parents.iter().skip(1).rev() {
+                if !lanes.contains(parent) {
+                    lanes.insert(graph_column + 1, parent.clone());
+                }
+            }
+        } else {
+            lanes.remove(graph_column);
+        }
+        let mut unique = Vec::with_capacity(lanes.len());
+        lanes.retain(|lane| {
+            if unique.contains(lane) {
+                false
+            } else {
+                unique.push(lane.clone());
+                true
+            }
+        });
+        commits.push(GitCommit {
+            hash,
+            short_hash: fields[1].to_owned(),
+            subject: fields[6].to_owned(),
+            author: fields[3].to_owned(),
+            relative_date: fields[4].to_owned(),
+            decorations: fields[5]
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+            graph_column,
+            graph_width: lanes.len().max(1),
+            is_merge: parents.len() > 1,
+        });
+    }
+    Ok(GitHistory { branches, commits })
+}
+
+pub fn switch_local_branch(repository: &Path, branch: &str) -> Result<()> {
+    let root = repository_root(repository)?;
+    let branch = branch.trim();
+    if branch.is_empty()
+        || !list_local_branches(&root)?
+            .iter()
+            .any(|name| name == branch)
+    {
+        bail!("the local branch {branch:?} does not exist");
+    }
+    let current = git_output(&root, &["branch", "--show-current"]).unwrap_or_default();
+    if current == branch {
+        return Ok(());
+    }
+    let status = git_output(&root, &["status", "--porcelain=v1"]).unwrap_or_default();
+    if !status.is_empty() {
+        bail!("commit or stash your working-tree changes before switching branches");
+    }
+    git_command(&root, &["switch", branch])
+        .with_context(|| format!("could not switch to branch {branch:?}"))
 }
 
 #[allow(dead_code)] // Used by the upcoming persisted thread-deletion UI and by lifecycle tests.
@@ -428,7 +562,8 @@ fn untracked_file_diff(path: &str, bytes: &[u8]) -> String {
 mod tests {
     use super::{
         RepoSnapshot, commit_all, create_thread_worktree_at, git_output, list_local_branches,
-        remove_thread_worktree, safe_slug, untracked_file_diff,
+        load_git_history, remove_thread_worktree, safe_slug, switch_local_branch,
+        untracked_file_diff,
     };
     use crate::diff::DiffDocument;
     use std::fs;
@@ -688,6 +823,65 @@ mod tests {
             Some("feat: commit from Rode")
         );
 
+        fs::remove_dir_all(root).expect("clean repository fixture");
+    }
+
+    #[test]
+    fn history_lists_commits_and_switches_clean_branches() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-history-test-{nonce}"));
+        fs::create_dir_all(&root).expect("create repository fixture");
+        for args in [
+            ["init", "--quiet"].as_slice(),
+            ["config", "user.name", "Rode Test"].as_slice(),
+            ["config", "user.email", "rode@example.invalid"].as_slice(),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .expect("run git fixture command")
+                    .success()
+            );
+        }
+        fs::write(root.join("README.md"), "first\n").expect("write fixture");
+        for args in [
+            ["add", "README.md"].as_slice(),
+            ["commit", "--quiet", "-m", "initial commit"].as_slice(),
+            ["branch", "-M", "main"].as_slice(),
+            ["branch", "topic"].as_slice(),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .expect("run git fixture command")
+                    .success()
+            );
+        }
+
+        let history = load_git_history(&root).expect("load history");
+        assert_eq!(history.commits[0].subject, "initial commit");
+        assert!(
+            history
+                .branches
+                .iter()
+                .any(|branch| branch.current && branch.name == "main")
+        );
+        switch_local_branch(&root, "topic").expect("switch branch");
+        assert_eq!(
+            git_output(&root, &["branch", "--show-current"]).as_deref(),
+            Some("topic")
+        );
+
+        fs::write(root.join("README.md"), "dirty\n").expect("dirty fixture");
+        let error = switch_local_branch(&root, "main").expect_err("dirty switch must fail");
+        assert!(error.to_string().contains("commit or stash"));
         fs::remove_dir_all(root).expect("clean repository fixture");
     }
 }
