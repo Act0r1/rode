@@ -103,17 +103,14 @@ fn card_body(card: &ConversationCard, theme_kind: ThemeKind) -> Div {
     let colors = theme::tokens(theme_kind).colors;
     let body = match &card.kind {
         CardKind::UserMessage {
-            text,
-            model,
-            access,
-            attachments,
+            text, attachments, ..
         } => format!(
-            "{text}\n\nModel: {model} · Access: {access}{}",
+            "{text}{}",
             if attachments.is_empty() {
                 String::new()
             } else {
                 format!(
-                    " · Context: {}",
+                    "\n\nContext: {}",
                     attachments
                         .iter()
                         .map(ConversationAttachment::label)

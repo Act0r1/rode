@@ -897,6 +897,7 @@ impl RodeApp {
                 access
             };
         }
+        self.conversation.hide_internal_lifecycle_cards();
         if self.conversation.reconcile_after_restart() {
             self.thread_activity = ThreadActivity::Failed;
             self.thread_activity_updated_ms = now_ms();
@@ -2021,37 +2022,10 @@ impl RodeApp {
             CodexEvent::SessionReady { thread_id, model } => {
                 self.codex_thread_id = Some(thread_id);
                 self.selected_model = Some(model.clone());
-                self.messages.push(Message {
-                    role: MessageRole::System,
-                    text: format!("Codex app-server session ready · {model}"),
-                });
-                self.push_conversation_card(
-                    ConversationCard::new(
-                        CardKind::Notice {
-                            tone: NoticeTone::Info,
-                            text: format!("Codex session ready · {model}"),
-                        },
-                        CardStatus::Complete,
-                        None,
-                    ),
-                    cx,
-                );
                 self.persist_current_thread();
             }
             CodexEvent::TurnStarted { turn_id } => {
-                self.active_turn_id = Some(turn_id.clone());
-                self.upsert_conversation_card(
-                    ConversationCard::stable(
-                        format!("turn-{turn_id}-start"),
-                        CardKind::TurnBoundary {
-                            label: "Turn started".to_owned(),
-                            detail: None,
-                        },
-                        CardStatus::Running,
-                        Some(turn_id),
-                    ),
-                    cx,
-                );
+                self.active_turn_id = Some(turn_id);
             }
             CodexEvent::AgentMessageDelta { item_id, delta } => {
                 let turn_id = self.active_turn_id.as_deref().unwrap_or("pending");
@@ -2305,29 +2279,32 @@ impl RodeApp {
                     }
                 }
                 self.conversation_list.remeasure();
-                let boundary = if cancelled {
-                    ConversationCard::new(
-                        CardKind::CancelledTurn {
-                            detail: error.clone().unwrap_or_else(|| "Turn cancelled".to_owned()),
-                        },
-                        CardStatus::Cancelled,
-                        turn_id.clone(),
-                    )
-                } else {
-                    ConversationCard::new(
-                        CardKind::TurnBoundary {
-                            label: if failed {
-                                "Turn failed".to_owned()
-                            } else {
-                                "Turn complete".to_owned()
+                if cancelled {
+                    self.push_conversation_card(
+                        ConversationCard::new(
+                            CardKind::CancelledTurn {
+                                detail: error
+                                    .clone()
+                                    .unwrap_or_else(|| "Turn cancelled".to_owned()),
                             },
-                            detail: error.clone(),
-                        },
-                        terminal_status,
-                        turn_id.clone(),
-                    )
-                };
-                self.push_conversation_card(boundary, cx);
+                            CardStatus::Cancelled,
+                            turn_id.clone(),
+                        ),
+                        cx,
+                    );
+                } else if failed {
+                    self.push_conversation_card(
+                        ConversationCard::new(
+                            CardKind::TurnBoundary {
+                                label: "Turn failed".to_owned(),
+                                detail: error.clone(),
+                            },
+                            terminal_status,
+                            turn_id.clone(),
+                        ),
+                        cx,
+                    );
+                }
                 self.set_thread_activity(
                     if cancelled {
                         ThreadActivity::Ready
@@ -3115,14 +3092,7 @@ impl RodeApp {
             ThreadActivity::Ready
         };
         self.thread_activity_updated_ms = now_ms();
-        self.messages = vec![Message {
-            role: MessageRole::System,
-            text: if isolated {
-                "Creating an isolated Git worktree for the new thread…".to_owned()
-            } else {
-                "This thread uses the current project checkout by explicit choice. The first prompt will open a new Codex app-server session.".to_owned()
-            },
-        }];
+        self.messages.clear();
         self.creating_worktree = isolated;
         self.persist_current_thread();
         cx.notify();
@@ -3157,13 +3127,7 @@ impl RodeApp {
                         this.thread_activity = ThreadActivity::Ready;
                         this.thread_error = None;
                         this.worktree_failure = None;
-                        this.messages = vec![Message {
-                            role: MessageRole::System,
-                            text: format!(
-                                "Isolated worktree ready on `{}`. The first prompt will open a new Codex app-server session.",
-                                worktree.branch
-                            ),
-                        }];
+                        this.messages.clear();
                         this.reload_repo_snapshot_then(
                             move |this| {
                                 if this.session_generation == generation {

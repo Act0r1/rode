@@ -177,6 +177,22 @@ impl ConversationProjection {
         self.rebuild_index();
     }
 
+    pub fn hide_internal_lifecycle_cards(&mut self) {
+        Rc::make_mut(&mut self.cards).retain(|card| {
+            !matches!(
+                card.kind,
+                CardKind::Notice {
+                    tone: NoticeTone::Info,
+                    ..
+                }
+            ) && !matches!(
+                card.kind,
+                CardKind::TurnBoundary { .. } if card.status != CardStatus::Failed
+            )
+        });
+        self.rebuild_index();
+    }
+
     pub fn clear(&mut self) {
         Rc::make_mut(&mut self.cards).clear();
         self.index_by_id.clear();
@@ -473,5 +489,58 @@ mod tests {
         assert!(projection.reconcile_after_restart());
         assert_eq!(projection.cards()[0].status, CardStatus::Cancelled);
         assert_eq!(projection.cards()[1].status, CardStatus::Failed);
+    }
+
+    #[test]
+    fn hides_internal_lifecycle_cards_but_keeps_failures() {
+        let mut projection = ConversationProjection::default();
+        projection.replace(vec![
+            ConversationCard::stable(
+                "session-ready",
+                CardKind::Notice {
+                    tone: NoticeTone::Info,
+                    text: "Codex session ready".to_owned(),
+                },
+                CardStatus::Complete,
+                None,
+            ),
+            ConversationCard::stable(
+                "turn-complete",
+                CardKind::TurnBoundary {
+                    label: "Turn complete".to_owned(),
+                    detail: None,
+                },
+                CardStatus::Success,
+                Some("turn-1".to_owned()),
+            ),
+            ConversationCard::stable(
+                "turn-failed",
+                CardKind::TurnBoundary {
+                    label: "Turn failed".to_owned(),
+                    detail: Some("provider error".to_owned()),
+                },
+                CardStatus::Failed,
+                Some("turn-2".to_owned()),
+            ),
+            ConversationCard::stable(
+                "assistant",
+                CardKind::AssistantMessage {
+                    text: "Answer".to_owned(),
+                },
+                CardStatus::Success,
+                Some("turn-1".to_owned()),
+            ),
+        ]);
+
+        projection.hide_internal_lifecycle_cards();
+
+        assert_eq!(
+            projection
+                .cards()
+                .iter()
+                .map(|card| card.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-failed", "assistant"]
+        );
     }
 }
