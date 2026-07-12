@@ -1,5 +1,6 @@
+use crate::conversation::{CardKind, CardStatus, ConversationCard, NoticeTone};
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, OptionalExtension as _, params};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher as _};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static PROJECT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredMessage {
@@ -56,7 +58,10 @@ pub struct StoredThread {
     pub last_error: Option<String>,
     pub dirty_count: usize,
     pub unread: bool,
+    pub conversation_scroll_item: usize,
+    pub conversation_scroll_offset_millis: i64,
     pub messages: Vec<StoredMessage>,
+    pub events: Vec<ConversationCard>,
 }
 
 pub struct StateStore {
@@ -103,6 +108,8 @@ impl StateStore {
                     last_error TEXT,
                     dirty_count INTEGER NOT NULL DEFAULT 0,
                     unread INTEGER NOT NULL DEFAULT 0,
+                    conversation_scroll_item INTEGER NOT NULL DEFAULT 0,
+                    conversation_scroll_offset_millis INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(project_path) REFERENCES projects(path) ON DELETE CASCADE
                  );
                  CREATE INDEX IF NOT EXISTS threads_project_ordinal
@@ -161,8 +168,9 @@ impl StateStore {
                 id, project_path, title, workspace_path, branch,
                 provider_thread_id, ordinal, updated_at_ms, draft,
                 activity, activity_updated_ms, base_branch,
-                last_error, dirty_count, unread
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                last_error, dirty_count, unread, conversation_scroll_item,
+                conversation_scroll_offset_millis
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                 project_path = excluded.project_path,
                 title = excluded.title,
@@ -177,7 +185,9 @@ impl StateStore {
                 base_branch = excluded.base_branch,
                 last_error = excluded.last_error,
                 dirty_count = excluded.dirty_count,
-                unread = excluded.unread",
+                unread = excluded.unread,
+                conversation_scroll_item = excluded.conversation_scroll_item,
+                conversation_scroll_offset_millis = excluded.conversation_scroll_offset_millis",
             params![
                 thread.id,
                 project_path,
@@ -194,6 +204,8 @@ impl StateStore {
                 thread.last_error,
                 usize_to_i64(thread.dirty_count),
                 thread.unread,
+                usize_to_i64(thread.conversation_scroll_item),
+                thread.conversation_scroll_offset_millis,
             ],
         )?;
         transaction.execute(
@@ -214,7 +226,57 @@ impl StateStore {
                 ])?;
             }
         }
+        replace_conversation_events(&transaction, &thread.id, &thread.events)?;
         transaction.commit().context("failed to save Rode state")
+    }
+
+    /// Replaces the complete ordered conversation projection for a thread.
+    ///
+    /// This is useful at turn boundaries, where the in-memory projection is the
+    /// authority and should be committed atomically.
+    pub fn save_thread_events(
+        &mut self,
+        thread_id: &str,
+        events: &[ConversationCard],
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .context("failed to begin conversation event transaction")?;
+        replace_conversation_events(&transaction, thread_id, events)?;
+        transaction
+            .execute(
+                "UPDATE threads SET updated_at_ms = ?2 WHERE id = ?1",
+                params![thread_id, now_ms()],
+            )
+            .context("failed to update conversation thread timestamp")?;
+        transaction
+            .commit()
+            .context("failed to save conversation events")
+    }
+
+    /// Upserts one streamed card while retaining its stable event identity.
+    /// The supplied sequence is its position in the thread projection.
+    pub fn upsert_thread_event(
+        &mut self,
+        thread_id: &str,
+        sequence: usize,
+        event: &ConversationCard,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction()
+            .context("failed to begin conversation event update")?;
+        upsert_conversation_event(&transaction, thread_id, sequence, event)?;
+        transaction
+            .execute(
+                "UPDATE threads SET updated_at_ms = ?2 WHERE id = ?1",
+                params![thread_id, now_ms()],
+            )
+            .context("failed to update conversation thread timestamp")?;
+        transaction
+            .commit()
+            .context("failed to update conversation event")
     }
 
     pub fn save_thread_draft(&mut self, id: &str, draft: &str) -> Result<()> {
@@ -467,7 +529,8 @@ impl StateStore {
                 "SELECT id, project_path, title, workspace_path, branch,
                         provider_thread_id, ordinal, draft, activity,
                         activity_updated_ms, base_branch, last_error,
-                        dirty_count, unread
+                        dirty_count, unread, conversation_scroll_item,
+                        conversation_scroll_offset_millis
                  FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
@@ -486,6 +549,8 @@ impl StateStore {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, i64>(12)?,
                         row.get::<_, bool>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, i64>(15)?,
                     ))
                 },
             )
@@ -505,6 +570,8 @@ impl StateStore {
             last_error,
             dirty_count,
             unread,
+            conversation_scroll_item,
+            conversation_scroll_offset_millis,
         )) = row
         else {
             return Ok(None);
@@ -520,6 +587,7 @@ impl StateStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let events = load_conversation_events(&self.connection, &id, &messages)?;
         let project_name = self
             .connection
             .query_row(
@@ -544,12 +612,26 @@ impl StateStore {
             last_error,
             dirty_count: dirty_count.max(0) as usize,
             unread,
+            conversation_scroll_item: conversation_scroll_item.max(0) as usize,
+            conversation_scroll_offset_millis,
             messages,
+            events,
         }))
     }
 }
 
 fn ensure_schema_columns(connection: &mut Connection) -> Result<()> {
+    let current_version = connection
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .context("failed to read Rode schema version")?;
+    anyhow::ensure!(
+        current_version <= SCHEMA_VERSION,
+        "Rode state schema version {current_version} is newer than supported version {SCHEMA_VERSION}"
+    );
+    if current_version == SCHEMA_VERSION {
+        return Ok(());
+    }
+
     let transaction = connection
         .transaction()
         .context("failed to begin Rode schema migration")?;
@@ -606,6 +688,11 @@ fn ensure_schema_columns(connection: &mut Connection) -> Result<()> {
         ("last_error", "TEXT"),
         ("dirty_count", "INTEGER NOT NULL DEFAULT 0"),
         ("unread", "INTEGER NOT NULL DEFAULT 0"),
+        ("conversation_scroll_item", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "conversation_scroll_offset_millis",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         if !columns.iter().any(|existing| existing == column) {
             transaction.execute(
@@ -620,9 +707,149 @@ fn ensure_schema_columns(connection: &mut Connection) -> Result<()> {
          WHERE activity_updated_ms <= 0",
         [],
     )?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_events (
+            thread_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(thread_id, event_id),
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS conversation_events_thread_sequence
+            ON conversation_events(thread_id, sequence);",
+    )?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("failed to update Rode schema version")?;
     transaction
         .commit()
         .context("failed to commit Rode schema migration")
+}
+
+fn replace_conversation_events(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    events: &[ConversationCard],
+) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM conversation_events WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .context("failed to replace conversation events")?;
+    let mut statement = transaction.prepare(
+        "INSERT INTO conversation_events(
+            thread_id, event_id, sequence, payload_json, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (sequence, event) in events.iter().enumerate() {
+        let payload = serde_json::to_string(event)
+            .with_context(|| format!("failed to serialize conversation event {}", event.id))?;
+        statement
+            .execute(params![
+                thread_id,
+                event.id,
+                usize_to_i64(sequence),
+                payload,
+                now_ms(),
+            ])
+            .with_context(|| format!("failed to save conversation event {}", event.id))?;
+    }
+    Ok(())
+}
+
+fn upsert_conversation_event(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    sequence: usize,
+    event: &ConversationCard,
+) -> Result<()> {
+    let payload = serde_json::to_string(event)
+        .with_context(|| format!("failed to serialize conversation event {}", event.id))?;
+    transaction
+        .execute(
+            "INSERT INTO conversation_events(
+                thread_id, event_id, sequence, payload_json, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(thread_id, event_id) DO UPDATE SET
+                sequence = excluded.sequence,
+                payload_json = excluded.payload_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                thread_id,
+                event.id,
+                usize_to_i64(sequence),
+                payload,
+                now_ms(),
+            ],
+        )
+        .with_context(|| format!("failed to upsert conversation event {}", event.id))?;
+    Ok(())
+}
+
+fn load_conversation_events(
+    connection: &Connection,
+    thread_id: &str,
+    legacy_messages: &[StoredMessage],
+) -> Result<Vec<ConversationCard>> {
+    let mut statement = connection.prepare(
+        "SELECT event_id, payload_json
+         FROM conversation_events
+         WHERE thread_id = ?1
+         ORDER BY sequence ASC, rowid ASC",
+    )?;
+    let rows = statement
+        .query_map(params![thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if rows.is_empty() {
+        return Ok(legacy_message_events(legacy_messages));
+    }
+
+    let mut events = Vec::with_capacity(rows.len());
+    for (event_id, payload) in rows {
+        let event = serde_json::from_str::<ConversationCard>(&payload)
+            .with_context(|| format!("failed to deserialize conversation event {event_id}"))?;
+        anyhow::ensure!(
+            event.id == event_id,
+            "conversation event {event_id} payload does not match its stable event id"
+        );
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn legacy_message_events(messages: &[StoredMessage]) -> Vec<ConversationCard> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(sequence, message)| ConversationCard {
+            id: format!("legacy-message-{sequence}"),
+            turn_id: None,
+            created_at_ms: 0,
+            status: CardStatus::Complete,
+            collapsed: false,
+            kind: match message.role.as_str() {
+                "user" => CardKind::UserMessage {
+                    text: message.text.clone(),
+                    model: "legacy".to_owned(),
+                    access: "unknown".to_owned(),
+                    attachments: Vec::new(),
+                },
+                "agent" | "assistant" => CardKind::AssistantMessage {
+                    text: message.text.clone(),
+                },
+                _ => CardKind::Notice {
+                    tone: NoticeTone::Info,
+                    text: message.text.clone(),
+                },
+            },
+        })
+        .collect()
 }
 
 fn existing_project_id(connection: &Connection, path: &Path) -> Result<Option<String>> {
@@ -690,6 +917,7 @@ fn usize_to_i64(value: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{StateStore, StoredMessage, StoredThread};
+    use crate::conversation::{CardKind, CardStatus, ConversationCard};
     use rusqlite::Connection;
     use std::fs;
     use std::path::Path;
@@ -725,6 +953,8 @@ mod tests {
             last_error: None,
             dirty_count: 2,
             unread: true,
+            conversation_scroll_item: 4,
+            conversation_scroll_offset_millis: 12_500,
             messages: vec![
                 StoredMessage {
                     role: "user".to_owned(),
@@ -735,6 +965,27 @@ mod tests {
                     text: "Done".to_owned(),
                 },
             ],
+            events: vec![
+                ConversationCard::stable(
+                    "user-turn-1",
+                    CardKind::UserMessage {
+                        text: "Build it".to_owned(),
+                        model: "gpt-5.4".to_owned(),
+                        access: "workspace-write".to_owned(),
+                        attachments: vec!["design.png".to_owned()],
+                    },
+                    CardStatus::Complete,
+                    Some("turn-1".to_owned()),
+                ),
+                ConversationCard::stable(
+                    "assistant-turn-1",
+                    CardKind::AssistantMessage {
+                        text: "Done".to_owned(),
+                    },
+                    CardStatus::Complete,
+                    Some("turn-1".to_owned()),
+                ),
+            ],
         };
         store.save_thread(&thread).expect("save thread");
 
@@ -744,6 +995,23 @@ mod tests {
             .expect("active thread exists");
         assert_eq!(loaded, thread);
         assert_eq!(store.load_threads(&project).unwrap(), vec![thread]);
+
+        let mut streamed = loaded.events[1].clone();
+        streamed.status = CardStatus::Running;
+        streamed.kind = CardKind::AssistantMessage {
+            text: "Done, with a streamed update".to_owned(),
+        };
+        store
+            .upsert_thread_event("thread-1", 1, &streamed)
+            .expect("upsert streamed event");
+        let streamed_thread = store
+            .load_active_thread(&project)
+            .expect("load streamed thread")
+            .expect("streamed thread exists");
+        assert_eq!(streamed_thread.events.len(), 2);
+        assert_eq!(streamed_thread.events[1], streamed);
+        assert_eq!(streamed_thread.events[1].id, "assistant-turn-1");
+
         store
             .save_thread_draft("thread-1", "Updated draft")
             .expect("update thread draft");
@@ -902,7 +1170,11 @@ mod tests {
                  ) VALUES (
                     'legacy-thread', '/tmp/legacy-thread-project', 'Legacy thread',
                     '/tmp/legacy-thread-project', 'main', NULL, 1, 4242
-                 );",
+                 );
+                 INSERT INTO messages(thread_id, sequence, role, text)
+                 VALUES
+                    ('legacy-thread', 0, 'user', 'Legacy request'),
+                    ('legacy-thread', 1, 'agent', 'Legacy response');",
             )
             .expect("write legacy thread schema");
         drop(connection);
@@ -919,6 +1191,37 @@ mod tests {
         assert_eq!(loaded.last_error, None);
         assert_eq!(loaded.dirty_count, 0);
         assert!(!loaded.unread);
+        assert_eq!(loaded.events.len(), 2);
+        assert_eq!(loaded.events[0].id, "legacy-message-0");
+        assert!(matches!(
+            &loaded.events[0].kind,
+            CardKind::UserMessage { text, .. } if text == "Legacy request"
+        ));
+        assert!(matches!(
+            &loaded.events[1].kind,
+            CardKind::AssistantMessage { text } if text == "Legacy response"
+        ));
+
+        let mut event_schema = store
+            .connection
+            .prepare("PRAGMA table_info(conversation_events)")
+            .expect("inspect event schema");
+        let event_columns = event_schema
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query event schema")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect event schema");
+        assert_eq!(
+            event_columns,
+            vec![
+                "thread_id",
+                "event_id",
+                "sequence",
+                "payload_json",
+                "updated_at_ms"
+            ]
+        );
+        drop(event_schema);
 
         drop(store);
         fs::remove_dir_all(root).expect("clean migration fixture");

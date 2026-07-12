@@ -5,6 +5,7 @@ mod agent;
 mod app;
 mod codex;
 mod codex_auth;
+mod conversation;
 mod diff;
 mod editor;
 mod git;
@@ -14,6 +15,7 @@ mod project;
 mod terminal;
 mod theme;
 mod ui;
+mod views;
 
 #[cfg(target_os = "linux")]
 fn main() {

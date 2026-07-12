@@ -5,11 +5,17 @@ use crate::actions::{
     OpenTerminalRoute, OpenWorkspace, RefreshRepo, SendPrompt, SubmitNewThread, SubmitRename,
     ToggleDiff, ToggleDiffLayout, ToggleTerminal,
 };
-use crate::agent::{ProviderKind, ProviderStatus, discover_providers};
+use crate::agent::{
+    ProviderKind, ProviderModel, ProviderStatus, RuntimeAccess, TurnAttachment, TurnRequest,
+    discover_providers,
+};
 use crate::codex::{self, ApprovalRequest, CodexEvent, CodexSession};
 use crate::codex_auth::{
     CodexAccount, CodexLoginOutcome, PendingCodexLoginCancellation, begin_codex_login,
     read_codex_account,
+};
+use crate::conversation::{
+    CardKind, CardStatus, ConversationCard, ConversationProjection, NoticeTone,
 };
 use crate::diff::{
     DiffDocument, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffViewMode, split_rows,
@@ -25,10 +31,11 @@ use crate::project::{ValidatedProject, validate_project};
 use crate::terminal::{TerminalCore, TerminalView};
 use crate::theme::{self, ThemeKind};
 use crate::ui::{button, modal, selectable_row, split_pane, tabs, toast};
+use crate::views::message_card;
 use gpui::{
-    App, Context, CursorStyle, Div, Entity, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Render, Role, StyleRefinement, Subscription, Window, div,
-    prelude::*, px, rgb,
+    App, Context, CursorStyle, Div, Entity, FollowMode, IntoElement, KeyDownEvent, ListAlignment,
+    ListOffset, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render,
+    Role, StyleRefinement, Subscription, Window, div, list, prelude::*, px, rgb,
 };
 
 const ISOLATE_NEW_THREADS_SETTING: &str = "isolate_new_threads";
@@ -266,6 +273,14 @@ enum ProjectSelectionState {
     Validating(PathBuf),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ModelCatalogState {
+    Idle,
+    Loading,
+    Ready,
+    Error(String),
+}
+
 impl CodexAuthState {
     fn requires_onboarding(&self) -> bool {
         !matches!(self, Self::SignedIn(_))
@@ -357,6 +372,10 @@ pub(crate) struct RodeApp {
     auth_attempt_generation: u64,
     pending_codex_login: Option<PendingCodexLoginCancellation>,
     messages: Vec<Message>,
+    conversation: ConversationProjection,
+    conversation_list: ListState,
+    conversation_persist_generation: u64,
+    conversation_event_generations: HashMap<String, u64>,
     composer: Entity<Editor>,
     _composer_subscription: Subscription,
     draft_persist_generation: u64,
@@ -379,6 +398,14 @@ pub(crate) struct RodeApp {
     active_agent_message: Option<usize>,
     reasoning_preview: String,
     approvals: Vec<ApprovalRequest>,
+    model_catalog: ModelCatalogState,
+    model_catalog_generation: u64,
+    available_models: Vec<ProviderModel>,
+    selected_model: Option<String>,
+    runtime_access: RuntimeAccess,
+    attach_git_diff: bool,
+    pending_full_access_request: Option<TurnRequest>,
+    active_turn_request: Option<TurnRequest>,
     session_generation: u64,
     creating_worktree: bool,
     isolate_new_threads: bool,
@@ -497,6 +524,10 @@ impl RodeApp {
             role: MessageRole::System,
             text: "Rode is using the native Wayland renderer. Codex turns run in the workspace-write sandbox by default.".to_owned(),
         }];
+        let conversation = ConversationProjection::default();
+        let conversation_list =
+            ListState::new(0, ListAlignment::Bottom, px(800.)).with_uniform_item_height(px(112.));
+        conversation_list.set_follow_mode(FollowMode::Tail);
         for error in [persistence_error].into_iter().flatten() {
             messages.push(Message {
                 role: MessageRole::System,
@@ -538,6 +569,10 @@ impl RodeApp {
             auth_attempt_generation: 0,
             pending_codex_login: None,
             messages,
+            conversation,
+            conversation_list,
+            conversation_persist_generation: 0,
+            conversation_event_generations: HashMap::new(),
             composer,
             _composer_subscription: composer_subscription,
             draft_persist_generation: 0,
@@ -560,6 +595,14 @@ impl RodeApp {
             active_agent_message: None,
             reasoning_preview: String::new(),
             approvals: Vec::new(),
+            model_catalog: ModelCatalogState::Idle,
+            model_catalog_generation: 0,
+            available_models: Vec::new(),
+            selected_model: None,
+            runtime_access: RuntimeAccess::WorkspaceWrite,
+            attach_git_diff: false,
+            pending_full_access_request: None,
+            active_turn_request: None,
             session_generation: 0,
             creating_worktree: false,
             isolate_new_threads,
@@ -602,6 +645,7 @@ impl RodeApp {
         let Some(store) = self.state_store.as_mut() else {
             return;
         };
+        let conversation_scroll = self.conversation_list.logical_scroll_top();
         let thread = StoredThread {
             id: self.thread_id.clone(),
             project_path: self.project_root.clone(),
@@ -626,6 +670,10 @@ impl RodeApp {
             last_error: self.thread_error.clone(),
             dirty_count: self.repo.changed_files,
             unread: self.thread_unread,
+            conversation_scroll_item: conversation_scroll.item_ix,
+            conversation_scroll_offset_millis: (conversation_scroll.offset_in_item.as_f32()
+                * 1_000.) as i64,
+            events: self.conversation.cards().to_vec(),
             messages: self
                 .messages
                 .iter()
@@ -698,6 +746,9 @@ impl RodeApp {
         self.active_turn_id = None;
         self.active_agent_message = None;
         self.reasoning_preview.clear();
+        self.conversation.clear();
+        self.conversation_list.reset(0);
+        self.conversation_list.set_follow_mode(FollowMode::Tail);
         self.approvals.clear();
         self.git_operation = None;
         self.publish_status = None;
@@ -744,6 +795,41 @@ impl RodeApp {
                 text: message.text,
             })
             .collect();
+        self.conversation.replace(thread.events.clone());
+        if let Some((model, access)) =
+            self.conversation
+                .cards()
+                .iter()
+                .rev()
+                .find_map(|card| match &card.kind {
+                    CardKind::UserMessage { model, access, .. } => {
+                        Some((model.clone(), RuntimeAccess::from_storage_name(access)))
+                    }
+                    _ => None,
+                })
+        {
+            self.selected_model = Some(model);
+            self.runtime_access = if access == RuntimeAccess::FullAccess {
+                RuntimeAccess::WorkspaceWrite
+            } else {
+                access
+            };
+        }
+        if self.conversation.reconcile_after_restart() {
+            self.thread_activity = ThreadActivity::Failed;
+            self.thread_activity_updated_ms = now_ms();
+            self.thread_error = Some("Provider activity was interrupted by restart".to_owned());
+        }
+        self.conversation_list
+            .reset_with_uniform_height(self.conversation.cards().len(), px(112.));
+        if thread.conversation_scroll_item >= self.conversation.cards().len().saturating_sub(1) {
+            self.conversation_list.set_follow_mode(FollowMode::Tail);
+        } else {
+            self.conversation_list.scroll_to(ListOffset {
+                item_ix: thread.conversation_scroll_item,
+                offset_in_item: px(thread.conversation_scroll_offset_millis as f32 / 1_000.),
+            });
+        }
         if self.messages.is_empty() {
             self.messages.push(Message {
                 role: MessageRole::System,
@@ -781,6 +867,9 @@ impl RodeApp {
         }
         self.save_active_project();
         self.persist_current_thread();
+        if self.codex_authenticated() {
+            self.refresh_codex_models(cx);
+        }
         cx.notify();
     }
 
@@ -820,6 +909,98 @@ impl RodeApp {
             .ok();
         })
         .detach();
+    }
+
+    fn push_conversation_card(&mut self, card: ConversationCard, cx: &mut Context<Self>) -> usize {
+        let index = self.conversation.cards().len();
+        self.conversation.push(card);
+        self.conversation_list.splice(index..index, 1);
+        self.schedule_conversation_persist(cx);
+        index
+    }
+
+    fn upsert_conversation_card(
+        &mut self,
+        card: ConversationCard,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let old_len = self.conversation.cards().len();
+        let index = self.conversation.upsert(card);
+        if self.conversation.cards().len() > old_len {
+            self.conversation_list.splice(old_len..old_len, 1);
+        } else {
+            self.conversation_list.remeasure_items(index..index + 1);
+        }
+        self.schedule_conversation_persist(cx);
+        index
+    }
+
+    fn conversation_card_changed(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.conversation_list.remeasure_items(index..index + 1);
+        let Some(event) = self.conversation.cards().get(index).cloned() else {
+            return;
+        };
+        let generation = self
+            .conversation_event_generations
+            .entry(event.id.clone())
+            .and_modify(|generation| *generation = generation.wrapping_add(1))
+            .or_insert(1)
+            .to_owned();
+        let event_id = event.id.clone();
+        let thread_id = self.thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            this.update(cx, |this, _| {
+                if this.thread_id != thread_id
+                    || this.conversation_event_generations.get(&event_id) != Some(&generation)
+                {
+                    return;
+                }
+                if let Some(store) = this.state_store.as_mut()
+                    && let Err(error) = store.upsert_thread_event(&thread_id, index, &event)
+                {
+                    eprintln!("failed to persist streamed conversation event: {error:#}");
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn schedule_conversation_persist(&mut self, cx: &mut Context<Self>) {
+        if !self.project_open || self.thread_id.is_empty() {
+            return;
+        }
+        self.conversation_persist_generation = self.conversation_persist_generation.wrapping_add(1);
+        let generation = self.conversation_persist_generation;
+        let thread_id = self.thread_id.clone();
+        let events = self.conversation.cards().to_vec();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+            this.update(cx, |this, _| {
+                if this.conversation_persist_generation != generation || this.thread_id != thread_id
+                {
+                    return;
+                }
+                if let Some(store) = this.state_store.as_mut()
+                    && let Err(error) = store.save_thread_events(&thread_id, &events)
+                {
+                    eprintln!("failed to persist typed conversation events: {error:#}");
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.conversation_list.set_follow_mode(FollowMode::Tail);
+        self.conversation_list.scroll_to_end();
+        cx.notify();
     }
 
     fn save_active_project(&mut self) {
@@ -1069,6 +1250,9 @@ impl RodeApp {
                     Err(error) => CodexAuthState::Error(format!("{error:#}")),
                 };
                 this.sync_route_with_auth();
+                if this.codex_authenticated() && this.project_open {
+                    this.refresh_codex_models(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1172,6 +1356,9 @@ impl RodeApp {
                         });
                         this.toasts
                             .push(toast::ToastKind::Success, "ChatGPT sign-in complete.");
+                        if this.codex_authenticated() && this.project_open {
+                            this.refresh_codex_models(cx);
+                        }
                     }
                     Ok(CodexLoginOutcome::Cancelled) => {
                         this.codex_auth = CodexAuthState::SignedOut;
@@ -1206,6 +1393,108 @@ impl RodeApp {
         if let CodexAuthState::BrowserPending { auth_url } = &self.codex_auth {
             cx.open_url(auth_url);
         }
+    }
+
+    fn refresh_codex_models(&mut self, cx: &mut Context<Self>) {
+        if !self.project_open || !self.repo.is_repository || !self.codex_authenticated() {
+            self.model_catalog = ModelCatalogState::Idle;
+            return;
+        }
+        self.model_catalog_generation = self.model_catalog_generation.wrapping_add(1);
+        let generation = self.model_catalog_generation;
+        let cwd = self.project_path.clone();
+        self.model_catalog = ModelCatalogState::Loading;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { CodexSession::discover_models(&cwd) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.model_catalog_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(models) if !models.is_empty() => {
+                        let selected_is_valid =
+                            this.selected_model.as_ref().is_some_and(|selected| {
+                                models.iter().any(|model| &model.id == selected)
+                            });
+                        if !selected_is_valid {
+                            this.selected_model = models
+                                .iter()
+                                .find(|model| model.is_default)
+                                .or_else(|| models.first())
+                                .map(|model| model.id.clone());
+                        }
+                        this.available_models = models;
+                        this.model_catalog = ModelCatalogState::Ready;
+                    }
+                    Ok(_) => {
+                        this.available_models.clear();
+                        this.selected_model = None;
+                        this.model_catalog = ModelCatalogState::Error(
+                            "Codex did not report any selectable models.".to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        this.model_catalog = ModelCatalogState::Error(format!("{error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.modal = Some(ModalState::ModelPicker);
+        cx.notify();
+    }
+
+    fn select_model(&mut self, model: String, cx: &mut Context<Self>) {
+        if self
+            .available_models
+            .iter()
+            .any(|candidate| candidate.id == model)
+        {
+            self.selected_model = Some(model);
+            self.modal = None;
+            cx.notify();
+        }
+    }
+
+    fn open_access_picker(&mut self, cx: &mut Context<Self>) {
+        self.pending_full_access_request = None;
+        self.modal = Some(ModalState::AccessPicker);
+        cx.notify();
+    }
+
+    fn select_runtime_access(&mut self, access: RuntimeAccess, cx: &mut Context<Self>) {
+        self.runtime_access = access;
+        self.modal = None;
+        cx.notify();
+    }
+
+    fn toggle_git_diff_attachment(&mut self, cx: &mut Context<Self>) {
+        if self.repo.diff.is_empty() {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                "There is no current Git diff to attach.",
+            );
+        } else {
+            self.attach_git_diff = !self.attach_git_diff;
+        }
+        cx.notify();
+    }
+
+    fn confirm_full_access_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(mut request) = self.pending_full_access_request.take() else {
+            return;
+        };
+        request.full_access_confirmed = true;
+        self.modal = None;
+        self.begin_turn_request(request, cx);
     }
 
     fn cancel_codex_login(&mut self, cx: &mut Context<Self>) {
@@ -1282,12 +1571,74 @@ impl RodeApp {
             return;
         }
 
+        let Some(model) = self.selected_model.clone() else {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                "Wait for Codex models to load, or retry model discovery.",
+            );
+            cx.notify();
+            return;
+        };
+        let attachments = if self.attach_git_diff && !self.repo.diff.is_empty() {
+            vec![TurnAttachment::GitDiff {
+                text: self.repo.diff.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        let request = TurnRequest {
+            local_thread_id: self.thread_id.clone(),
+            provider_thread_id: self.codex_thread_id.clone(),
+            cwd: self.project_path.clone(),
+            prompt,
+            model,
+            access: self.runtime_access,
+            attachments,
+            full_access_confirmed: false,
+        };
+        if request.access.requires_confirmation() {
+            self.pending_full_access_request = Some(request);
+            self.modal = Some(ModalState::AccessPicker);
+            cx.notify();
+            return;
+        }
+        self.begin_turn_request(request, cx);
+    }
+
+    fn begin_turn_request(&mut self, request: TurnRequest, cx: &mut Context<Self>) {
+        if request.local_thread_id != self.thread_id || request.cwd != self.project_path {
+            self.toasts.push(
+                toast::ToastKind::Error,
+                "The captured turn no longer matches the selected thread.",
+            );
+            cx.notify();
+            return;
+        }
+
         self.composer.update(cx, |editor, cx| editor.clear(cx));
         self.drafts.insert(self.thread_id.clone(), String::new());
-        self.messages.push(Message {
-            role: MessageRole::User,
-            text: prompt.clone(),
-        });
+        let attachment_labels = request
+            .attachments
+            .iter()
+            .map(|attachment| attachment.label().to_owned())
+            .collect();
+        self.push_conversation_card(
+            ConversationCard::new(
+                CardKind::UserMessage {
+                    text: request.prompt.clone(),
+                    model: request.model.clone(),
+                    access: request.access.storage_name().to_owned(),
+                    attachments: attachment_labels,
+                },
+                CardStatus::Complete,
+                None,
+            ),
+            cx,
+        );
+        self.active_turn_request = Some(request.clone());
+        if request.access == RuntimeAccess::FullAccess {
+            self.runtime_access = RuntimeAccess::WorkspaceWrite;
+        }
         self.active_agent_message = None;
         self.reasoning_preview.clear();
         self.running = true;
@@ -1297,17 +1648,20 @@ impl RodeApp {
 
         let generation = self.session_generation;
         if let Some(session) = self.codex_session.clone() {
-            Self::spawn_turn(session, prompt, generation, cx);
+            Self::spawn_turn(session, request, generation, cx);
             return;
         }
 
         let cwd = self.project_path.clone();
         let resume_thread_id = self.codex_thread_id.clone();
+        let model = request.model.clone();
+        let access = request.access;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let (session, events) = CodexSession::start(&cwd, resume_thread_id.as_deref())?;
-                    session.start_turn(&prompt)?;
+                    let (session, events) =
+                        CodexSession::start(&cwd, resume_thread_id.as_deref(), &model, access)?;
+                    session.start_turn(&request)?;
                     anyhow::Ok((session, events))
                 })
                 .await;
@@ -1328,6 +1682,17 @@ impl RodeApp {
                             role: MessageRole::System,
                             text: format!("Could not start Codex app-server: {detail}"),
                         });
+                        this.push_conversation_card(
+                            ConversationCard::new(
+                                CardKind::Notice {
+                                    tone: NoticeTone::Error,
+                                    text: format!("Could not start Codex app-server: {detail}"),
+                                },
+                                CardStatus::Failed,
+                                None,
+                            ),
+                            cx,
+                        );
                         this.persist_current_thread();
                     }
                 }
@@ -1338,10 +1703,15 @@ impl RodeApp {
         .detach();
     }
 
-    fn spawn_turn(session: CodexSession, prompt: String, generation: u64, cx: &mut Context<Self>) {
+    fn spawn_turn(
+        session: CodexSession,
+        request: TurnRequest,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { session.start_turn(&prompt) })
+                .background_spawn(async move { session.start_turn(&request) })
                 .await;
             if let Err(error) = result {
                 this.update(cx, |this, cx| {
@@ -1353,6 +1723,17 @@ impl RodeApp {
                             role: MessageRole::System,
                             text: format!("Could not start Codex turn: {detail}"),
                         });
+                        this.push_conversation_card(
+                            ConversationCard::new(
+                                CardKind::Notice {
+                                    tone: NoticeTone::Error,
+                                    text: format!("Could not start Codex turn: {detail}"),
+                                },
+                                CardStatus::Failed,
+                                None,
+                            ),
+                            cx,
+                        );
                         this.persist_current_thread();
                         cx.notify();
                     }
@@ -1370,11 +1751,24 @@ impl RodeApp {
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
-            while let Ok(event) = events.recv().await {
+            while let Ok(first) = events.recv().await {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let mut batch = Vec::with_capacity(64);
+                batch.push(first);
+                while batch.len() < 256 {
+                    match events.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(_) => break,
+                    }
+                }
                 if this
                     .update(cx, |this, cx| {
                         if this.session_generation == generation {
-                            this.handle_codex_event(event, cx);
+                            for event in batch {
+                                this.handle_codex_event(event, cx);
+                            }
                         }
                     })
                     .is_err()
@@ -1390,16 +1784,51 @@ impl RodeApp {
         match event {
             CodexEvent::SessionReady { thread_id, model } => {
                 self.codex_thread_id = Some(thread_id);
+                self.selected_model = Some(model.clone());
                 self.messages.push(Message {
                     role: MessageRole::System,
                     text: format!("Codex app-server session ready · {model}"),
                 });
+                self.push_conversation_card(
+                    ConversationCard::new(
+                        CardKind::Notice {
+                            tone: NoticeTone::Info,
+                            text: format!("Codex session ready · {model}"),
+                        },
+                        CardStatus::Complete,
+                        None,
+                    ),
+                    cx,
+                );
                 self.persist_current_thread();
             }
             CodexEvent::TurnStarted { turn_id } => {
-                self.active_turn_id = Some(turn_id);
+                self.active_turn_id = Some(turn_id.clone());
+                self.upsert_conversation_card(
+                    ConversationCard::stable(
+                        format!("turn-{turn_id}-start"),
+                        CardKind::TurnBoundary {
+                            label: "Turn started".to_owned(),
+                            detail: None,
+                        },
+                        CardStatus::Running,
+                        Some(turn_id),
+                    ),
+                    cx,
+                );
             }
-            CodexEvent::AgentMessageDelta { delta } => {
+            CodexEvent::AgentMessageDelta { item_id, delta } => {
+                let turn_id = self.active_turn_id.as_deref().unwrap_or("pending");
+                let card_index = self
+                    .conversation
+                    .append_assistant_delta(&item_id, turn_id, &delta);
+                if card_index >= self.conversation_list.item_count() {
+                    self.conversation_list.splice(
+                        self.conversation_list.item_count()..self.conversation_list.item_count(),
+                        1,
+                    );
+                }
+                self.conversation_card_changed(card_index, cx);
                 let index = match self.active_agent_message {
                     Some(index) if index < self.messages.len() => index,
                     _ => {
@@ -1414,7 +1843,16 @@ impl RodeApp {
                 };
                 self.messages[index].text.push_str(&delta);
             }
-            CodexEvent::AgentMessageCompleted { text } => {
+            CodexEvent::AgentMessageCompleted { item_id, text } => {
+                self.upsert_conversation_card(
+                    ConversationCard::stable(
+                        format!("assistant-{item_id}"),
+                        CardKind::AssistantMessage { text: text.clone() },
+                        CardStatus::Success,
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
                 if let Some(index) = self.active_agent_message
                     && index < self.messages.len()
                 {
@@ -1428,7 +1866,25 @@ impl RodeApp {
                 self.active_agent_message = None;
                 self.persist_current_thread();
             }
-            CodexEvent::ReasoningDelta { delta } => {
+            CodexEvent::ReasoningDelta {
+                item_id,
+                content_index,
+                delta,
+            } => {
+                let turn_id = self.active_turn_id.as_deref().unwrap_or("pending");
+                let card_index = self.conversation.append_reasoning_delta(
+                    &item_id,
+                    content_index,
+                    turn_id,
+                    &delta,
+                );
+                if card_index >= self.conversation_list.item_count() {
+                    self.conversation_list.splice(
+                        self.conversation_list.item_count()..self.conversation_list.item_count(),
+                        1,
+                    );
+                }
+                self.conversation_card_changed(card_index, cx);
                 self.reasoning_preview.push_str(&delta);
                 const MAX_REASONING_PREVIEW: usize = 240;
                 if self.reasoning_preview.len() > MAX_REASONING_PREVIEW {
@@ -1441,16 +1897,76 @@ impl RodeApp {
                 item_id,
                 command,
                 cwd,
-            } => self.messages.push(Message {
-                role: MessageRole::Tool,
-                text: format!("$ {command}\n{cwd}\nitem {item_id}"),
-            }),
+            } => {
+                self.upsert_conversation_card(
+                    ConversationCard::stable(
+                        format!("command-{item_id}"),
+                        CardKind::Command {
+                            item_id: item_id.clone(),
+                            command: command.clone(),
+                            cwd: cwd.clone(),
+                            output: String::new(),
+                            exit_code: None,
+                        },
+                        CardStatus::Running,
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
+                self.messages.push(Message {
+                    role: MessageRole::Tool,
+                    text: format!("$ {command}\n{cwd}\nitem {item_id}"),
+                });
+            }
+            CodexEvent::CommandOutputDelta { item_id, delta } => {
+                if let Some((index, card)) =
+                    self.conversation.get_mut(&format!("command-{item_id}"))
+                {
+                    if let CardKind::Command { output, .. } = &mut card.kind {
+                        output.push_str(&delta);
+                        card.status = CardStatus::Running;
+                    }
+                    self.conversation_card_changed(index, cx);
+                }
+            }
             CodexEvent::CommandCompleted {
                 item_id,
                 command,
                 exit_code,
                 output,
             } => {
+                let completed_cwd = self
+                    .conversation
+                    .cards()
+                    .iter()
+                    .find_map(|card| match &card.kind {
+                        CardKind::Command {
+                            item_id: existing_id,
+                            cwd,
+                            ..
+                        } if existing_id == &item_id => Some(cwd.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.upsert_conversation_card(
+                    ConversationCard::stable(
+                        format!("command-{item_id}"),
+                        CardKind::Command {
+                            item_id: item_id.clone(),
+                            command: command.clone(),
+                            cwd: completed_cwd,
+                            output: output.clone(),
+                            exit_code,
+                        },
+                        if exit_code == Some(0) {
+                            CardStatus::Success
+                        } else {
+                            CardStatus::Failed
+                        },
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
                 let output = output.lines().take(20).collect::<Vec<_>>().join("\n");
                 self.messages.push(Message {
                     role: MessageRole::Tool,
@@ -1468,25 +1984,118 @@ impl RodeApp {
                 });
             }
             CodexEvent::FileChangeStarted { item_id, summary } => {
+                self.upsert_conversation_card(
+                    ConversationCard::stable(
+                        format!("file-change-{item_id}"),
+                        CardKind::FileChange {
+                            item_id: item_id.clone(),
+                            summary: summary.clone(),
+                        },
+                        CardStatus::Running,
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
                 self.messages.push(Message {
                     role: MessageRole::Tool,
                     text: format!("Editing files · {summary}\nitem {item_id}"),
                 });
             }
+            CodexEvent::FileChangeCompleted {
+                item_id,
+                summary,
+                status,
+            } => {
+                self.upsert_conversation_card(
+                    ConversationCard::stable(
+                        format!("file-change-{item_id}"),
+                        CardKind::FileChange { item_id, summary },
+                        if matches!(status.as_str(), "completed" | "success") {
+                            CardStatus::Success
+                        } else {
+                            CardStatus::Failed
+                        },
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
+            }
             CodexEvent::ApprovalRequested(request) => {
+                self.push_conversation_card(
+                    ConversationCard::stable(
+                        format!("approval-{}", request.item_id),
+                        CardKind::Approval {
+                            item_id: request.item_id.clone(),
+                            approval_kind: match request.kind {
+                                codex::ApprovalKind::Command => "command",
+                                codex::ApprovalKind::FileChange => "file_change",
+                            }
+                            .to_owned(),
+                            title: request.title.clone(),
+                            detail: request.detail.clone(),
+                        },
+                        CardStatus::Pending,
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
                 self.approvals.push(request);
                 self.set_thread_activity(ThreadActivity::WaitingApproval, None);
                 self.persist_current_thread();
             }
             CodexEvent::TurnCompleted { status, error } => {
+                let turn_id = self.active_turn_id.clone();
                 self.running = false;
                 self.active_turn_id = None;
+                self.active_turn_request = None;
                 self.active_agent_message = None;
                 self.reasoning_preview.clear();
                 self.repo = RepoSnapshot::load(&self.project_path);
-                let failed = error.is_some() || !matches!(status.as_str(), "completed" | "success");
+                let cancelled = matches!(status.as_str(), "cancelled" | "canceled" | "interrupted");
+                let failed = !cancelled
+                    && (error.is_some() || !matches!(status.as_str(), "completed" | "success"));
+                let terminal_status = if cancelled {
+                    CardStatus::Cancelled
+                } else if failed {
+                    CardStatus::Failed
+                } else {
+                    CardStatus::Success
+                };
+                for card in self.conversation.cards_mut() {
+                    if card.turn_id == turn_id
+                        && matches!(card.status, CardStatus::Running | CardStatus::Pending)
+                    {
+                        card.status = terminal_status;
+                    }
+                }
+                self.conversation_list.remeasure();
+                let boundary = if cancelled {
+                    ConversationCard::new(
+                        CardKind::CancelledTurn {
+                            detail: error.clone().unwrap_or_else(|| "Turn cancelled".to_owned()),
+                        },
+                        CardStatus::Cancelled,
+                        turn_id.clone(),
+                    )
+                } else {
+                    ConversationCard::new(
+                        CardKind::TurnBoundary {
+                            label: if failed {
+                                "Turn failed".to_owned()
+                            } else {
+                                "Turn complete".to_owned()
+                            },
+                            detail: error.clone(),
+                        },
+                        terminal_status,
+                        turn_id.clone(),
+                    )
+                };
+                self.push_conversation_card(boundary, cx);
                 self.set_thread_activity(
-                    if failed {
+                    if cancelled {
+                        ThreadActivity::Ready
+                    } else if failed {
                         ThreadActivity::Failed
                     } else {
                         ThreadActivity::Complete
@@ -1508,6 +2117,17 @@ impl RodeApp {
                     role: MessageRole::System,
                     text: format!("Codex app-server: {error}"),
                 });
+                self.push_conversation_card(
+                    ConversationCard::new(
+                        CardKind::Notice {
+                            tone: NoticeTone::Error,
+                            text: format!("Codex app-server: {error}"),
+                        },
+                        CardStatus::Failed,
+                        self.active_turn_id.clone(),
+                    ),
+                    cx,
+                );
                 self.persist_current_thread();
             }
             CodexEvent::Exited => {
@@ -1522,6 +2142,17 @@ impl RodeApp {
                         role: MessageRole::System,
                         text: "Codex app-server exited before the turn completed.".to_owned(),
                     });
+                    self.push_conversation_card(
+                        ConversationCard::new(
+                            CardKind::CancelledTurn {
+                                detail: "Codex app-server exited before the turn completed."
+                                    .to_owned(),
+                            },
+                            CardStatus::Cancelled,
+                            self.active_turn_id.clone(),
+                        ),
+                        cx,
+                    );
                 }
                 self.persist_current_thread();
             }
@@ -1538,14 +2169,26 @@ impl RodeApp {
         if index >= self.approvals.len() {
             return;
         }
-        let request = self.approvals.remove(index);
+        let request = self.approvals[index].clone();
         let result = self.codex_session.as_ref().map_or_else(
             || Err(anyhow::anyhow!("Codex session is no longer running")),
             |session| session.respond_to_approval(&request.rpc_id, decision),
         );
-        let outcome = if let Err(error) = result {
-            format!("Could not answer approval request: {error:#}")
+        let outcome = if let Err(error) = &result {
+            format!("Could not answer approval request: {error:#}. The request remains actionable.")
         } else {
+            self.approvals.remove(index);
+            if let Some((card_index, card)) = self
+                .conversation
+                .get_mut(&format!("approval-{}", request.item_id))
+            {
+                card.status = if decision == "accept" {
+                    CardStatus::Success
+                } else {
+                    CardStatus::Cancelled
+                };
+                self.conversation_card_changed(card_index, cx);
+            }
             format!(
                 "{} request {}.",
                 match request.kind {
@@ -1563,11 +2206,46 @@ impl RodeApp {
             role: MessageRole::System,
             text: outcome,
         });
+        if let Err(error) = result {
+            self.push_conversation_card(
+                ConversationCard::new(
+                    CardKind::Notice {
+                        tone: NoticeTone::Error,
+                        text: format!("Could not answer approval request: {error:#}"),
+                    },
+                    CardStatus::Failed,
+                    self.active_turn_id.clone(),
+                ),
+                cx,
+            );
+        }
         if self.running && self.approvals.is_empty() {
             self.set_thread_activity(ThreadActivity::Running, None);
         }
         self.persist_current_thread();
         cx.notify();
+    }
+
+    fn respond_to_approval_item(
+        &mut self,
+        item_id: &str,
+        decision: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .approvals
+            .iter()
+            .position(|request| request.item_id == item_id)
+        {
+            self.respond_to_approval(index, decision, cx);
+        }
+    }
+
+    fn toggle_conversation_card(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(index) = self.conversation.toggle_collapsed(id) {
+            self.conversation_card_changed(index, cx);
+            cx.notify();
+        }
     }
 
     fn cancel_turn(&mut self, cx: &mut Context<Self>) {
@@ -1809,6 +2487,9 @@ impl RodeApp {
             self.save_active_project();
             self.start_new_thread(false, cx);
         }
+        if self.codex_authenticated() {
+            self.refresh_codex_models(cx);
+        }
     }
 
     fn repair_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -1906,7 +2587,10 @@ impl RodeApp {
     }
 
     fn dismiss_modal(&mut self, _: &DismissModal, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal.take().is_some() {
+        if let Some(closed) = self.modal.take() {
+            if closed == ModalState::AccessPicker {
+                self.pending_full_access_request = None;
+            }
             self.new_thread_target_project = None;
             self.new_thread_form_generation = self.new_thread_form_generation.wrapping_add(1);
             let focus = self.composer.read(cx).focus_handle.clone();
@@ -2113,6 +2797,9 @@ impl RodeApp {
         self.active_turn_id = None;
         self.active_agent_message = None;
         self.reasoning_preview.clear();
+        self.conversation.clear();
+        self.conversation_list.reset(0);
+        self.conversation_list.set_follow_mode(FollowMode::Tail);
         self.approvals.clear();
         self.git_operation = None;
         self.publish_status = None;
@@ -2405,6 +3092,227 @@ impl RodeApp {
         modal_state: ModalState,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let colors = theme::tokens(self.theme).colors;
+        if modal_state == ModalState::ModelPicker {
+            let models = self
+                .available_models
+                .iter()
+                .enumerate()
+                .map(|(index, model)| {
+                    let model_id = model.id.clone();
+                    let selected = self.selected_model.as_deref() == Some(model.id.as_str());
+                    div()
+                        .id(("model-option", index))
+                        .role(Role::Button)
+                        .aria_label(format!("Use model {}", model.display_name))
+                        .tab_index(0)
+                        .tab_stop(true)
+                        .cursor_pointer()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if selected {
+                            colors.focus_ring
+                        } else {
+                            colors.border
+                        }))
+                        .focus_visible(move |style| style.border_color(rgb(colors.focus_ring)))
+                        .bg(rgb(if selected {
+                            colors.accent_soft
+                        } else {
+                            colors.panel
+                        }))
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_model(model_id.clone(), cx)
+                        }))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(colors.text))
+                                .child(model.display_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(colors.muted_text))
+                                .child(model.description.clone()),
+                        )
+                });
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(colors.muted_text))
+                        .child("Models are reported by the active Codex installation and account."),
+                )
+                .when(
+                    matches!(self.model_catalog, ModelCatalogState::Loading),
+                    |body| {
+                        body.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(colors.info))
+                                .child("Loading models…"),
+                        )
+                    },
+                )
+                .when_some(
+                    match &self.model_catalog {
+                        ModelCatalogState::Error(error) => Some(error.clone()),
+                        _ => None,
+                    },
+                    |body, error| {
+                        body.child(
+                            div()
+                                .rounded_md()
+                                .bg(rgb(colors.deletion_soft))
+                                .p_3()
+                                .text_sm()
+                                .text_color(rgb(colors.error))
+                                .child(error),
+                        )
+                        .child(button::button(
+                            "retry-model-list",
+                            "Retry",
+                            button::ButtonStyle::Secondary,
+                            false,
+                            self.theme,
+                            cx.listener(|this, _, _, cx| this.refresh_codex_models(cx)),
+                        ))
+                    },
+                )
+                .children(models);
+            return modal::modal_frame("Choose model", body, self.theme).into_any_element();
+        }
+
+        if modal_state == ModalState::AccessPicker {
+            if self.pending_full_access_request.is_some() {
+                return modal::modal_frame(
+                    "Confirm full access",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            div()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(colors.warning))
+                                .bg(rgb(colors.warning_soft))
+                                .p_4()
+                                .text_sm()
+                                .line_height(px(21.))
+                                .text_color(rgb(colors.warning))
+                                .child("This single turn will run without filesystem sandbox restrictions. Review the prompt and attached context before continuing."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_3()
+                                .child(button::button(
+                                    "cancel-full-access",
+                                    "Cancel",
+                                    button::ButtonStyle::Secondary,
+                                    false,
+                                    self.theme,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.dismiss_modal(&DismissModal, window, cx)
+                                    }),
+                                ))
+                                .child(button::button(
+                                    "confirm-full-access",
+                                    "Run once with full access",
+                                    button::ButtonStyle::Destructive,
+                                    false,
+                                    self.theme,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirm_full_access_turn(cx)
+                                    }),
+                                )),
+                        ),
+                    self.theme,
+                )
+                .into_any_element();
+            }
+            let options = [
+                (
+                    RuntimeAccess::ReadOnly,
+                    "Inspect the workspace without allowing file writes.",
+                ),
+                (
+                    RuntimeAccess::WorkspaceWrite,
+                    "Allow writes only in the selected worktree.",
+                ),
+                (
+                    RuntimeAccess::FullAccess,
+                    "Remove filesystem sandbox restrictions; every turn requires confirmation.",
+                ),
+            ];
+            let body =
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(
+                        options
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (access, detail))| {
+                                div()
+                                    .id(("access-option", index))
+                                    .role(Role::Button)
+                                    .aria_label(format!("Use {}", access.label()))
+                                    .tab_index(0)
+                                    .tab_stop(true)
+                                    .cursor_pointer()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(if access == self.runtime_access {
+                                        colors.focus_ring
+                                    } else {
+                                        colors.border
+                                    }))
+                                    .focus_visible(move |style| {
+                                        style.border_color(rgb(colors.focus_ring))
+                                    })
+                                    .bg(rgb(if access == self.runtime_access {
+                                        colors.accent_soft
+                                    } else {
+                                        colors.panel
+                                    }))
+                                    .p_3()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_runtime_access(access, cx)
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(colors.text))
+                                            .child(access.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(colors.muted_text))
+                                            .child(detail),
+                                    )
+                            }),
+                    );
+            return modal::modal_frame("Runtime access", body, self.theme).into_any_element();
+        }
+
         if modal_state != ModalState::NewThread {
             return modal::modal_frame(
                 modal_state.title(),
@@ -2417,7 +3325,6 @@ impl RodeApp {
             .into_any_element();
         }
 
-        let colors = theme::tokens(self.theme).colors;
         if self.thread_activity == ThreadActivity::Failed && self.worktree_failure.is_some() {
             let detail = self.worktree_failure.clone().unwrap_or_default();
             return modal::modal_frame(
@@ -4025,8 +4932,196 @@ impl RodeApp {
             )
     }
 
-    fn render_messages(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_messages(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = theme::tokens(self.theme).colors;
+        if !self.conversation.cards().is_empty() {
+            let cards = self.conversation.cards().to_vec();
+            let live_approvals = self
+                .approvals
+                .iter()
+                .map(|request| request.item_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let entity = cx.entity().downgrade();
+            let theme_kind = self.theme;
+            let virtualized = list(
+                self.conversation_list.clone(),
+                move |index, _window, _cx| {
+                    let Some(card) = cards.get(index).cloned() else {
+                        return div().into_any_element();
+                    };
+                    let card_id = card.id.clone();
+                    let toggle_entity = entity.clone();
+                    let mut element = message_card::card(&card, theme_kind).when(
+                        card.is_collapsible(),
+                        |card_element| {
+                            card_element.child(
+                                div()
+                                    .id(("toggle-card", index))
+                                    .role(Role::Button)
+                                    .aria_label(if card.collapsed {
+                                        "Expand card"
+                                    } else {
+                                        "Collapse card"
+                                    })
+                                    .tab_index(0)
+                                    .tab_stop(true)
+                                    .cursor_pointer()
+                                    .self_end()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(theme::tokens(theme_kind).colors.overlay))
+                                    .border_1()
+                                    .border_color(rgb(theme::tokens(theme_kind).colors.overlay))
+                                    .focus_visible(move |style| {
+                                        style.border_color(rgb(theme::tokens(theme_kind)
+                                            .colors
+                                            .focus_ring))
+                                    })
+                                    .text_xs()
+                                    .text_color(rgb(theme::tokens(theme_kind).colors.muted_text))
+                                    .on_click(move |_, _, cx| {
+                                        toggle_entity
+                                            .update(cx, |this, cx| {
+                                                this.toggle_conversation_card(&card_id, cx)
+                                            })
+                                            .ok();
+                                    })
+                                    .child(if card.collapsed { "Expand" } else { "Collapse" }),
+                            )
+                        },
+                    );
+                    if let CardKind::Approval { item_id, .. } = &card.kind
+                        && card.status == CardStatus::Pending
+                        && live_approvals.contains(item_id)
+                    {
+                        let approve_item = item_id.clone();
+                        let decline_item = item_id.clone();
+                        let approve_entity = entity.clone();
+                        let decline_entity = entity.clone();
+                        element = element.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id(("typed-approval-accept", index))
+                                        .role(Role::Button)
+                                        .aria_label("Approve request once")
+                                        .tab_index(0)
+                                        .tab_stop(true)
+                                        .cursor_pointer()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(theme::tokens(theme_kind).colors.addition_soft))
+                                        .border_1()
+                                        .border_color(rgb(theme::tokens(theme_kind)
+                                            .colors
+                                            .addition_soft))
+                                        .focus_visible(move |style| {
+                                            style.border_color(rgb(theme::tokens(theme_kind)
+                                                .colors
+                                                .focus_ring))
+                                        })
+                                        .text_xs()
+                                        .text_color(rgb(theme::tokens(theme_kind).colors.success))
+                                        .on_click(move |_, _, cx| {
+                                            approve_entity
+                                                .update(cx, |this, cx| {
+                                                    this.respond_to_approval_item(
+                                                        &approve_item,
+                                                        "accept",
+                                                        cx,
+                                                    )
+                                                })
+                                                .ok();
+                                        })
+                                        .child("Approve once"),
+                                )
+                                .child(
+                                    div()
+                                        .id(("typed-approval-decline", index))
+                                        .role(Role::Button)
+                                        .aria_label("Decline request")
+                                        .tab_index(0)
+                                        .tab_stop(true)
+                                        .cursor_pointer()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(theme::tokens(theme_kind).colors.deletion_soft))
+                                        .border_1()
+                                        .border_color(rgb(theme::tokens(theme_kind)
+                                            .colors
+                                            .deletion_soft))
+                                        .focus_visible(move |style| {
+                                            style.border_color(rgb(theme::tokens(theme_kind)
+                                                .colors
+                                                .focus_ring))
+                                        })
+                                        .text_xs()
+                                        .text_color(rgb(theme::tokens(theme_kind).colors.error))
+                                        .on_click(move |_, _, cx| {
+                                            decline_entity
+                                                .update(cx, |this, cx| {
+                                                    this.respond_to_approval_item(
+                                                        &decline_item,
+                                                        "decline",
+                                                        cx,
+                                                    )
+                                                })
+                                                .ok();
+                                        })
+                                        .child("Decline"),
+                                ),
+                        );
+                    }
+                    div().w_full().pb_4().child(element).into_any_element()
+                },
+            )
+            .size_full()
+            .p_5();
+            let show_jump = !self.conversation_list.is_following_tail();
+            return div()
+                .id("messages-virtualized")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(virtualized)
+                .when(show_jump, |container| {
+                    container.child(
+                        div()
+                            .id("jump-to-latest")
+                            .role(Role::Button)
+                            .aria_label("Jump to latest conversation card")
+                            .tab_index(0)
+                            .tab_stop(true)
+                            .absolute()
+                            .bottom_4()
+                            .left_0()
+                            .right_0()
+                            .mx_auto()
+                            .w(px(140.))
+                            .h(px(32.))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(colors.accent))
+                            .border_1()
+                            .border_color(rgb(colors.accent))
+                            .focus_visible(move |style| style.border_color(rgb(colors.focus_ring)))
+                            .text_sm()
+                            .text_color(rgb(colors.on_accent))
+                            .on_click(cx.listener(|this, _, _, cx| this.jump_to_latest(cx)))
+                            .child("Jump to latest"),
+                    )
+                })
+                .into_any_element();
+        }
         let mut messages = div()
             .id("messages")
             .flex_1()
@@ -4132,11 +5227,22 @@ impl RodeApp {
                                     .id(("approval-accept", index))
                                     .role(Role::Button)
                                     .aria_label("Approve request")
+                                    .tab_index(0)
+                                    .tab_stop(true)
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
                                     .bg(rgb(theme::tokens(self.theme).colors.addition_soft))
+                                    .border_1()
+                                    .border_color(rgb(theme::tokens(self.theme)
+                                        .colors
+                                        .addition_soft))
+                                    .focus_visible(move |style| {
+                                        style.border_color(rgb(theme::tokens(self.theme)
+                                            .colors
+                                            .focus_ring))
+                                    })
                                     .text_xs()
                                     .text_color(rgb(theme::tokens(self.theme).colors.success))
                                     .hover(|style| {
@@ -4152,11 +5258,22 @@ impl RodeApp {
                                     .id(("approval-decline", index))
                                     .role(Role::Button)
                                     .aria_label("Decline request")
+                                    .tab_index(0)
+                                    .tab_stop(true)
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
                                     .bg(rgb(theme::tokens(self.theme).colors.deletion_soft))
+                                    .border_1()
+                                    .border_color(rgb(theme::tokens(self.theme)
+                                        .colors
+                                        .deletion_soft))
+                                    .focus_visible(move |style| {
+                                        style.border_color(rgb(theme::tokens(self.theme)
+                                            .colors
+                                            .focus_ring))
+                                    })
                                     .text_xs()
                                     .text_color(rgb(theme::tokens(self.theme).colors.error))
                                     .hover(|style| {
@@ -4191,11 +5308,21 @@ impl RodeApp {
                     .child(activity),
             );
         }
-        messages
+        messages.into_any_element()
     }
 
-    fn render_composer(&self, cx: &App) -> Div {
+    fn render_composer(&self, cx: &mut Context<Self>) -> Div {
         let focus_handle = self.composer.read(cx).focus_handle.clone();
+        let model_label = self
+            .selected_model
+            .as_deref()
+            .or(match self.model_catalog {
+                ModelCatalogState::Loading => Some("Loading models…"),
+                ModelCatalogState::Error(_) => Some("Model unavailable"),
+                _ => Some("Choose model"),
+            })
+            .unwrap_or("Choose model")
+            .to_owned();
         div()
             .p_4()
             .flex_none()
@@ -4214,7 +5341,7 @@ impl RodeApp {
                     .w_full()
                     .min_w_0()
                     .overflow_hidden()
-                    .h(px(112.))
+                    .h(px(148.))
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
@@ -4227,11 +5354,149 @@ impl RodeApp {
                     .text_size(px(14.))
                     .text_color(rgb(theme::tokens(self.theme).colors.text))
                     .child(
-                        div().w_full().min_w_0().h(px(72.)).overflow_hidden().child(
+                        div().w_full().min_w_0().h(px(70.)).overflow_hidden().child(
                             self.composer
                                 .clone()
-                                .cached(StyleRefinement::default().w_full().h(px(72.))),
+                                .cached(StyleRefinement::default().w_full().h(px(70.))),
                         ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("composer-model")
+                                            .role(Role::Button)
+                                            .aria_label("Choose Codex model")
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(theme::tokens(self.theme).colors.overlay))
+                                            .border_1()
+                                            .border_color(rgb(theme::tokens(self.theme)
+                                                .colors
+                                                .overlay))
+                                            .focus_visible(move |style| {
+                                                style.border_color(rgb(theme::tokens(self.theme)
+                                                    .colors
+                                                    .focus_ring))
+                                            })
+                                            .text_xs()
+                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                            .border_1()
+                                            .border_color(rgb(theme::tokens(self.theme)
+                                                .colors
+                                                .overlay))
+                                            .focus_visible(move |style| {
+                                                style.border_color(rgb(theme::tokens(self.theme)
+                                                    .colors
+                                                    .focus_ring))
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_model_picker(cx)
+                                            }))
+                                            .child(model_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-access")
+                                            .role(Role::Button)
+                                            .aria_label("Choose runtime access")
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(
+                                                if self.runtime_access == RuntimeAccess::FullAccess
+                                                {
+                                                    theme::tokens(self.theme).colors.warning_soft
+                                                } else {
+                                                    theme::tokens(self.theme).colors.overlay
+                                                },
+                                            ))
+                                            .text_xs()
+                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                            .border_1()
+                                            .border_color(rgb(if self.attach_git_diff {
+                                                theme::tokens(self.theme).colors.accent_soft
+                                            } else {
+                                                theme::tokens(self.theme).colors.overlay
+                                            }))
+                                            .focus_visible(move |style| {
+                                                style.border_color(rgb(theme::tokens(self.theme)
+                                                    .colors
+                                                    .focus_ring))
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_access_picker(cx)
+                                            }))
+                                            .child(self.runtime_access.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-attach-diff")
+                                            .role(Role::Button)
+                                            .aria_label("Attach current Git diff")
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(if self.attach_git_diff {
+                                                theme::tokens(self.theme).colors.accent_soft
+                                            } else {
+                                                theme::tokens(self.theme).colors.overlay
+                                            }))
+                                            .text_xs()
+                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_git_diff_attachment(cx)
+                                            }))
+                                            .child(if self.attach_git_diff {
+                                                "Diff attached"
+                                            } else {
+                                                "Attach diff"
+                                            }),
+                                    ),
+                            )
+                            .child(if self.running {
+                                button::button(
+                                    "composer-cancel",
+                                    "Cancel",
+                                    button::ButtonStyle::Destructive,
+                                    false,
+                                    self.theme,
+                                    cx.listener(|this, _, _, cx| this.cancel_turn(cx)),
+                                )
+                                .into_any_element()
+                            } else {
+                                button::button(
+                                    "composer-send",
+                                    "Send",
+                                    button::ButtonStyle::Primary,
+                                    self.creating_worktree || self.selected_model.is_none(),
+                                    self.theme,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.send_prompt(&SendPrompt, window, cx)
+                                    }),
+                                )
+                                .into_any_element()
+                            }),
                     )
                     .child(
                         div()

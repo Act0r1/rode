@@ -3,12 +3,14 @@ use async_channel::{Receiver, Sender};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, BufWriter, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
+
+use crate::agent::{ProviderModel, RuntimeAccess, TurnRequest};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -66,12 +68,16 @@ pub enum CodexEvent {
         turn_id: String,
     },
     AgentMessageDelta {
+        item_id: String,
         delta: String,
     },
     AgentMessageCompleted {
+        item_id: String,
         text: String,
     },
     ReasoningDelta {
+        item_id: String,
+        content_index: i64,
         delta: String,
     },
     CommandStarted {
@@ -85,9 +91,18 @@ pub enum CodexEvent {
         exit_code: Option<i64>,
         output: String,
     },
+    CommandOutputDelta {
+        item_id: String,
+        delta: String,
+    },
     FileChangeStarted {
         item_id: String,
         summary: String,
+    },
+    FileChangeCompleted {
+        item_id: String,
+        summary: String,
+        status: String,
     },
     ApprovalRequested(ApprovalRequest),
     TurnCompleted {
@@ -107,6 +122,7 @@ struct Inner {
     child: Mutex<Child>,
     thread_id: Mutex<String>,
     active_turn_id: Mutex<Option<String>>,
+    cwd: PathBuf,
 }
 
 impl Drop for Inner {
@@ -127,7 +143,50 @@ impl CodexSession {
     pub fn start(
         cwd: &Path,
         resume_thread_id: Option<&str>,
+        model: &str,
+        access: RuntimeAccess,
     ) -> Result<(Self, Receiver<CodexEvent>)> {
+        let (session, events_tx, events_rx, cwd) = Self::connect(cwd)?;
+        let thread_params = thread_start_params(&cwd, model, access);
+        let opened = match resume_thread_id {
+            Some(thread_id) => {
+                let mut resume = thread_params.clone();
+                resume["threadId"] = json!(thread_id);
+                session.request("thread/resume", resume)?
+            }
+            None => session.request("thread/start", thread_params)?,
+        };
+        let thread_id = opened
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .context("thread/start response did not include thread.id")?
+            .to_owned();
+        let model = opened
+            .pointer("/thread/model")
+            .or_else(|| opened.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or(model)
+            .to_owned();
+        *session
+            .inner
+            .thread_id
+            .lock()
+            .map_err(|_| anyhow!("Codex thread lock is poisoned"))? = thread_id.clone();
+        events_tx
+            .send_blocking(CodexEvent::SessionReady { thread_id, model })
+            .ok();
+
+        Ok((session, events_rx))
+    }
+
+    fn connect(
+        cwd: &Path,
+    ) -> Result<(
+        Self,
+        Sender<CodexEvent>,
+        Receiver<CodexEvent>,
+        std::path::PathBuf,
+    )> {
         let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let mut child = Command::new("codex")
             .args(["app-server", "--stdio"])
@@ -171,6 +230,7 @@ impl CodexSession {
                 child: Mutex::new(child),
                 thread_id: Mutex::new(String::new()),
                 active_turn_id: Mutex::new(None),
+                cwd: cwd.clone(),
             }),
         };
 
@@ -182,58 +242,39 @@ impl CodexSession {
                     "title": "Rode",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": { "experimentalApi": true }
+                "capabilities": {
+                    "experimentalApi": true,
+                    "requestAttestation": false
+                }
             }),
         )?;
         session.notify("initialized", None)?;
-
-        let thread_params = json!({
-            "cwd": cwd,
-            "approvalPolicy": "on-request",
-            "sandbox": "workspace-write"
-        });
-        let opened = match resume_thread_id {
-            Some(thread_id) => {
-                let mut resume = thread_params.clone();
-                resume["threadId"] = json!(thread_id);
-                session
-                    .request("thread/resume", resume)
-                    .or_else(|_| session.request("thread/start", thread_params.clone()))?
-            }
-            None => session.request("thread/start", thread_params)?,
-        };
-        let thread_id = opened
-            .pointer("/thread/id")
-            .and_then(Value::as_str)
-            .context("thread/start response did not include thread.id")?
-            .to_owned();
-        let model = opened
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("Codex")
-            .to_owned();
-        *session
-            .inner
-            .thread_id
-            .lock()
-            .map_err(|_| anyhow!("Codex thread lock is poisoned"))? = thread_id.clone();
-        events_tx
-            .send_blocking(CodexEvent::SessionReady { thread_id, model })
-            .ok();
-
-        Ok((session, events_rx))
+        Ok((session, events_tx, events_rx, cwd))
     }
 
-    pub fn start_turn(&self, prompt: &str) -> Result<String> {
+    pub fn start_turn(&self, request: &TurnRequest) -> Result<String> {
         let thread_id = self.thread_id()?;
+        if request
+            .provider_thread_id
+            .as_deref()
+            .is_some_and(|id| id != thread_id)
+        {
+            anyhow::bail!("turn request targets a different Codex provider thread");
+        }
+        let request_cwd = request
+            .cwd
+            .canonicalize()
+            .unwrap_or_else(|_| request.cwd.clone());
+        if request_cwd != self.inner.cwd {
+            anyhow::bail!("turn request targets a different workspace");
+        }
+        if request.access == RuntimeAccess::FullAccess && !request.full_access_confirmed {
+            anyhow::bail!("full access was not confirmed for this turn request");
+        }
+        let input = turn_inputs(request);
         let response = self.request(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": prompt }],
-                "approvalPolicy": "on-request",
-                "sandboxPolicy": { "type": "workspaceWrite" }
-            }),
+            turn_start_params(&thread_id, request, input, &request_cwd),
         )?;
         let turn_id = response
             .pointer("/turn/id")
@@ -246,6 +287,31 @@ impl CodexSession {
             .lock()
             .map_err(|_| anyhow!("Codex turn lock is poisoned"))? = Some(turn_id.clone());
         Ok(turn_id)
+    }
+
+    pub fn discover_models(cwd: &Path) -> Result<Vec<ProviderModel>> {
+        let (session, _, _, _) = Self::connect(cwd)?;
+        let mut cursor: Option<String> = None;
+        let mut models = Vec::new();
+        loop {
+            let result = session.request(
+                "model/list",
+                json!({
+                    "cursor": cursor,
+                    "includeHidden": false,
+                    "limit": 100
+                }),
+            )?;
+            models.extend(parse_models(&result)?);
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(models)
     }
 
     pub fn interrupt(&self) -> Result<()> {
@@ -330,6 +396,114 @@ impl CodexSession {
             .send(message)
             .map_err(|_| anyhow!("Codex app-server writer has stopped"))
     }
+}
+
+fn sandbox_mode(access: RuntimeAccess) -> &'static str {
+    match access {
+        RuntimeAccess::ReadOnly => "read-only",
+        RuntimeAccess::WorkspaceWrite => "workspace-write",
+        RuntimeAccess::FullAccess => "danger-full-access",
+    }
+}
+
+fn thread_start_params(cwd: &Path, model: &str, access: RuntimeAccess) -> Value {
+    json!({
+        "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd],
+        "approvalPolicy": "on-request",
+        "sandbox": sandbox_mode(access),
+        "model": model
+    })
+}
+
+fn turn_start_params(
+    thread_id: &str,
+    request: &TurnRequest,
+    input: Vec<Value>,
+    cwd: &Path,
+) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": input,
+        "approvalPolicy": "on-request",
+        "sandboxPolicy": sandbox_policy(request.access, cwd),
+        "model": request.model,
+        "cwd": cwd,
+        "runtimeWorkspaceRoots": [cwd]
+    })
+}
+
+fn turn_inputs(request: &TurnRequest) -> Vec<Value> {
+    let mut input = vec![json!({
+        "type": "text",
+        "text": request.prompt,
+        "text_elements": []
+    })];
+    input.extend(request.attachments.iter().map(|attachment| {
+        json!({
+            "type": "text",
+            "text": attachment.as_text_context(),
+            "text_elements": []
+        })
+    }));
+    input
+}
+
+fn sandbox_policy(access: RuntimeAccess, cwd: &Path) -> Value {
+    match access {
+        RuntimeAccess::ReadOnly => json!({ "type": "readOnly", "networkAccess": false }),
+        RuntimeAccess::WorkspaceWrite => json!({
+            "type": "workspaceWrite",
+            "writableRoots": [cwd],
+            "networkAccess": false,
+            "excludeSlashTmp": false,
+            "excludeTmpdirEnvVar": false
+        }),
+        RuntimeAccess::FullAccess => json!({ "type": "dangerFullAccess" }),
+    }
+}
+
+fn parse_models(result: &Value) -> Result<Vec<ProviderModel>> {
+    let models = result
+        .get("data")
+        .and_then(Value::as_array)
+        .context("model/list response did not include data")?;
+    models
+        .iter()
+        .map(|model| {
+            let id = model
+                .get("model")
+                .or_else(|| model.get("id"))
+                .and_then(Value::as_str)
+                .context("model/list item did not include a model id")?
+                .to_owned();
+            Ok(ProviderModel {
+                id,
+                display_name: model
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex model")
+                    .to_owned(),
+                description: model
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                is_default: model
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                supports_images: model
+                    .get("inputModalities")
+                    .and_then(Value::as_array)
+                    .is_some_and(|modalities| {
+                        modalities
+                            .iter()
+                            .any(|modality| modality.as_str() == Some("image"))
+                    }),
+            })
+        })
+        .collect()
 }
 
 fn spawn_writer(
@@ -541,13 +715,23 @@ fn decode_notification(method: &str, params: &Value) -> Option<CodexEvent> {
                 .to_owned(),
         }),
         "item/agentMessage/delta" => Some(CodexEvent::AgentMessageDelta {
+            item_id: params.get("itemId")?.as_str()?.to_owned(),
             delta: params.get("delta")?.as_str()?.to_owned(),
         }),
-        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-            Some(CodexEvent::ReasoningDelta {
-                delta: params.get("delta")?.as_str()?.to_owned(),
-            })
-        }
+        "item/reasoning/summaryTextDelta" => Some(CodexEvent::ReasoningDelta {
+            item_id: params.get("itemId")?.as_str()?.to_owned(),
+            content_index: params.get("summaryIndex")?.as_i64()?,
+            delta: params.get("delta")?.as_str()?.to_owned(),
+        }),
+        "item/reasoning/textDelta" => Some(CodexEvent::ReasoningDelta {
+            item_id: params.get("itemId")?.as_str()?.to_owned(),
+            content_index: params.get("contentIndex")?.as_i64()?,
+            delta: params.get("delta")?.as_str()?.to_owned(),
+        }),
+        "item/commandExecution/outputDelta" => Some(CodexEvent::CommandOutputDelta {
+            item_id: params.get("itemId")?.as_str()?.to_owned(),
+            delta: params.get("delta")?.as_str()?.to_owned(),
+        }),
         "item/started" => decode_item_started(params.get("item")?),
         "item/completed" => decode_item_completed(params.get("item")?),
         "turn/completed" => {
@@ -597,6 +781,7 @@ fn decode_item_started(item: &Value) -> Option<CodexEvent> {
 fn decode_item_completed(item: &Value) -> Option<CodexEvent> {
     match item.get("type")?.as_str()? {
         "agentMessage" => Some(CodexEvent::AgentMessageCompleted {
+            item_id: item.get("id")?.as_str()?.to_owned(),
             text: item.get("text")?.as_str()?.to_owned(),
         }),
         "commandExecution" => Some(CodexEvent::CommandCompleted {
@@ -607,6 +792,15 @@ fn decode_item_completed(item: &Value) -> Option<CodexEvent> {
                 .get("aggregatedOutput")
                 .and_then(Value::as_str)
                 .unwrap_or("")
+                .to_owned(),
+        }),
+        "fileChange" => Some(CodexEvent::FileChangeCompleted {
+            item_id: item.get("id")?.as_str()?.to_owned(),
+            summary: summarize_changes(item.get("changes")),
+            status: item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
                 .to_owned(),
         }),
         _ => None,
@@ -650,8 +844,11 @@ fn strip_ansi(value: &str) -> String {
 mod tests {
     use super::{
         ApprovalKind, CodexEvent, CodexSession, RpcId, decode_notification, decode_server_request,
+        parse_models, thread_start_params, turn_inputs, turn_start_params,
     };
+    use crate::agent::{RuntimeAccess, TurnAttachment, TurnRequest};
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn decodes_agent_message_delta() {
@@ -661,7 +858,7 @@ mod tests {
         );
         assert!(matches!(
             event,
-            Some(CodexEvent::AgentMessageDelta { delta }) if delta == "hello"
+            Some(CodexEvent::AgentMessageDelta { delta, .. }) if delta == "hello"
         ));
     }
 
@@ -707,10 +904,114 @@ mod tests {
     }
 
     #[test]
+    fn decodes_stream_ids_and_completed_file_changes() {
+        assert!(matches!(
+            decode_notification(
+                "item/commandExecution/outputDelta",
+                &json!({ "itemId": "command-1", "delta": "building\n" })
+            ),
+            Some(CodexEvent::CommandOutputDelta { item_id, delta })
+                if item_id == "command-1" && delta == "building\n"
+        ));
+        assert!(matches!(
+            decode_notification(
+                "item/completed",
+                &json!({
+                    "item": {
+                        "type": "fileChange",
+                        "id": "change-1",
+                        "status": "completed",
+                        "changes": [{ "path": "src/main.rs" }]
+                    }
+                })
+            ),
+            Some(CodexEvent::FileChangeCompleted { item_id, summary, status })
+                if item_id == "change-1" && summary == "src/main.rs" && status == "completed"
+        ));
+    }
+
+    #[test]
+    fn parses_provider_reported_models_without_hardcoded_choices() {
+        let models = parse_models(&json!({
+            "data": [{
+                "id": "catalog-id",
+                "model": "gpt-5.4",
+                "displayName": "GPT-5.4",
+                "description": "Latest coding model",
+                "isDefault": true,
+                "inputModalities": ["text", "image"]
+            }],
+            "nextCursor": null
+        }))
+        .expect("parse models");
+        assert_eq!(models[0].id, "gpt-5.4");
+        assert_eq!(models[0].display_name, "GPT-5.4");
+        assert!(models[0].is_default);
+        assert!(models[0].supports_images);
+    }
+
+    #[test]
+    fn exact_model_and_access_are_encoded_in_thread_and_turn_requests() {
+        let cwd = Path::new("/tmp/rode-worktree");
+        let expected = [
+            (
+                RuntimeAccess::ReadOnly,
+                "read-only",
+                json!({ "type": "readOnly", "networkAccess": false }),
+            ),
+            (
+                RuntimeAccess::WorkspaceWrite,
+                "workspace-write",
+                json!({
+                    "type": "workspaceWrite",
+                    "writableRoots": [cwd],
+                    "networkAccess": false,
+                    "excludeSlashTmp": false,
+                    "excludeTmpdirEnvVar": false
+                }),
+            ),
+            (
+                RuntimeAccess::FullAccess,
+                "danger-full-access",
+                json!({ "type": "dangerFullAccess" }),
+            ),
+        ];
+        for (access, thread_sandbox, turn_sandbox) in expected {
+            let request = TurnRequest {
+                local_thread_id: "local-1".to_owned(),
+                provider_thread_id: Some("provider-1".to_owned()),
+                cwd: cwd.into(),
+                prompt: "Review".to_owned(),
+                model: "gpt-5.4".to_owned(),
+                access,
+                attachments: vec![TurnAttachment::GitDiff {
+                    text: "+change".to_owned(),
+                }],
+                full_access_confirmed: access == RuntimeAccess::FullAccess,
+            };
+            let thread = thread_start_params(cwd, &request.model, access);
+            assert_eq!(thread["model"], "gpt-5.4");
+            assert_eq!(thread["sandbox"], thread_sandbox);
+            let inputs = turn_inputs(&request);
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(inputs[0]["text_elements"], json!([]));
+            let turn = turn_start_params("provider-1", &request, inputs, cwd);
+            assert_eq!(turn["model"], "gpt-5.4");
+            assert_eq!(turn["sandboxPolicy"], turn_sandbox);
+        }
+    }
+
+    #[test]
     #[ignore = "requires an installed and authenticated Codex CLI"]
     fn installed_codex_app_server_initializes_and_opens_a_thread() {
         let cwd = std::env::current_dir().expect("current directory");
-        let (session, events) = CodexSession::start(&cwd, None).expect("start app-server session");
+        let (session, events) = CodexSession::start(
+            &cwd,
+            None,
+            "gpt-5.4",
+            crate::agent::RuntimeAccess::WorkspaceWrite,
+        )
+        .expect("start app-server session");
         assert!(!session.thread_id().expect("provider thread id").is_empty());
         assert!(matches!(
             events.recv_blocking(),
