@@ -5008,7 +5008,7 @@ impl RodeApp {
     fn render_messages(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = theme::tokens(self.theme).colors;
         if !self.conversation.cards().is_empty() {
-            let cards = self.conversation.cards().to_vec();
+            let cards = self.conversation.shared_cards();
             let live_approvals = self
                 .approvals
                 .iter()
