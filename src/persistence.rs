@@ -153,8 +153,7 @@ impl StateStore {
              ON CONFLICT(path) DO UPDATE SET
                 git_root = excluded.git_root,
                 name = excluded.name,
-                active_thread_id = excluded.active_thread_id,
-                last_opened_ms = excluded.last_opened_ms",
+                active_thread_id = excluded.active_thread_id",
             params![
                 project_path,
                 project_id,
@@ -916,7 +915,7 @@ fn usize_to_i64(value: usize) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{StateStore, StoredMessage, StoredThread};
+    use super::{StateStore, StoredMessage, StoredProject, StoredThread};
     use crate::conversation::{CardKind, CardStatus, ConversationCard};
     use rusqlite::Connection;
     use std::fs;
@@ -1080,6 +1079,84 @@ mod tests {
             .remove_project(&repaired[0].path)
             .expect("remove repaired project");
         assert!(store.load_projects().unwrap().is_empty());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("clean state fixture");
+    }
+
+    #[test]
+    fn saving_a_thread_does_not_reorder_projects() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rode-project-order-test-{nonce}"));
+        fs::create_dir_all(&root).expect("create state fixture");
+        let database = root.join("state.sqlite3");
+        let older_project = root.join("older");
+        let newer_project = root.join("newer");
+        fs::create_dir_all(&older_project).expect("create older project fixture");
+        fs::create_dir_all(&newer_project).expect("create newer project fixture");
+        let mut store = StateStore::open(&database).expect("open state database");
+        store
+            .save_project(&StoredProject::new(
+                older_project.clone(),
+                "Older".to_owned(),
+            ))
+            .expect("save older project");
+        store
+            .save_project(&StoredProject::new(
+                newer_project.clone(),
+                "Newer".to_owned(),
+            ))
+            .expect("save newer project");
+        store
+            .connection
+            .execute(
+                "UPDATE projects SET last_opened_ms = CASE path WHEN ?1 THEN 100 WHEN ?2 THEN 200 END",
+                rusqlite::params![
+                    older_project.to_string_lossy(),
+                    newer_project.to_string_lossy()
+                ],
+            )
+            .expect("set deterministic project order");
+
+        store
+            .save_thread(&StoredThread {
+                id: "older-thread".to_owned(),
+                project_path: older_project.clone(),
+                project_name: "Older".to_owned(),
+                title: "Thread 1".to_owned(),
+                workspace_path: older_project.clone(),
+                branch: None,
+                provider_thread_id: None,
+                ordinal: 1,
+                draft: String::new(),
+                activity: "ready".to_owned(),
+                activity_updated_ms: 100,
+                base_branch: None,
+                last_error: None,
+                dirty_count: 0,
+                unread: false,
+                conversation_scroll_item: 0,
+                conversation_scroll_offset_millis: 0,
+                messages: Vec::new(),
+                events: Vec::new(),
+            })
+            .expect("save thread in older project");
+
+        let projects = store.load_projects().expect("load ordered projects");
+        assert_eq!(projects[0].path, newer_project);
+        assert_eq!(projects[0].last_opened_ms, 200);
+        assert_eq!(projects[1].path, older_project);
+        assert_eq!(projects[1].last_opened_ms, 100);
+
+        store
+            .save_project(&projects[1])
+            .expect("open older project");
+        let reordered = store.load_projects().expect("load reordered projects");
+        assert_eq!(reordered[0].path, older_project);
+        assert!(reordered[0].last_opened_ms > 200);
 
         drop(store);
         fs::remove_dir_all(root).expect("clean state fixture");

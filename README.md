@@ -40,6 +40,13 @@ stable Rust toolchain, `wayland`, `libxkbcommon`, `vulkan-icd-loader`,
 `fontconfig`, and a working Vulkan driver. Building the pinned Ghostty VT core
 also requires Zig 0.15.x on `PATH` (0.15.2 is tested).
 
+If a system Zig 0.16 installation causes `libghostty-vt-sys` build errors, put
+Zig 0.15.2 first for Rust commands:
+
+```sh
+PATH=/home/yeager/.local/opt/zig-x86_64-linux-0.15.2:$PATH cargo check
+```
+
 ```sh
 cargo run -- /path/to/a/project
 ```
