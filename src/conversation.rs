@@ -1,10 +1,38 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static CARD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ConversationAttachment {
+    /// Compatibility with conversation events written before attachments were typed.
+    Legacy(String),
+    Context {
+        label: String,
+    },
+    Image {
+        path: PathBuf,
+    },
+}
+
+impl ConversationAttachment {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Legacy(label) => label.clone(),
+            Self::Context { label } => label.clone(),
+            Self::Image { path } => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Image")
+                .to_owned(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,7 +61,7 @@ pub enum CardKind {
         text: String,
         model: String,
         access: String,
-        attachments: Vec<String>,
+        attachments: Vec<ConversationAttachment>,
     },
     AssistantMessage {
         text: String,
@@ -283,7 +311,10 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CardKind, CardStatus, ConversationCard, ConversationProjection, NoticeTone};
+    use super::{
+        CardKind, CardStatus, ConversationAttachment, ConversationCard, ConversationProjection,
+        NoticeTone,
+    };
 
     #[test]
     fn streaming_updates_keep_stable_card_identity() {
@@ -315,13 +346,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_string_attachments_remain_readable() {
+        let json = r#"{"id":"user-1","turn_id":null,"created_at_ms":1,"status":"complete","collapsed":false,"kind":{"type":"user_message","text":"Look","model":"gpt-5.4","access":"workspace_write","attachments":["design.png"]}}"#;
+        let card: ConversationCard = serde_json::from_str(json).expect("read legacy card");
+        assert!(matches!(
+            card.kind,
+            CardKind::UserMessage { attachments, .. }
+                if attachments == vec![ConversationAttachment::Legacy("design.png".to_owned())]
+        ));
+    }
+
+    #[test]
     fn every_typed_card_variant_round_trips() {
         let variants = vec![
             CardKind::UserMessage {
                 text: "Prompt".to_owned(),
                 model: "gpt-5.4".to_owned(),
                 access: "read_only".to_owned(),
-                attachments: vec!["Current Git diff".to_owned()],
+                attachments: vec![ConversationAttachment::Context {
+                    label: "Current Git diff".to_owned(),
+                }],
             },
             CardKind::AssistantMessage {
                 text: "Answer".to_owned(),

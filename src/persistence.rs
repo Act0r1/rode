@@ -916,7 +916,7 @@ fn usize_to_i64(value: usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{StateStore, StoredMessage, StoredProject, StoredThread};
-    use crate::conversation::{CardKind, CardStatus, ConversationCard};
+    use crate::conversation::{CardKind, CardStatus, ConversationAttachment, ConversationCard};
     use rusqlite::Connection;
     use std::fs;
     use std::path::Path;
@@ -971,7 +971,9 @@ mod tests {
                         text: "Build it".to_owned(),
                         model: "gpt-5.4".to_owned(),
                         access: "workspace-write".to_owned(),
-                        attachments: vec!["design.png".to_owned()],
+                        attachments: vec![ConversationAttachment::Image {
+                            path: "/tmp/design.png".into(),
+                        }],
                     },
                     CardStatus::Complete,
                     Some("turn-1".to_owned()),

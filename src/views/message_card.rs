@@ -1,6 +1,8 @@
-use crate::conversation::{CardKind, CardStatus, ConversationCard, NoticeTone};
+use crate::conversation::{
+    CardKind, CardStatus, ConversationAttachment, ConversationCard, NoticeTone,
+};
 use crate::theme::{self, ThemeKind};
-use gpui::{Div, div, prelude::*, px, rgb};
+use gpui::{Div, ObjectFit, div, img, prelude::*, px, rgb};
 
 pub(crate) fn card(card: &ConversationCard, theme_kind: ThemeKind) -> Div {
     let colors = theme::tokens(theme_kind).colors;
@@ -36,6 +38,17 @@ pub(crate) fn card(card: &ConversationCard, theme_kind: ThemeKind) -> Div {
         CardStatus::Complete => "Complete",
     };
 
+    let image_paths = match &card.kind {
+        CardKind::UserMessage { attachments, .. } => attachments
+            .iter()
+            .filter_map(|attachment| match attachment {
+                ConversationAttachment::Image { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
     div()
         .w_full()
         .rounded_lg()
@@ -69,6 +82,21 @@ pub(crate) fn card(card: &ConversationCard, theme_kind: ThemeKind) -> Div {
                 ),
         )
         .child(card_body(card, theme_kind))
+        .children(image_paths.into_iter().enumerate().map(|(index, path)| {
+            let open_path = path.clone();
+            img(path)
+                .id(format!("chat-image-{}-{index}", card.id))
+                .role(gpui::Role::Button)
+                .aria_label("Open image")
+                .tab_index(0)
+                .tab_stop(true)
+                .cursor_pointer()
+                .w_full()
+                .max_h(px(320.))
+                .rounded_md()
+                .object_fit(ObjectFit::ScaleDown)
+                .on_click(move |_, _, cx| cx.open_with_system(&open_path))
+        }))
 }
 
 fn card_body(card: &ConversationCard, theme_kind: ThemeKind) -> Div {
@@ -84,7 +112,14 @@ fn card_body(card: &ConversationCard, theme_kind: ThemeKind) -> Div {
             if attachments.is_empty() {
                 String::new()
             } else {
-                format!(" · Context: {}", attachments.join(", "))
+                format!(
+                    " · Context: {}",
+                    attachments
+                        .iter()
+                        .map(ConversationAttachment::label)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
         ),
         CardKind::AssistantMessage { text } | CardKind::Reasoning { text } => text.clone(),

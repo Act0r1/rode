@@ -439,13 +439,22 @@ fn turn_inputs(request: &TurnRequest) -> Vec<Value> {
         "text": request.prompt,
         "text_elements": []
     })];
-    input.extend(request.attachments.iter().map(|attachment| {
-        json!({
-            "type": "text",
-            "text": attachment.as_text_context(),
-            "text_elements": []
-        })
-    }));
+    input.extend(
+        request
+            .attachments
+            .iter()
+            .map(|attachment| match attachment {
+                crate::agent::TurnAttachment::GitDiff { .. } => json!({
+                    "type": "text",
+                    "text": attachment.as_text_context().unwrap_or_default(),
+                    "text_elements": []
+                }),
+                crate::agent::TurnAttachment::Image { path } => json!({
+                    "type": "localImage",
+                    "path": path
+                }),
+            }),
+    );
     input
 }
 
@@ -984,17 +993,26 @@ mod tests {
                 prompt: "Review".to_owned(),
                 model: "gpt-5.4".to_owned(),
                 access,
-                attachments: vec![TurnAttachment::GitDiff {
-                    text: "+change".to_owned(),
-                }],
+                attachments: vec![
+                    TurnAttachment::GitDiff {
+                        text: "+change".to_owned(),
+                    },
+                    TurnAttachment::Image {
+                        path: "/tmp/design.png".into(),
+                    },
+                ],
                 full_access_confirmed: access == RuntimeAccess::FullAccess,
             };
             let thread = thread_start_params(cwd, &request.model, access);
             assert_eq!(thread["model"], "gpt-5.4");
             assert_eq!(thread["sandbox"], thread_sandbox);
             let inputs = turn_inputs(&request);
-            assert_eq!(inputs.len(), 2);
+            assert_eq!(inputs.len(), 3);
             assert_eq!(inputs[0]["text_elements"], json!([]));
+            assert_eq!(
+                inputs[2],
+                json!({ "type": "localImage", "path": "/tmp/design.png" })
+            );
             let turn = turn_start_params("provider-1", &request, inputs, cwd);
             assert_eq!(turn["model"], "gpt-5.4");
             assert_eq!(turn["sandboxPolicy"], turn_sandbox);

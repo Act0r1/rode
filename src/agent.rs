@@ -73,20 +73,27 @@ impl RuntimeAccess {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TurnAttachment {
     GitDiff { text: String },
+    Image { path: PathBuf },
 }
 
 impl TurnAttachment {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::GitDiff { .. } => "Current Git diff",
+            Self::GitDiff { .. } => "Current Git diff".to_owned(),
+            Self::Image { path } => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Image")
+                .to_owned(),
         }
     }
 
-    pub fn as_text_context(&self) -> String {
+    pub fn as_text_context(&self) -> Option<String> {
         match self {
-            Self::GitDiff { text } => format!(
+            Self::GitDiff { text } => Some(format!(
                 "The user attached the current Git diff as context:\n<git_diff>\n{text}\n</git_diff>"
-            ),
+            )),
+            Self::Image { .. } => None,
         }
     }
 }

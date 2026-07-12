@@ -19,7 +19,8 @@ use crate::codex_auth::{
     read_codex_account,
 };
 use crate::conversation::{
-    CardKind, CardStatus, ConversationCard, ConversationProjection, NoticeTone,
+    CardKind, CardStatus, ConversationAttachment, ConversationCard, ConversationProjection,
+    NoticeTone,
 };
 use crate::diff::{
     DiffDocument, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffViewMode, split_rows,
@@ -441,6 +442,7 @@ pub(crate) struct RodeApp {
     selected_model: Option<String>,
     runtime_access: RuntimeAccess,
     attach_git_diff: bool,
+    pending_images: Vec<PathBuf>,
     pending_full_access_request: Option<TurnRequest>,
     active_turn_request: Option<TurnRequest>,
     session_generation: u64,
@@ -656,6 +658,7 @@ impl RodeApp {
             selected_model: None,
             runtime_access: RuntimeAccess::WorkspaceWrite,
             attach_git_diff: false,
+            pending_images: Vec::new(),
             pending_full_access_request: None,
             active_turn_request: None,
             session_generation: 0,
@@ -932,6 +935,7 @@ impl RodeApp {
         self.drafts.insert(self.thread_id.clone(), draft.clone());
         self.composer
             .update(cx, |editor, cx| editor.set_text(draft, cx));
+        self.pending_images.clear();
         if let Some(store) = self.state_store.as_mut() {
             let _ = store.mark_thread_read(&self.thread_id);
             if missing_isolated_workspace {
@@ -1603,6 +1607,92 @@ impl RodeApp {
         cx.notify();
     }
 
+    fn add_image_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model_supports_images = self.selected_model.as_ref().is_some_and(|selected| {
+            self.available_models
+                .iter()
+                .find(|model| &model.id == selected)
+                .is_some_and(|model| model.supports_images)
+        });
+        if !model_supports_images {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                "The selected Codex model does not support image input.",
+            );
+            cx.notify();
+            return;
+        }
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Select images".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = selection.await;
+            this.update_in(cx, |this, _, cx| match result {
+                Ok(Ok(Some(paths))) => {
+                    let mut rejected = 0;
+                    for path in paths {
+                        let supported = path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .is_some_and(|extension| {
+                                matches!(
+                                    extension.to_ascii_lowercase().as_str(),
+                                    "png"
+                                        | "jpg"
+                                        | "jpeg"
+                                        | "gif"
+                                        | "webp"
+                                        | "bmp"
+                                        | "tif"
+                                        | "tiff"
+                                )
+                            });
+                        match (supported, path.canonicalize()) {
+                            (true, Ok(path)) => {
+                                if !this.pending_images.contains(&path) {
+                                    this.pending_images.push(path);
+                                }
+                            }
+                            _ => rejected += 1,
+                        }
+                    }
+                    if rejected > 0 {
+                        this.toasts.push(
+                            toast::ToastKind::Warning,
+                            format!("Skipped {rejected} unsupported or unreadable image(s)."),
+                        );
+                    }
+                    cx.notify();
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    this.toasts.push(
+                        toast::ToastKind::Error,
+                        format!("Could not open the image picker: {error:#}"),
+                    );
+                    cx.notify();
+                }
+                Err(_) => {
+                    this.toasts.push(
+                        toast::ToastKind::Error,
+                        "The desktop image picker closed unexpectedly.",
+                    );
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn clear_image_attachments(&mut self, cx: &mut Context<Self>) {
+        self.pending_images.clear();
+        cx.notify();
+    }
+
     fn confirm_full_access_turn(&mut self, cx: &mut Context<Self>) {
         let Some(mut request) = self.pending_full_access_request.take() else {
             return;
@@ -1666,7 +1756,7 @@ impl RodeApp {
 
         let prompt = self.composer.read(cx).text();
         let prompt = prompt.trim().to_owned();
-        if prompt.is_empty() {
+        if prompt.is_empty() && self.pending_images.is_empty() {
             return;
         }
         if !self.codex_available() {
@@ -1696,13 +1786,33 @@ impl RodeApp {
             cx.notify();
             return;
         };
-        let attachments = if self.attach_git_diff && !self.repo.diff.is_empty() {
+        if !self.pending_images.is_empty()
+            && !self
+                .available_models
+                .iter()
+                .find(|candidate| candidate.id == model)
+                .is_some_and(|candidate| candidate.supports_images)
+        {
+            self.toasts.push(
+                toast::ToastKind::Warning,
+                "Choose a Codex model that supports image input.",
+            );
+            cx.notify();
+            return;
+        }
+        let mut attachments = if self.attach_git_diff && !self.repo.diff.is_empty() {
             vec![TurnAttachment::GitDiff {
                 text: self.repo.diff.clone(),
             }]
         } else {
             Vec::new()
         };
+        attachments.extend(
+            self.pending_images
+                .iter()
+                .cloned()
+                .map(|path| TurnAttachment::Image { path }),
+        );
         let request = TurnRequest {
             local_thread_id: self.thread_id.clone(),
             provider_thread_id: self.codex_thread_id.clone(),
@@ -1735,10 +1845,18 @@ impl RodeApp {
 
         self.composer.update(cx, |editor, cx| editor.clear(cx));
         self.drafts.insert(self.thread_id.clone(), String::new());
-        let attachment_labels = request
+        self.pending_images.clear();
+        let conversation_attachments = request
             .attachments
             .iter()
-            .map(|attachment| attachment.label().to_owned())
+            .map(|attachment| match attachment {
+                TurnAttachment::GitDiff { .. } => ConversationAttachment::Context {
+                    label: attachment.label(),
+                },
+                TurnAttachment::Image { path } => {
+                    ConversationAttachment::Image { path: path.clone() }
+                }
+            })
             .collect();
         self.push_conversation_card(
             ConversationCard::new(
@@ -1746,7 +1864,7 @@ impl RodeApp {
                     text: request.prompt.clone(),
                     model: request.model.clone(),
                     access: request.access.storage_name().to_owned(),
-                    attachments: attachment_labels,
+                    attachments: conversation_attachments,
                 },
                 CardStatus::Complete,
                 None,
@@ -2958,6 +3076,7 @@ impl RodeApp {
             .update(cx, |editor, cx| editor.set_text("", cx));
         self.composer
             .update(cx, |editor, cx| editor.set_text("", cx));
+        self.pending_images.clear();
         self.running = false;
         self.thread_number = self.next_thread_number();
         self.thread_id = new_local_thread_id();
@@ -5682,7 +5801,11 @@ impl RodeApp {
                     .w_full()
                     .min_w_0()
                     .overflow_hidden()
-                    .h(px(148.))
+                    .h(px(if self.pending_images.is_empty() {
+                        148.
+                    } else {
+                        180.
+                    }))
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(theme::tokens(self.theme).colors.strong_border))
@@ -5813,6 +5936,33 @@ impl RodeApp {
                                             } else {
                                                 "Attach diff"
                                             }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-attach-images")
+                                            .role(Role::Button)
+                                            .aria_label("Attach images")
+                                            .tab_index(0)
+                                            .tab_stop(true)
+                                            .cursor_pointer()
+                                            .rounded_md()
+                                            .px_2()
+                                            .py_1()
+                                            .bg(rgb(if self.pending_images.is_empty() {
+                                                theme::tokens(self.theme).colors.overlay
+                                            } else {
+                                                theme::tokens(self.theme).colors.accent_soft
+                                            }))
+                                            .text_xs()
+                                            .text_color(rgb(theme::tokens(self.theme).colors.text))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.add_image_attachments(window, cx)
+                                            }))
+                                            .child(if self.pending_images.is_empty() {
+                                                "Attach images".to_owned()
+                                            } else {
+                                                format!("{} image(s)", self.pending_images.len())
+                                            }),
                                     ),
                             )
                             .child(if self.running {
@@ -5839,6 +5989,37 @@ impl RodeApp {
                                 .into_any_element()
                             }),
                     )
+                    .when(!self.pending_images.is_empty(), |composer| {
+                        composer.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(rgb(theme::tokens(self.theme).colors.muted_text))
+                                .child(
+                                    self.pending_images
+                                        .iter()
+                                        .filter_map(|path| path.file_name()?.to_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                )
+                                .child(
+                                    div()
+                                        .id("composer-clear-images")
+                                        .role(Role::Button)
+                                        .aria_label("Remove attached images")
+                                        .tab_index(0)
+                                        .tab_stop(true)
+                                        .cursor_pointer()
+                                        .child("Clear")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.clear_image_attachments(cx)
+                                        })),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
