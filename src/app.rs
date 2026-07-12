@@ -367,6 +367,7 @@ pub(crate) struct RodeApp {
     project_path: PathBuf,
     project_name: String,
     repo: RepoSnapshot,
+    pending_repo_validation: bool,
     providers: Vec<ProviderStatus>,
     codex_auth: CodexAuthState,
     auth_attempt_generation: u64,
@@ -564,6 +565,7 @@ impl RodeApp {
             project_path,
             project_name,
             repo,
+            pending_repo_validation: false,
             providers,
             codex_auth,
             auth_attempt_generation: 0,
@@ -2462,6 +2464,7 @@ impl RodeApp {
             .map(|stored| stored.name.clone())
             .unwrap_or(project.name);
         self.repo = RepoSnapshot::default();
+        self.pending_repo_validation = true;
         self.project_open = true;
         self.project_picker_error = None;
         let restored_thread_id = self
@@ -2809,7 +2812,25 @@ impl RodeApp {
         } else {
             (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone())
         };
-        self.reload_repo_snapshot(cx);
+        if isolated {
+            self.reload_repo_snapshot(cx);
+        } else {
+            let generation = self.session_generation;
+            self.reload_repo_snapshot_then(
+                move |this| {
+                    if this.session_generation != generation {
+                        return;
+                    }
+                    let branch = (!this.repo.branch.is_empty()).then(|| this.repo.branch.clone());
+                    this.thread_branch = branch.clone();
+                    if this.thread_base_branch.as_deref() == Some("") {
+                        this.thread_base_branch = branch;
+                    }
+                    this.persist_current_thread();
+                },
+                cx,
+            );
+        }
         self.thread_activity = if isolated {
             ThreadActivity::CreatingWorktree
         } else {
@@ -2927,26 +2948,18 @@ impl RodeApp {
         let focus = self.composer.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
         cx.notify();
-        let path = self.project_path.clone();
-        cx.spawn(async move |this, cx| {
-            let snapshot = cx
-                .background_spawn({
-                    let path = path.clone();
-                    async move { RepoSnapshot::load(&path) }
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                if this.project_path != path {
+        let generation = self.session_generation;
+        self.reload_repo_snapshot_then(
+            move |this| {
+                if this.session_generation != generation {
                     return;
                 }
                 this.thread_branch =
-                    (!snapshot.branch.is_empty()).then(|| snapshot.branch.clone());
-                this.repo = snapshot;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+                    (!this.repo.branch.is_empty()).then(|| this.repo.branch.clone());
+                this.persist_current_thread();
+            },
+            cx,
+        );
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -3014,8 +3027,17 @@ impl RodeApp {
     }
 
     fn reload_repo_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.reload_repo_snapshot_then(|_| {}, cx);
+    }
+
+    fn reload_repo_snapshot_then(
+        &mut self,
+        then: impl FnOnce(&mut Self) + 'static,
+        cx: &mut Context<Self>,
+    ) {
         let path = self.project_path.clone();
         if path.as_os_str().is_empty() {
+            self.pending_repo_validation = false;
             self.repo = RepoSnapshot::default();
             cx.notify();
             return;
@@ -3031,7 +3053,17 @@ impl RodeApp {
                 if this.project_path != path {
                     return;
                 }
+                let validating = std::mem::take(&mut this.pending_repo_validation);
+                if validating && !snapshot.is_repository {
+                    this.close_project();
+                    this.project_picker_error = Some(
+                        "Git validation changed while opening the project. Try again.".to_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 this.repo = snapshot;
+                then(this);
                 cx.notify();
             })
             .ok();
