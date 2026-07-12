@@ -7,7 +7,6 @@ use std::process::Command;
 
 #[derive(Clone, Debug, Default)]
 pub struct RepoSnapshot {
-    pub root: PathBuf,
     pub is_repository: bool,
     pub branch: String,
     pub changed_files: usize,
@@ -202,10 +201,7 @@ impl RepoSnapshot {
     pub fn load(path: &Path) -> Self {
         let root = canonical_or_original(path);
         if !git_ok(&root, &["rev-parse", "--is-inside-work-tree"]) {
-            return Self {
-                root,
-                ..Self::default()
-            };
+            return Self::default();
         }
 
         let branch = git_output(&root, &["branch", "--show-current"])
@@ -239,7 +235,6 @@ impl RepoSnapshot {
         }
 
         Self {
-            root,
             is_repository: true,
             branch,
             changed_files,

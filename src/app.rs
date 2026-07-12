@@ -780,11 +780,8 @@ impl RodeApp {
         } else {
             PathBuf::new()
         };
-        self.repo = if self.project_path.as_os_str().is_empty() {
-            RepoSnapshot::default()
-        } else {
-            RepoSnapshot::load(&self.project_path)
-        };
+        self.repo = RepoSnapshot::default();
+        self.reload_repo_snapshot(cx);
         self.project_open = true;
         self.reconcile_project_route();
         self.messages = thread
@@ -2464,15 +2461,7 @@ impl RodeApp {
             .as_ref()
             .map(|stored| stored.name.clone())
             .unwrap_or(project.name);
-        self.repo = RepoSnapshot::load(&self.project_path);
-        if !self.repo.is_repository {
-            self.close_project();
-            self.project_picker_error =
-                Some("Git validation changed while opening the project. Try again.".to_owned());
-            cx.notify();
-            return;
-        }
-        self.project_root = self.repo.root.clone();
+        self.repo = RepoSnapshot::default();
         self.project_open = true;
         self.project_picker_error = None;
         let restored_thread_id = self
@@ -2815,12 +2804,12 @@ impl RodeApp {
         self.thread_error = None;
         self.thread_unread = false;
         self.project_path = self.project_root.clone();
-        self.repo = RepoSnapshot::load(&self.project_path);
         self.thread_branch = if isolated {
             None
         } else {
             (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone())
         };
+        self.reload_repo_snapshot(cx);
         self.thread_activity = if isolated {
             ThreadActivity::CreatingWorktree
         } else {
@@ -2924,8 +2913,8 @@ impl RodeApp {
         self.modal = None;
         self.worktree_failure = None;
         self.project_path = self.project_root.clone();
-        self.repo = RepoSnapshot::load(&self.project_path);
-        self.thread_branch = (!self.repo.branch.is_empty()).then(|| self.repo.branch.clone());
+        self.repo = RepoSnapshot::default();
+        self.thread_branch = None;
         self.thread_activity = ThreadActivity::Ready;
         self.thread_activity_updated_ms = now_ms();
         self.thread_error = None;
@@ -2938,6 +2927,26 @@ impl RodeApp {
         let focus = self.composer.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
         cx.notify();
+        let path = self.project_path.clone();
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move { RepoSnapshot::load(&path) }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.project_path != path {
+                    return;
+                }
+                this.thread_branch =
+                    (!snapshot.branch.is_empty()).then(|| snapshot.branch.clone());
+                this.repo = snapshot;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn toggle_diff(&mut self, _: &ToggleDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -3001,8 +3010,33 @@ impl RodeApp {
     }
 
     fn refresh_repo(&mut self, _: &RefreshRepo, _: &mut Window, cx: &mut Context<Self>) {
-        self.repo = RepoSnapshot::load(&self.project_path);
-        cx.notify();
+        self.reload_repo_snapshot(cx);
+    }
+
+    fn reload_repo_snapshot(&mut self, cx: &mut Context<Self>) {
+        let path = self.project_path.clone();
+        if path.as_os_str().is_empty() {
+            self.repo = RepoSnapshot::default();
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let snapshot = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move { RepoSnapshot::load(&path) }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.project_path != path {
+                    return;
+                }
+                this.repo = snapshot;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn start_publish_operation(&mut self, operation: PublishOperation, cx: &mut Context<Self>) {
